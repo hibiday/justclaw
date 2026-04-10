@@ -5,6 +5,7 @@ import {
 	discoverDaemonManifests,
 	resolveModulesRoot,
 } from "./module-manifest";
+import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
 
 type StartedDaemon = {
 	manifest: DaemonModuleManifest;
@@ -15,6 +16,9 @@ type StartedDaemon = {
 
 type BootstrapRuntimeOptions = {
 	homeDir?: string;
+	sandboxFactory?: (
+		manifest: DaemonModuleManifest,
+	) => Promise<SandboxLaunchSpec>;
 };
 
 const SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -89,10 +93,15 @@ function createPeer(
 
 export async function startDaemon(
 	manifest: DaemonModuleManifest,
+	options: Pick<BootstrapRuntimeOptions, "sandboxFactory"> = {},
 ): Promise<StartedDaemon> {
+	const sandboxSpec = await (options.sandboxFactory ?? createSandboxLaunchSpec)(
+		manifest,
+	);
 	const process = Bun.spawn({
-		cmd: [manifest.execPath],
-		cwd: manifest.moduleDir,
+		cmd: sandboxSpec.cmd,
+		cwd: sandboxSpec.cwd,
+		env: sandboxSpec.env,
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -153,7 +162,11 @@ export async function bootstrapRuntime(
 
 	try {
 		for (const manifest of manifests) {
-			daemons.push(await startDaemon(manifest));
+			daemons.push(
+				await startDaemon(manifest, {
+					sandboxFactory: options.sandboxFactory,
+				}),
+			);
 		}
 	} catch (error) {
 		await stopDaemons(daemons);

@@ -13,6 +13,13 @@ import path from "node:path";
 import { JsonRpcPeer } from "./jsonrpc";
 import { parseDaemonManifest, resolveModulesRoot } from "./module-manifest";
 import { bootstrapRuntime, stopDaemons } from "./runtime";
+import {
+	createDarwinSandboxProfile,
+	createLinuxBubblewrapCommand,
+	createSandboxLaunchSpec,
+	resolveSandboxBackend,
+	type SandboxLaunchSpec,
+} from "./sandbox";
 
 const tempDirs: string[] = [];
 
@@ -108,6 +115,18 @@ async function writeRawDaemonModule(
 	const scriptPath = path.join(moduleDir, "module.ts");
 	await writeFile(scriptPath, script);
 	await chmod(scriptPath, 0o755);
+}
+
+function createUnsandboxedSpec(
+	moduleDir: string,
+	execPath: string,
+): SandboxLaunchSpec {
+	return {
+		backend: "sandbox-exec",
+		cmd: [execPath],
+		cwd: moduleDir,
+		env: process.env,
+	};
 }
 
 describe("parseDaemonManifest", () => {
@@ -273,6 +292,185 @@ describe("JsonRpcPeer", () => {
 	});
 });
 
+describe("sandbox", () => {
+	test("selects sandbox-exec on darwin", () => {
+		expect(resolveSandboxBackend("darwin")).toBe("sandbox-exec");
+	});
+
+	test("selects bwrap on linux", () => {
+		expect(resolveSandboxBackend("linux")).toBe("bwrap");
+	});
+
+	test("rejects unsupported platforms", () => {
+		expect(() => resolveSandboxBackend("win32")).toThrow(
+			"Unsupported sandbox platform",
+		);
+	});
+
+	test("builds a darwin profile with module and temp write access", () => {
+		const profile = createDarwinSandboxProfile("/tmp/module");
+		expect(profile).toContain('(subpath "/tmp/module")');
+		expect(profile).toContain('(subpath "/tmp")');
+		expect(profile).toContain('(subpath "/private/tmp")');
+		expect(profile).toContain("(allow network*)");
+	});
+
+	test("builds a linux bwrap command from the readonly allowlist", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+		const existingPaths = new Set([
+			"/bin",
+			"/usr",
+			"/usr/local",
+			"/opt",
+			"/etc",
+			"/lib",
+			"/run",
+			"/nix",
+			"/tmp/example",
+			"/tmp",
+		]);
+		const cmd = await createLinuxBubblewrapCommand(
+			"/usr/bin/bwrap",
+			manifest,
+			async (candidatePath) => existingPaths.has(candidatePath),
+		);
+
+		expect(cmd).toEqual([
+			"/usr/bin/bwrap",
+			"--die-with-parent",
+			"--new-session",
+			"--ro-bind",
+			"/bin",
+			"/bin",
+			"--ro-bind",
+			"/usr",
+			"/usr",
+			"--ro-bind",
+			"/usr/local",
+			"/usr/local",
+			"--ro-bind",
+			"/opt",
+			"/opt",
+			"--ro-bind",
+			"/etc",
+			"/etc",
+			"--ro-bind",
+			"/lib",
+			"/lib",
+			"--ro-bind",
+			"/run",
+			"/run",
+			"--ro-bind",
+			"/nix",
+			"/nix",
+			"--bind",
+			"/tmp/example",
+			"/tmp/example",
+			"--bind",
+			"/tmp",
+			"/tmp",
+			"--proc",
+			"/proc",
+			"--dev",
+			"/dev",
+			"--chdir",
+			"/tmp/example",
+			"--",
+			path.resolve("/tmp/example", "./run"),
+		]);
+	});
+
+	test("omits missing optional linux readonly mounts", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+
+		const cmd = await createLinuxBubblewrapCommand(
+			"/usr/bin/bwrap",
+			manifest,
+			async (candidatePath) =>
+				candidatePath === "/tmp/example" || candidatePath === "/tmp",
+		);
+
+		expect(cmd).not.toContain("/sys");
+		expect(cmd).not.toContain("/var");
+		expect(cmd).not.toContain("/var/tmp");
+		expect(cmd).not.toContain("/usr/local");
+		expect(cmd).toContain("/tmp/example");
+		expect(cmd).toContain("/tmp");
+	});
+
+	test("fails when a required writable linux sandbox path is unavailable", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+
+		await expect(
+			createLinuxBubblewrapCommand(
+				"/usr/bin/bwrap",
+				manifest,
+				async (candidatePath) => candidatePath === "/tmp/example",
+			),
+		).rejects.toThrow("Required writable sandbox path is unavailable: /tmp");
+	});
+
+	test("fails closed when the darwin backend is missing", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+
+		await expect(
+			createSandboxLaunchSpec(manifest, {
+				platform: "darwin",
+				lookupExecutable: async () => null,
+			}),
+		).rejects.toThrow("sandbox-exec backend is unavailable");
+	});
+
+	test("fails closed when the linux backend is missing", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+
+		await expect(
+			createSandboxLaunchSpec(manifest, {
+				platform: "linux",
+				lookupExecutable: async () => null,
+			}),
+		).rejects.toThrow("bwrap backend is unavailable");
+	});
+
+	test("preserves environment variables in the launch spec", async () => {
+		const manifest = parseDaemonManifest(
+			"/tmp/example",
+			"example",
+			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+		);
+		const env = { ...process.env, OPENAI_API_KEY: "test-key" };
+
+		const spec = await createSandboxLaunchSpec(manifest, {
+			platform: "darwin",
+			env,
+			lookupExecutable: async () => "/usr/bin/sandbox-exec",
+		});
+
+		expect(spec.env.OPENAI_API_KEY).toBe("test-key");
+		expect(spec.cmd[0]).toBe("/usr/bin/sandbox-exec");
+	});
+});
+
 describe("bootstrapRuntime", () => {
 	test("fails when HOME is unavailable", async () => {
 		await expect(bootstrapRuntime({ homeDir: "" })).rejects.toThrow(
@@ -323,7 +521,11 @@ describe("bootstrapRuntime", () => {
 			createModuleScript({ stderrLine: "booted" }),
 		);
 
-		const runtime = await bootstrapRuntime({ homeDir });
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
 		expect(runtime.modulesRoot).toBe(path.join(homeDir, "justclaw", "modules"));
 		expect(runtime.daemons).toHaveLength(1);
 		expect(runtime.daemons[0]?.tools).toEqual([]);
@@ -339,9 +541,13 @@ describe("bootstrapRuntime", () => {
 			createModuleScript({ exitImmediately: true }),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			"process exited with code 0",
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow("process exited with code 0");
 	});
 
 	test("fails when initialize returns a JSON-RPC error", async () => {
@@ -357,7 +563,13 @@ describe("bootstrapRuntime", () => {
 			),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow("init failed");
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow("init failed");
 	});
 
 	test('fails when initialize result "tools" is not an array', async () => {
@@ -370,9 +582,13 @@ describe("bootstrapRuntime", () => {
 			}),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			'initialize result "tools" must be an array',
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow('initialize result "tools" must be an array');
 	});
 
 	test("fails when stdout emits malformed JSON", async () => {
@@ -383,9 +599,13 @@ describe("bootstrapRuntime", () => {
 			createModuleScript({ malformedStdout: true }),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			"received invalid JSON-RPC line",
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow("received invalid JSON-RPC line");
 	});
 
 	test("shuts down already-started daemons when a later daemon fails", async () => {
@@ -404,9 +624,13 @@ describe("bootstrapRuntime", () => {
 			createModuleScript({ exitImmediately: true }),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			"process exited with code 0",
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow("process exited with code 0");
 		await expect(readFile(cleanupMarker, "utf8")).resolves.toContain(
 			"shutdown",
 		);
@@ -420,7 +644,11 @@ describe("bootstrapRuntime", () => {
 			createModuleScript({ ignoreShutdown: true }),
 		);
 
-		const runtime = await bootstrapRuntime({ homeDir });
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
 		const daemon = runtime.daemons[0];
 		expect(daemon).toBeDefined();
 
@@ -446,7 +674,11 @@ describe("bootstrapRuntime", () => {
 		};
 
 		try {
-			const runtime = await bootstrapRuntime({ homeDir });
+			const runtime = await bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			});
 			await stopDaemons(runtime.daemons);
 		} finally {
 			console.error = originalConsoleError;
@@ -472,7 +704,11 @@ describe("bootstrapRuntime", () => {
 			}),
 		);
 
-		const runtime = await bootstrapRuntime({ homeDir });
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
 		await expect(stat(cleanupMarker)).rejects.toThrow();
 		await stopDaemons(runtime.daemons);
 	});
