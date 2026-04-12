@@ -75,6 +75,7 @@ function createModuleScript({
 	ignoreInitialize = false,
 	ignoreShutdown = false,
 	ignoreTerminate = false,
+	exitAfterShutdown = true,
 	shutdownSideEffectPath,
 }: {
 	initializeResponse?: string;
@@ -86,6 +87,7 @@ function createModuleScript({
 	ignoreInitialize?: boolean;
 	ignoreShutdown?: boolean;
 	ignoreTerminate?: boolean;
+	exitAfterShutdown?: boolean;
 	shutdownSideEffectPath?: string;
 } = {}): string {
 	return `#!/usr/bin/env bun
@@ -111,7 +113,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			}
 			${ignoreShutdown ? "continue;" : ""}
 			console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: ${shutdownResponse} }));
-			process.exit(0);
+			${exitAfterShutdown ? "process.exit(0);" : ""}
 		}
 	}
 	lines.length = 0;
@@ -1208,6 +1210,81 @@ describe("bootstrapRuntime", () => {
 		).rejects.toThrow("received invalid JSON-RPC line");
 	});
 
+	test("terminates a started daemon after stdout closes", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"stdout-closes-late",
+			`#!/bin/sh
+IFS= read -r line
+echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+exec 1>&-
+sleep 10
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemon = runtime.daemons[0];
+		expect(daemon).toBeDefined();
+
+		try {
+			await expect(
+				Promise.race([
+					daemon?.process.exited,
+					delay(1_000).then(() => {
+						throw new Error("daemon was not terminated");
+					}),
+				]),
+			).resolves.toBeNumber();
+		} finally {
+			if (daemon?.process.exitCode === null) {
+				daemon.process.kill("SIGKILL");
+			}
+		}
+	});
+
+	test("kills a started daemon that ignores SIGTERM after stdout closes", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"stdout-closes-stubborn",
+			`#!/bin/sh
+trap '' TERM
+IFS= read -r line
+echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+exec 1>&-
+sleep 10
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemon = runtime.daemons[0];
+		expect(daemon).toBeDefined();
+
+		try {
+			await expect(
+				Promise.race([
+					daemon?.process.exited,
+					delay(3_000).then(() => {
+						throw new Error("daemon was not killed");
+					}),
+				]),
+			).resolves.toBeNumber();
+		} finally {
+			if (daemon?.process.exitCode === null) {
+				daemon.process.kill("SIGKILL");
+			}
+		}
+	});
+
 	test("shuts down already-started daemons when a later daemon fails", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const cleanupMarker = path.join(homeDir, "cleanup-marker.txt");
@@ -1259,6 +1336,50 @@ describe("bootstrapRuntime", () => {
 		await expect(processInfo?.exited).resolves.toBeNumber();
 	});
 
+	test("waits for a daemon to exit after a shutdown response", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const cleanupMarker = path.join(homeDir, "shutdown-cleanup.txt");
+		await writeDaemonModule(
+			homeDir,
+			"async-shutdown",
+			`#!/usr/bin/env bun
+const chunks = [];
+for await (const chunk of Bun.stdin.stream()) {
+	chunks.push(chunk);
+	const text = Buffer.concat(chunks).toString("utf8");
+	const lines = text.split(/\\r?\\n/);
+	while (lines.length > 1) {
+		const line = lines.shift();
+		if (!line) continue;
+		const message = JSON.parse(line);
+		if (message.method === "initialize") {
+			console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		} else if (message.method === "shutdown") {
+			console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			await Bun.write(${JSON.stringify(cleanupMarker)}, "cleanup\\n");
+			process.exit(0);
+		}
+	}
+	chunks.length = 0;
+	if (lines[0]) {
+		chunks.push(Buffer.from(lines[0]));
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await stopDaemons(runtime.daemons);
+
+		await expect(readFile(cleanupMarker, "utf8")).resolves.toContain("cleanup");
+	});
+
 	test("kills a daemon with SIGKILL when it ignores shutdown and SIGTERM", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
@@ -1277,6 +1398,84 @@ describe("bootstrapRuntime", () => {
 
 		await stopDaemons(runtime.daemons);
 		await expect(daemon?.process.exited).resolves.toBeNumber();
+	});
+
+	test("terminates daemon child processes on shutdown", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const childPidPath = path.join(homeDir, "child.pid");
+		await writeDaemonModule(
+			homeDir,
+			"child-spawner",
+			`#!/usr/bin/env bun
+const child = Bun.spawn(["sleep", "10"]);
+await Bun.write(${JSON.stringify(childPidPath)}, String(child.pid));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		setInterval(() => {}, 1000);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const childPid = Number(await readFile(childPidPath, "utf8"));
+		expect(childPid).toBeGreaterThan(0);
+
+		await stopDaemons(runtime.daemons);
+
+		await waitUntil(() => {
+			try {
+				process.kill(childPid, 0);
+				return false;
+			} catch {
+				return true;
+			}
+		});
+	});
+
+	test("terminates daemon child processes after graceful daemon exit", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const childPidPath = path.join(homeDir, "graceful-child.pid");
+		await writeDaemonModule(
+			homeDir,
+			"graceful-child-spawner",
+			`#!/bin/sh
+sleep 10 &
+echo "$!" > ${childPidPath}
+IFS= read -r line
+echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+IFS= read -r line
+echo '{"jsonrpc":"2.0","id":2,"result":"ok"}'
+exit 0
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const childPid = Number(await readFile(childPidPath, "utf8"));
+		expect(childPid).toBeGreaterThan(0);
+
+		await stopDaemons(runtime.daemons);
+
+		await waitUntil(() => {
+			try {
+				process.kill(childPid, 0);
+				return false;
+			} catch {
+				return true;
+			}
+		});
 	});
 
 	test("prefixes module stderr output", async () => {

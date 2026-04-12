@@ -89,6 +89,12 @@ async function withTimeout<T>(
 	}
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
 function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
 	if (typeof result !== "object" || result === null || Array.isArray(result)) {
 		throw new Error(`${moduleName}: initialize result must be an object`);
@@ -108,6 +114,101 @@ function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
 	return tools;
 }
 
+async function terminateDaemonProcess(daemon: StartedDaemon): Promise<void> {
+	if (daemon.process.exitCode === null) {
+		signalDaemonProcessGroup(daemon, "SIGTERM");
+		try {
+			await withTimeout(daemon.process.exited, SHUTDOWN_TIMEOUT_MS, () => {
+				return new Error(
+					`${daemon.manifest.name}: process did not exit after SIGTERM`,
+				);
+			});
+		} catch {
+			signalDaemonProcessGroup(daemon, "SIGKILL");
+			await withTimeout(daemon.process.exited, KILL_TIMEOUT_MS, () => {
+				return new Error(
+					`${daemon.manifest.name}: process did not exit after SIGKILL`,
+				);
+			});
+		}
+	}
+
+	await terminateDaemonProcessGroup(daemon);
+}
+
+function signalDaemonProcessGroup(
+	daemon: StartedDaemon,
+	signal: NodeJS.Signals,
+): void {
+	try {
+		process.kill(-daemon.process.pid, signal);
+	} catch {
+		daemon.process.kill(signal);
+	}
+}
+
+async function terminateDaemonProcessGroup(
+	daemon: StartedDaemon,
+): Promise<void> {
+	if (!daemonProcessGroupExists(daemon)) {
+		return;
+	}
+
+	signalDaemonProcessGroup(daemon, "SIGTERM");
+	try {
+		await withTimeout(
+			waitForDaemonProcessGroupExit(daemon),
+			SHUTDOWN_TIMEOUT_MS,
+			() => {
+				return new Error(
+					`${daemon.manifest.name}: process group did not exit after SIGTERM`,
+				);
+			},
+		);
+		return;
+	} catch {}
+
+	signalDaemonProcessGroup(daemon, "SIGKILL");
+	await withTimeout(
+		waitForDaemonProcessGroupExit(daemon),
+		KILL_TIMEOUT_MS,
+		() => {
+			return new Error(
+				`${daemon.manifest.name}: process group did not exit after SIGKILL`,
+			);
+		},
+	);
+}
+
+async function waitForDaemonProcessGroupExit(
+	daemon: StartedDaemon,
+): Promise<void> {
+	while (daemonProcessGroupExists(daemon)) {
+		await sleep(10);
+	}
+}
+
+function daemonProcessGroupExists(daemon: StartedDaemon): boolean {
+	try {
+		process.kill(-daemon.process.pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+function terminateAfterFatalStdoutFailure(daemon: StartedDaemon): void {
+	if (daemon.stopping) {
+		return;
+	}
+
+	void terminateDaemonProcess(daemon).catch((error) => {
+		console.error(
+			`[${daemon.manifest.name}] failed to terminate after stdout failure: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	});
+}
+
 async function pipeStdout(daemon: StartedDaemon): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stdout, (line) => {
@@ -120,12 +221,14 @@ async function pipeStdout(daemon: StartedDaemon): Promise<void> {
 			console.error(`[${daemon.manifest.name}] ${error.message}`);
 		}
 		daemon.peer.close(error);
+		terminateAfterFatalStdoutFailure(daemon);
 	} catch (error) {
 		const peerError = error instanceof Error ? error : new Error(String(error));
 		if (!daemon.stopping) {
 			console.error(`[${daemon.manifest.name}] ${peerError.message}`);
 		}
 		daemon.peer.close(peerError);
+		terminateAfterFatalStdoutFailure(daemon);
 	}
 }
 
@@ -184,6 +287,7 @@ export async function startDaemon(
 	const process = Bun.spawn({
 		cmd: sandboxSpec.cmd,
 		cwd: sandboxSpec.cwd,
+		detached: true,
 		env: sandboxSpec.env,
 		stdin: "pipe",
 		stdout: "pipe",
@@ -228,24 +332,20 @@ export async function stopDaemon(daemon: StartedDaemon): Promise<void> {
 			SHUTDOWN_TIMEOUT_MS,
 			() => new Error(`${daemon.manifest.name}: shutdown timed out`),
 		);
-	} catch {
-		daemon.process.kill();
-	}
-
-	try {
 		await withTimeout(daemon.process.exited, SHUTDOWN_TIMEOUT_MS, () => {
 			return new Error(
 				`${daemon.manifest.name}: process did not exit after shutdown`,
 			);
 		});
+		await terminateDaemonProcessGroup(daemon);
+		return;
 	} catch {
-		daemon.process.kill("SIGKILL");
-		await withTimeout(daemon.process.exited, KILL_TIMEOUT_MS, () => {
-			return new Error(
-				`${daemon.manifest.name}: process did not exit after SIGKILL`,
-			);
-		}).catch(() => undefined);
+		// Continue to process termination below. Once graceful shutdown fails,
+		// the transport may already be closed, unable to return a response, or
+		// unable to make the daemon exit after acknowledging shutdown.
 	}
+
+	await terminateDaemonProcess(daemon).catch(() => undefined);
 }
 
 export async function bootstrapRuntime(
