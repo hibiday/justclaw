@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -19,21 +20,57 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-export function resolveModulesRoot(homeDir = process.env.HOME): string {
-	if (!homeDir) {
-		throw new Error("HOME is not set; cannot resolve runtime module directory");
+function resolveModuleExecPath(moduleDir: string, exec: string): string {
+	if (path.isAbsolute(exec)) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} "exec" must be relative to the module directory`,
+		);
 	}
 
-	return path.join(homeDir, "justclaw", "modules");
+	const resolvedExecPath = path.resolve(moduleDir, exec);
+	const relativeExecPath = path.relative(moduleDir, resolvedExecPath);
+	if (
+		relativeExecPath === "" ||
+		relativeExecPath === ".." ||
+		relativeExecPath.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relativeExecPath)
+	) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} "exec" must stay inside the module directory`,
+		);
+	}
+
+	return resolvedExecPath;
+}
+
+export function resolveModulesRoot(
+	justclawHome = process.env.JUSTCLAW_HOME,
+	homeDir = process.env.HOME,
+): string {
+	if (justclawHome) {
+		return path.resolve(justclawHome, "modules");
+	}
+
+	if (!homeDir) {
+		throw new Error(
+			"HOME is not set and JUSTCLAW_HOME is not set; cannot resolve runtime module directory",
+		);
+	}
+
+	return path.resolve(homeDir, "justclaw", "modules");
 }
 
 export async function discoverDaemonManifests(
 	modulesRoot: string,
 ): Promise<DaemonModuleManifest[]> {
-	let entries: string[];
+	let entries: Dirent[];
 	try {
-		entries = await readdir(modulesRoot);
+		entries = await readdir(modulesRoot, { withFileTypes: true });
 	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			throw new Error(`No modules directory found at ${modulesRoot}`);
+		}
+
 		throw new Error(
 			`Failed to read runtime modules directory ${modulesRoot}: ${error instanceof Error ? error.message : String(error)}`,
 		);
@@ -41,21 +78,35 @@ export async function discoverDaemonManifests(
 
 	const manifests = await Promise.all(
 		entries.map(async (entry) => {
-			const moduleDir = path.join(modulesRoot, entry);
+			if (!entry.isDirectory()) {
+				return null;
+			}
+
+			const moduleDir = path.join(modulesRoot, entry.name);
 			const manifestPath = path.join(moduleDir, "module.json");
 			const manifestText = await readFile(manifestPath, "utf8").catch(
 				(error) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+						return null;
+					}
+
 					throw new Error(
 						`Failed to read manifest ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`,
 					);
 				},
 			);
 
-			return parseDaemonManifest(moduleDir, entry, manifestText);
+			if (manifestText === null) {
+				return null;
+			}
+
+			return parseDaemonManifest(moduleDir, entry.name, manifestText);
 		}),
 	);
 
-	return manifests.sort((left, right) => left.name.localeCompare(right.name));
+	return manifests
+		.filter((manifest) => manifest !== null)
+		.sort((left, right) => left.name.localeCompare(right.name));
 }
 
 export function parseDaemonManifest(
@@ -98,6 +149,8 @@ export function parseDaemonManifest(
 		);
 	}
 
+	const execPath = resolveModuleExecPath(moduleDir, exec);
+
 	if (mode !== "daemon") {
 		if (mode === "timer") {
 			throw new Error(`Timer modules are not implemented yet: ${name}`);
@@ -112,6 +165,6 @@ export function parseDaemonManifest(
 		mode: "daemon",
 		exec,
 		moduleDir,
-		execPath: path.resolve(moduleDir, exec),
+		execPath,
 	};
 }

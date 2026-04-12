@@ -1,4 +1,3 @@
-import { setTimeout as delay } from "node:timers/promises";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import {
 	type DaemonModuleManifest,
@@ -11,20 +10,87 @@ type StartedDaemon = {
 	manifest: DaemonModuleManifest;
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	peer: JsonRpcPeer;
+	stopping: boolean;
 	tools: unknown[];
 };
 
 type BootstrapRuntimeOptions = {
+	abortSignal?: AbortSignal;
 	homeDir?: string;
+	initializeTimeoutMs?: number;
 	sandboxFactory?: (
 		manifest: DaemonModuleManifest,
 	) => Promise<SandboxLaunchSpec>;
+	startedDaemons?: StartedDaemon[];
 };
 
+const INITIALIZE_TIMEOUT_MS = 5_000;
 const SHUTDOWN_TIMEOUT_MS = 1_000;
+const KILL_TIMEOUT_MS = 1_000;
+
+function createAbortError(): Error {
+	return new Error("Runtime startup interrupted");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) {
+		throw createAbortError();
+	}
+}
+
+function waitForAbort(signal: AbortSignal | undefined): Promise<never> {
+	if (!signal) {
+		return new Promise(() => {});
+	}
+
+	if (signal.aborted) {
+		return Promise.reject(createAbortError());
+	}
+
+	return new Promise((_, reject) => {
+		signal.addEventListener("abort", () => reject(createAbortError()), {
+			once: true,
+		});
+	});
+}
+
+function createTimeout(
+	ms: number,
+	createError: () => Error,
+): {
+	cancel: () => void;
+	promise: Promise<never>;
+} {
+	let timeout: ReturnType<typeof setTimeout>;
+	const promise = new Promise<never>((_, reject) => {
+		timeout = setTimeout(() => {
+			reject(createError());
+		}, ms);
+	});
+
+	return {
+		cancel: () => {
+			clearTimeout(timeout);
+		},
+		promise,
+	};
+}
+
+async function withTimeout<T>(
+	operation: Promise<T>,
+	ms: number,
+	createError: () => Error,
+): Promise<T> {
+	const timeout = createTimeout(ms, createError);
+	try {
+		return await Promise.race([operation, timeout.promise]);
+	} finally {
+		timeout.cancel();
+	}
+}
 
 function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
-	if (typeof result !== "object" || result === null) {
+	if (typeof result !== "object" || result === null || Array.isArray(result)) {
 		throw new Error(`${moduleName}: initialize result must be an object`);
 	}
 
@@ -47,16 +113,19 @@ async function pipeStdout(daemon: StartedDaemon): Promise<void> {
 		await consumeLines(daemon.process.stdout, (line) => {
 			daemon.peer.handleLine(line);
 		});
-		const exitCode = await daemon.process.exited;
-		daemon.peer.close(
-			new Error(
-				`${daemon.manifest.name}: process exited with code ${exitCode}`,
-			),
+		const error = new Error(
+			`${daemon.manifest.name}: stdout closed unexpectedly`,
 		);
+		if (!daemon.stopping) {
+			console.error(`[${daemon.manifest.name}] ${error.message}`);
+		}
+		daemon.peer.close(error);
 	} catch (error) {
-		daemon.peer.close(
-			error instanceof Error ? error : new Error(String(error)),
-		);
+		const peerError = error instanceof Error ? error : new Error(String(error));
+		if (!daemon.stopping) {
+			console.error(`[${daemon.manifest.name}] ${peerError.message}`);
+		}
+		daemon.peer.close(peerError);
 	}
 }
 
@@ -82,22 +151,36 @@ function createPeer(
 			void process.stdin.write(`${line}\n`);
 		},
 		onNotification: (message: JsonRpcNotification) => {
-			if (message.method !== "event") {
+			if (message.method === "event") {
+				// Placeholder until the LLM event queue exists: keep module events
+				// visible without treating stderr as the protocol destination.
 				console.error(
-					`[${manifest.name}] ignoring unsupported notification ${message.method}`,
+					`[${manifest.name}] event ${JSON.stringify(message.params ?? {})}`,
 				);
+				return;
 			}
+
+			console.error(
+				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
+			);
 		},
 	});
 }
 
 export async function startDaemon(
 	manifest: DaemonModuleManifest,
-	options: Pick<BootstrapRuntimeOptions, "sandboxFactory"> = {},
+	options: Pick<
+		BootstrapRuntimeOptions,
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+	> & {
+		onSpawned?: (daemon: StartedDaemon) => void;
+	} = {},
 ): Promise<StartedDaemon> {
+	throwIfAborted(options.abortSignal);
 	const sandboxSpec = await (options.sandboxFactory ?? createSandboxLaunchSpec)(
 		manifest,
 	);
+	throwIfAborted(options.abortSignal);
 	const process = Bun.spawn({
 		cmd: sandboxSpec.cmd,
 		cwd: sandboxSpec.cwd,
@@ -112,41 +195,56 @@ export async function startDaemon(
 		manifest,
 		process,
 		peer,
+		stopping: false,
 		tools: [],
 	};
 
 	void pipeStdout(daemon);
 	void pipeStderr(daemon);
+	options.onSpawned?.(daemon);
 
-	const initializeResult = await peer.request("initialize");
-	daemon.tools = parseInitializeResult(manifest.name, initializeResult);
-	return daemon;
+	try {
+		const initializeResult = await withTimeout(
+			Promise.race([
+				peer.request("initialize"),
+				waitForAbort(options.abortSignal),
+			]),
+			options.initializeTimeoutMs ?? INITIALIZE_TIMEOUT_MS,
+			() => new Error(`${manifest.name}: initialize timed out`),
+		);
+		daemon.tools = parseInitializeResult(manifest.name, initializeResult);
+		return daemon;
+	} catch (error) {
+		await stopDaemon(daemon);
+		throw error;
+	}
 }
 
 export async function stopDaemon(daemon: StartedDaemon): Promise<void> {
+	daemon.stopping = true;
 	try {
-		await Promise.race([
+		await withTimeout(
 			daemon.peer.request("shutdown"),
-			delay(SHUTDOWN_TIMEOUT_MS).then(() => {
-				throw new Error(`${daemon.manifest.name}: shutdown timed out`);
-			}),
-		]);
+			SHUTDOWN_TIMEOUT_MS,
+			() => new Error(`${daemon.manifest.name}: shutdown timed out`),
+		);
 	} catch {
 		daemon.process.kill();
 	}
 
 	try {
-		await Promise.race([
-			daemon.process.exited,
-			delay(SHUTDOWN_TIMEOUT_MS).then(() => {
-				throw new Error(
-					`${daemon.manifest.name}: process did not exit after shutdown`,
-				);
-			}),
-		]);
+		await withTimeout(daemon.process.exited, SHUTDOWN_TIMEOUT_MS, () => {
+			return new Error(
+				`${daemon.manifest.name}: process did not exit after shutdown`,
+			);
+		});
 	} catch {
-		daemon.process.kill();
-		await daemon.process.exited.catch(() => undefined);
+		daemon.process.kill("SIGKILL");
+		await withTimeout(daemon.process.exited, KILL_TIMEOUT_MS, () => {
+			return new Error(
+				`${daemon.manifest.name}: process did not exit after SIGKILL`,
+			);
+		}).catch(() => undefined);
 	}
 }
 
@@ -156,20 +254,31 @@ export async function bootstrapRuntime(
 	modulesRoot: string;
 	daemons: StartedDaemon[];
 }> {
-	const modulesRoot = resolveModulesRoot(options.homeDir);
+	const modulesRoot = resolveModulesRoot(
+		process.env.JUSTCLAW_HOME,
+		options.homeDir,
+	);
 	const manifests = await discoverDaemonManifests(modulesRoot);
-	const daemons: StartedDaemon[] = [];
+	if (manifests.length === 0) {
+		throw new Error(`No modules available in ${modulesRoot}`);
+	}
+	const daemons = options.startedDaemons ?? [];
 
 	try {
 		for (const manifest of manifests) {
-			daemons.push(
-				await startDaemon(manifest, {
-					sandboxFactory: options.sandboxFactory,
-				}),
-			);
+			throwIfAborted(options.abortSignal);
+			await startDaemon(manifest, {
+				abortSignal: options.abortSignal,
+				initializeTimeoutMs: options.initializeTimeoutMs,
+				sandboxFactory: options.sandboxFactory,
+				onSpawned: (daemon) => {
+					daemons.push(daemon);
+				},
+			});
 		}
 	} catch (error) {
 		await stopDaemons(daemons);
+		daemons.length = 0;
 		throw error;
 	}
 

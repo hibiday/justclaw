@@ -1,31 +1,56 @@
-import { bootstrapRuntime, stopDaemons } from "./runtime";
+import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
 
-function createShutdownSignal(): Promise<void> {
-	return new Promise((resolve) => {
-		let resolved = false;
-		const finish = () => {
-			if (resolved) {
-				return;
+function createShutdownSignal(): {
+	dispose: () => void;
+	promise: Promise<void>;
+} {
+	let resolved = false;
+	let finish = () => {};
+	const promise = new Promise<void>((resolve) => {
+		finish = () => {
+			if (!resolved) {
+				resolved = true;
+				resolve();
 			}
-			resolved = true;
-			process.off("SIGINT", finish);
-			process.off("SIGTERM", finish);
-			resolve();
 		};
-
-		process.once("SIGINT", finish);
-		process.once("SIGTERM", finish);
 	});
+	const dispose = () => {
+		process.off("SIGINT", finish);
+		process.off("SIGTERM", finish);
+	};
+
+	process.once("SIGINT", finish);
+	process.once("SIGTERM", finish);
+
+	return { dispose, promise };
 }
 
 async function main(): Promise<void> {
-	const { modulesRoot, daemons } = await bootstrapRuntime();
-	console.error(
-		`Loaded ${daemons.length} daemon module(s) from ${modulesRoot}`,
-	);
+	const daemons: StartedDaemon[] = [];
+	const shutdown = createShutdownSignal();
+	const abortController = new AbortController();
+	const shutdownTask = shutdown.promise.then(async () => {
+		abortController.abort();
+		await stopDaemons(daemons);
+	});
 
-	await createShutdownSignal();
-	await stopDaemons(daemons);
+	try {
+		const { modulesRoot } = await bootstrapRuntime({
+			abortSignal: abortController.signal,
+			startedDaemons: daemons,
+		});
+		console.error(
+			`Loaded ${daemons.length} daemon module(s) from ${modulesRoot}`,
+		);
+
+		await shutdownTask;
+	} catch (error) {
+		abortController.abort();
+		await stopDaemons(daemons);
+		throw error;
+	} finally {
+		shutdown.dispose();
+	}
 }
 
 await main().catch((error) => {

@@ -40,14 +40,14 @@ For the wire protocol, lifecycle, and message formats, see [docs/spec.md](docs/s
 ### Directory Structure
 
 ```
-modules/
+$HOME/justclaw/modules/
   {module-name}/
     module.json      # manifest
     {entrypoint}     # executable
     ...              # module-specific data and state
 ```
 
-Each `modules/{name}/` directory is rw-mounted via bwrap. State management is the module's own responsibility.
+If `JUSTCLAW_HOME` is set, the runtime uses `JUSTCLAW_HOME/modules/` instead. Each runtime module directory is writable inside the platform sandbox via `bwrap` or `sandbox-exec`. State management is the module's own responsibility.
 
 ### Manifest (module.json)
 
@@ -111,4 +111,4 @@ Module (source)                    Core                         Module (target)
 
 ## Security
 
-- Each module has rw access only to `modules/{name}/` (via bwrap)
+- Each module has rw access only to `modules/{name}/` and temp paths (via `bwrap` or `sandbox-exec`)
