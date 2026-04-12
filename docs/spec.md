@@ -103,6 +103,19 @@ Core                            Module
  |                            exit(0)
 ```
 
+## Module Execution
+
+When the core starts a module, it executes the manifest's `exec` path inside the platform sandbox. Linux uses `bwrap`; macOS uses `sandbox-exec`.
+
+If the entrypoint begins with a shebang, the core inspects it before spawning:
+
+- `#!/absolute/path/to/interpreter` uses that interpreter path
+- `#!/usr/bin/env {command}` resolves `{command}` using the inherited environment
+
+If the resolved interpreter is outside the sandbox's standard read-only allowlist, the core exposes the interpreter's parent directory as an additional read-only path, without exposing `/`.
+
+**Rationale:** This preserves common user-local runtimes such as Bun installed outside `/usr` while keeping the sandbox policy minimal and read-only.
+
 ## Core → Module Messaging
 
 The core delivers outbound messages to modules via the `message.send` notification. Unlike module-emitted events (which the LLM consumes), this notification is consumed by module code, so its format is fixed.
