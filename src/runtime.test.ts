@@ -17,7 +17,12 @@ import {
 	parseDaemonManifest,
 	resolveModulesRoot,
 } from "./module-manifest";
-import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
+import {
+	bootstrapRuntime,
+	type StartedDaemon,
+	startDaemon,
+	stopDaemons,
+} from "./runtime";
 import {
 	createDarwinSandboxProfile,
 	createLinuxBubblewrapCommand,
@@ -54,9 +59,11 @@ async function createTempDir(prefix: string): Promise<string> {
 	return dir;
 }
 
-async function waitUntil(predicate: () => boolean): Promise<void> {
+async function waitUntil(
+	predicate: () => boolean | Promise<boolean>,
+): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if (predicate()) {
+		if (await predicate()) {
 			return;
 		}
 		await delay(10);
@@ -1054,6 +1061,52 @@ describe("bootstrapRuntime", () => {
 		await stopDaemons(runtime.daemons);
 	});
 
+	test("restarts a daemon that exits after initialize", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "exit-after-init-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"exit-after-init",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		if (starts === 1) {
+			process.exit(0);
+		}
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.state === "running"
+			);
+		});
+		expect(runtime.daemons[0]?.state).toBe("running");
+		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+
+		await stopDaemons(runtime.daemons);
+	});
+
 	test("fails when a daemon exits before initialize responds", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
@@ -1150,6 +1203,38 @@ describe("bootstrapRuntime", () => {
 		await expect(bootstrap).rejects.toThrow();
 	});
 
+	test("marks a daemon failed when initialize fails", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"bad-init",
+			createModuleScript({
+				initializeResponse: '{"tools":"not-an-array"}',
+			}),
+		);
+		const manifests = await discoverDaemonManifests(
+			resolveModulesRoot(undefined, homeDir),
+		);
+		const manifest = manifests[0];
+		if (!manifest) {
+			throw new Error("Expected bad-init manifest");
+		}
+		let daemon: StartedDaemon | undefined;
+
+		await expect(
+			startDaemon(manifest, {
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+				onSpawned: (spawnedDaemon) => {
+					daemon = spawnedDaemon;
+				},
+			}),
+		).rejects.toThrow('initialize result "tools" must be an array');
+
+		expect(daemon?.state).toBe("failed");
+		await expect(daemon?.process.exited).resolves.toBeNumber();
+	});
+
 	test('fails when initialize result "tools" is not an array', async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const cleanupMarker = path.join(homeDir, "bad-tools-cleanup.txt");
@@ -1212,10 +1297,15 @@ describe("bootstrapRuntime", () => {
 
 	test("terminates a started daemon after stdout closes", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "stdout-closes-starts.txt");
 		await writeDaemonModule(
 			homeDir,
 			"stdout-closes-late",
 			`#!/bin/sh
+starts=0
+if [ -f ${startCountPath} ]; then starts=$(cat ${startCountPath}); fi
+starts=$((starts + 1))
+printf '%s' "$starts" > ${startCountPath}
 IFS= read -r line
 echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
 exec 1>&-
@@ -1235,7 +1325,7 @@ sleep 10
 			await expect(
 				Promise.race([
 					daemon?.process.exited,
-					delay(1_000).then(() => {
+					delay(3_000).then(() => {
 						throw new Error("daemon was not terminated");
 					}),
 				]),
@@ -1245,19 +1335,38 @@ sleep 10
 				daemon.process.kill("SIGKILL");
 			}
 		}
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.restartAttempts === 1 &&
+				runtime.daemons[0]?.state === "failed"
+			);
+		});
+		await stopDaemons(runtime.daemons);
 	});
 
 	test("kills a started daemon that ignores SIGTERM after stdout closes", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "stdout-stubborn-starts.txt");
 		await writeDaemonModule(
 			homeDir,
 			"stdout-closes-stubborn",
 			`#!/bin/sh
 trap '' TERM
+starts=0
+if [ -f ${startCountPath} ]; then starts=$(cat ${startCountPath}); fi
+starts=$((starts + 1))
+printf '%s' "$starts" > ${startCountPath}
 IFS= read -r line
 echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
-exec 1>&-
-sleep 10
+if [ "$starts" -eq 1 ]; then
+	exec 1>&-
+	sleep 10
+fi
+while IFS= read -r line; do
+	echo '{"jsonrpc":"2.0","id":2,"result":"ok"}'
+	exit 0
+done
 `,
 		);
 
@@ -1283,6 +1392,96 @@ sleep 10
 				daemon.process.kill("SIGKILL");
 			}
 		}
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.state === "running"
+			);
+		});
+		await stopDaemons(runtime.daemons);
+	});
+
+	test("restarts a daemon that emits malformed stdout after initialize", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "malformed-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"malformed-after-init",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		if (starts === 1) {
+			console.log("{oops");
+		}
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.state === "running" &&
+				runtime.daemons[0]?.restartAttempts === 1
+			);
+		});
+		expect(runtime.daemons[0]?.state).toBe("running");
+		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+
+		await stopDaemons(runtime.daemons);
+	});
+
+	test("terminates stdout failures for direct startDaemon callers", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"direct-stdout-failure",
+			`#!/bin/sh
+IFS= read -r line
+echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+exec 1>&-
+sleep 10
+`,
+		);
+		const manifests = await discoverDaemonManifests(
+			resolveModulesRoot(undefined, homeDir),
+		);
+		const manifest = manifests[0];
+		if (!manifest) {
+			throw new Error("Expected direct-stdout-failure manifest");
+		}
+
+		const daemon = await startDaemon(manifest, {
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await expect(
+			Promise.race([
+				daemon.process.exited,
+				delay(3_000).then(() => {
+					throw new Error("daemon was not terminated");
+				}),
+			]),
+		).resolves.toBeNumber();
+		expect(daemon.state).toBe("failed");
 	});
 
 	test("shuts down already-started daemons when a later daemon fails", async () => {
@@ -1334,6 +1533,185 @@ sleep 10
 		const processInfo = daemon?.process;
 		expect(processInfo).toBeDefined();
 		await expect(processInfo?.exited).resolves.toBeNumber();
+	});
+
+	test("does not restart a daemon during shutdown", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "shutdown-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"shutdown-no-restart",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await stopDaemons(runtime.daemons);
+		await delay(100);
+
+		expect(await readFile(startCountPath, "utf8")).toBe("1");
+		expect(runtime.daemons[0]?.state).toBe("stopped");
+	});
+
+	test("leaves a daemon failed when the restart also fails", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "restart-fails-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"restart-fails",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.restartAttempts === 1 &&
+				runtime.daemons[0]?.state === "failed"
+			);
+		});
+		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+
+		await stopDaemons(runtime.daemons);
+	});
+
+	test("does not restart after the runtime abort signal is already aborted", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "aborted-restart-starts.txt");
+		const triggerPath = path.join(homeDir, "trigger-exit");
+		await writeDaemonModule(
+			homeDir,
+			"aborted-restart",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		while (!(await Bun.file(${JSON.stringify(triggerPath)}).exists())) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		process.exit(0);
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+		const abortController = new AbortController();
+
+		const runtime = await bootstrapRuntime({
+			abortSignal: abortController.signal,
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		abortController.abort();
+		await writeFile(triggerPath, "exit");
+		await waitUntil(() => runtime.daemons[0]?.state === "failed");
+		await delay(100);
+
+		expect(await readFile(startCountPath, "utf8")).toBe("1");
+		await stopDaemons(runtime.daemons);
+	});
+
+	test("does not let a pending restart outlive stopDaemons", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "pending-restart-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"pending-restart",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		process.exit(0);
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) => {
+				const startCount = Number(
+					await readFile(startCountPath, "utf8").catch(() => "0"),
+				);
+				if (startCount === 1) {
+					await delay(250);
+				}
+				return createUnsandboxedSpec(manifest.moduleDir, manifest.execPath);
+			},
+		});
+
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "1" &&
+				runtime.daemons[0]?.state === "failed"
+			);
+		});
+		const originalDaemon = runtime.daemons[0];
+		await stopDaemons(runtime.daemons);
+
+		expect(runtime.daemons[0]).toBe(originalDaemon);
+		expect(runtime.daemons[0]?.state).toBe("stopped");
+		expect(await readFile(startCountPath, "utf8")).toBe("1");
 	});
 
 	test("waits for a daemon to exit after a shutdown response", async () => {
