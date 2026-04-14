@@ -1,3 +1,8 @@
+import {
+	EventQueue,
+	resolveEventQueuePath,
+	timestampFromUUIDv7,
+} from "./event-queue";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import {
 	type DaemonModuleManifest,
@@ -28,6 +33,7 @@ type StartedDaemon = {
 type BootstrapRuntimeOptions = {
 	abortSignal?: AbortSignal;
 	homeDir?: string;
+	eventQueuePath?: string;
 	initializeTimeoutMs?: number;
 	sandboxFactory?: (
 		manifest: DaemonModuleManifest,
@@ -106,6 +112,22 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
+}
+
+function parseEventNotificationParams(
+	moduleName: string,
+	params: unknown,
+): Record<string, unknown> & { type: "event.v1" } {
+	if (typeof params !== "object" || params === null || Array.isArray(params)) {
+		throw new Error(`${moduleName}: event params must be an object`);
+	}
+
+	const record = params as Record<string, unknown>;
+	if (record.type !== "event.v1") {
+		throw new Error(`${moduleName}: event type must be "event.v1"`);
+	}
+
+	return record as Record<string, unknown> & { type: "event.v1" };
 }
 
 function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
@@ -280,6 +302,7 @@ async function pipeStderr(daemon: StartedDaemon): Promise<void> {
 function createPeer(
 	manifest: DaemonModuleManifest,
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
+	queue?: EventQueue,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -288,11 +311,11 @@ function createPeer(
 		},
 		onNotification: (message: JsonRpcNotification) => {
 			if (message.method === "event") {
-				// Placeholder until the LLM event queue exists: keep module events
-				// visible without treating stderr as the protocol destination.
-				console.error(
-					`[${manifest.name}] event ${JSON.stringify(message.params ?? {})}`,
+				const params = parseEventNotificationParams(
+					manifest.name,
+					message.params,
 				);
+				queue?.enqueue(manifest.name, params);
 				return;
 			}
 
@@ -329,6 +352,7 @@ export async function startDaemon(
 		onSpawned?: (daemon: StartedDaemon) => void;
 		onFailure?: DaemonFailureHandler;
 		restartAttempts?: number;
+		queue?: EventQueue;
 	} = {},
 ): Promise<StartedDaemon> {
 	throwIfAborted(options.abortSignal);
@@ -346,7 +370,7 @@ export async function startDaemon(
 		stderr: "pipe",
 	});
 
-	const peer = createPeer(manifest, process);
+	const peer = createPeer(manifest, process, options.queue);
 	const daemon: StartedDaemon = {
 		manifest,
 		process,
@@ -438,6 +462,7 @@ function superviseDaemon(
 		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
 	>,
 	daemons: StartedDaemon[],
+	eventQueue: EventQueue,
 ): void {
 	void daemon.process.exited.then(() => {
 		handleDaemonFailure(
@@ -445,6 +470,7 @@ function superviseDaemon(
 			new Error(`${daemon.manifest.name}: process exited unexpectedly`),
 			options,
 			daemons,
+			eventQueue,
 		);
 	});
 }
@@ -457,6 +483,7 @@ function handleDaemonFailure(
 		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
 	>,
 	daemons: StartedDaemon[],
+	eventQueue: EventQueue,
 ): void {
 	if (daemon.state !== "running") {
 		return;
@@ -472,6 +499,7 @@ function handleDaemonFailure(
 		error,
 		options,
 		daemons,
+		eventQueue,
 		restartAbortController.signal,
 	);
 	daemon.restartTask = restartTask;
@@ -493,6 +521,7 @@ async function restartFailedDaemon(
 		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
 	>,
 	daemons: StartedDaemon[],
+	eventQueue: EventQueue,
 	restartSignal: AbortSignal,
 ): Promise<void> {
 	try {
@@ -546,8 +575,15 @@ async function restartFailedDaemon(
 			initializeTimeoutMs: options.initializeTimeoutMs,
 			restartAttempts: daemon.restartAttempts + 1,
 			sandboxFactory: options.sandboxFactory,
+			queue: eventQueue,
 			onFailure: (failedDaemon, failureError) => {
-				handleDaemonFailure(failedDaemon, failureError, options, daemons);
+				handleDaemonFailure(
+					failedDaemon,
+					failureError,
+					options,
+					daemons,
+					eventQueue,
+				);
 			},
 		});
 		if (daemon.state !== "failed" || daemons[daemonIndex] !== daemon) {
@@ -555,7 +591,7 @@ async function restartFailedDaemon(
 			return;
 		}
 		daemons[daemonIndex] = replacement;
-		superviseDaemon(replacement, options, daemons);
+		superviseDaemon(replacement, options, daemons, eventQueue);
 		console.error(`[${daemon.manifest.name}] restarted after failure`);
 	} catch (restartError) {
 		if (restartSignal.aborted) {
@@ -575,41 +611,66 @@ export async function bootstrapRuntime(
 ): Promise<{
 	modulesRoot: string;
 	daemons: StartedDaemon[];
+	eventQueue: EventQueue;
 }> {
 	const modulesRoot = resolveModulesRoot(
 		process.env.JUSTCLAW_HOME,
 		options.homeDir,
 	);
-	const manifests = await discoverDaemonManifests(modulesRoot);
-	if (manifests.length === 0) {
-		throw new Error(`No modules available in ${modulesRoot}`);
-	}
+	const dbPath =
+		options.eventQueuePath ??
+		resolveEventQueuePath(process.env.JUSTCLAW_HOME, options.homeDir);
+	const eventQueue = new EventQueue(dbPath);
 	const daemons = options.startedDaemons ?? [];
 
 	try {
+		const manifests = await discoverDaemonManifests(modulesRoot);
+		if (manifests.length === 0) {
+			throw new Error(`No modules available in ${modulesRoot}`);
+		}
+
 		for (const manifest of manifests) {
 			throwIfAborted(options.abortSignal);
 			await startDaemon(manifest, {
 				abortSignal: options.abortSignal,
 				initializeTimeoutMs: options.initializeTimeoutMs,
 				sandboxFactory: options.sandboxFactory,
+				queue: eventQueue,
 				onFailure: (daemon, error) => {
-					handleDaemonFailure(daemon, error, options, daemons);
+					handleDaemonFailure(daemon, error, options, daemons, eventQueue);
 				},
 				onSpawned: (daemon) => {
 					daemons.push(daemon);
 				},
 			}).then((daemon) => {
-				superviseDaemon(daemon, options, daemons);
+				superviseDaemon(daemon, options, daemons, eventQueue);
 			});
 		}
+
+		for (const event of eventQueue.stale()) {
+			const daemon = daemons.find((d) => d.manifest.name === event.source);
+			if (daemon) {
+				daemon.peer.notify("event", {
+					type: "event.dropped.v1",
+					source: event.source,
+					timestamp: timestampFromUUIDv7(event.id),
+					params: event.params,
+				});
+			} else {
+				console.error(
+					`[core] event lost: source=${event.source} id=${event.id}`,
+				);
+			}
+			eventQueue.complete(event.id);
+		}
 	} catch (error) {
+		eventQueue.close();
 		await stopDaemons(daemons);
 		daemons.length = 0;
 		throw error;
 	}
 
-	return { modulesRoot, daemons };
+	return { modulesRoot, daemons, eventQueue };
 }
 
 export async function stopDaemons(daemons: StartedDaemon[]): Promise<void> {
