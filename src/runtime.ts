@@ -127,6 +127,23 @@ function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
 	return tools;
 }
 
+function parseEventNotificationParams(
+	moduleName: string,
+	params: unknown,
+): Record<string, unknown> & { type: "event.v1" } {
+	if (typeof params !== "object" || params === null || Array.isArray(params)) {
+		throw new Error(`${moduleName}: event params must be an object`);
+	}
+
+	const { type } = params as { type?: unknown };
+
+	if (type !== "event.v1") {
+		throw new Error(`${moduleName}: event type must be "event.v1"`);
+	}
+
+	return params as Record<string, unknown> & { type: "event.v1" };
+}
+
 async function terminateDaemonProcess(daemon: StartedDaemon): Promise<void> {
 	if (daemon.process.exitCode === null) {
 		signalDaemonProcessGroup(daemon, "SIGTERM");
@@ -288,11 +305,13 @@ function createPeer(
 		},
 		onNotification: (message: JsonRpcNotification) => {
 			if (message.method === "event") {
+				const params = parseEventNotificationParams(
+					manifest.name,
+					message.params,
+				);
 				// Placeholder until the LLM event queue exists: keep module events
 				// visible without treating stderr as the protocol destination.
-				console.error(
-					`[${manifest.name}] event ${JSON.stringify(message.params ?? {})}`,
-				);
+				console.error(`[${manifest.name}] event ${JSON.stringify(params)}`);
 				return;
 			}
 

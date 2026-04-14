@@ -69,8 +69,7 @@ If `JUSTCLAW_HOME` is set, the runtime uses `JUSTCLAW_HOME/modules/` instead. Ea
   "exec": "./{entrypoint}",
   "mode": "timer",
   "cron": "0 9 * * 1-5",
-  "timezone": "Asia/Tokyo",
-  "event_type": "{event.type}"
+  "timezone": "Asia/Tokyo"
 }
 ```
 
@@ -86,6 +85,21 @@ If `JUSTCLAW_HOME` is set, the runtime uses `JUSTCLAW_HOME/modules/` instead. Ea
 ## Event Processing
 
 ### Event Flow
+
+Canonical module event envelope:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "type": "event.v1",
+    "kind": "{event.kind}"
+  }
+}
+```
+
+`type` is the reserved envelope discriminator. Ordinary event semantics should go in another payload field such as `kind`.
 
 ```
 Module (source)                    Core                         Module (target)
