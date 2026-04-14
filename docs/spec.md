@@ -55,6 +55,7 @@ For ordinary event semantics, modules should use another payload field such as `
 | `tool/{name}` | core -> module | request | Invoke a tool exposed by the module |
 | `shutdown` | core -> module | request | Graceful stop |
 | `event` | module -> core | notification | Event emitted by the module |
+| `event` | core -> module | notification | Core-initiated notification (see Core → Module Messaging) |
 
 ## Lifecycle (daemon)
 
@@ -118,7 +119,11 @@ If the resolved interpreter is outside the sandbox's standard read-only allowlis
 
 ## Core → Module Messaging
 
-The core delivers outbound messages to modules via a dedicated `message.send.v1` envelope. Unlike module-emitted events (which the LLM consumes), this notification is consumed by module code, so its format is fixed.
+The core sends notifications to modules using `method: "event"` with a versioned `type` field as the discriminator. Unlike module-emitted events (which the LLM consumes), these notifications are consumed by module code, so their formats are fixed.
+
+### `message.send.v1`
+
+The core delivers outbound LLM-generated messages to modules via `message.send.v1`.
 
 ```json
 {
@@ -139,6 +144,36 @@ The core delivers outbound messages to modules via a dedicated `message.send.v1`
 The notification carries no destination information. Modules are responsible for determining where to actually deliver the message based on their own conversational state. A messaging module typically tracks its most recent conversation context and uses it as the default destination.
 
 If precise destination control is required (e.g., DM a specific user, send to a non-default channel), modules should expose this as a tool with explicit parameters rather than relying on the `message.send.v1` notification.
+
+### `event.dropped.v1`
+
+When the core restarts and finds an event that was in the `running` state (i.e., the LLM cycle started but did not complete), it notifies the source module via `event.dropped.v1`. The source module can use this to decide whether to re-emit the event.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "type": "event.dropped.v1",
+    "source": "{module-name}",
+    "timestamp": "2026-04-14T10:00:00.000Z",
+    "params": {
+      "type": "event.v1",
+      "kind": "message.received",
+      "..."
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `event.dropped.v1` |
+| `source` | string | Name of the module that originally emitted the event |
+| `timestamp` | string | ISO 8601, when the event was originally received by the core |
+| `params` | object | Original event params as emitted by the source module |
+
+If the source module is no longer present at restart, the event is discarded silently. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
 ### Auto-routing
 

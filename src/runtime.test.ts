@@ -164,32 +164,6 @@ async function writeRawDaemonModule(
 	await chmod(scriptPath, 0o755);
 }
 
-function createEventModuleScript({
-	eventParams,
-	emitAfterInitialize = true,
-}: {
-	eventParams: string;
-	emitAfterInitialize?: boolean;
-}): string {
-	return `#!/usr/bin/env bun
-let emitted = false;
-${emitAfterInitialize ? "" : `console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: ${eventParams} }));\nemitted = true;\n`}for await (const chunk of Bun.stdin.stream()) {
-	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
-	if (message.method === "initialize") {
-		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
-		${
-			emitAfterInitialize
-				? `if (!emitted) {\n\t\t\tconsole.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: ${eventParams} }));\n\t\t\temitted = true;\n\t\t}`
-				: ""
-		}
-	} else if (message.method === "shutdown") {
-		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
-		process.exit(0);
-	}
-}
-`;
-}
-
 function createStdoutClosingShellScript(): string {
 	return `#!/bin/sh
 exec 1>&-
@@ -354,11 +328,58 @@ describe("JsonRpcPeer", () => {
 			JSON.stringify({
 				jsonrpc: "2.0",
 				method: "event",
-				params: { type: "event.v1", kind: "message.received" },
+				params: { type: "message.received" },
 			}),
 		);
 
 		expect(methods).toEqual(["event"]);
+	});
+
+	test("notify sends a JSON-RPC notification without an id", () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+		});
+
+		peer.notify("event", { type: "event.v1", x: 1 });
+		expect(sentLines).toHaveLength(1);
+		const msg = JSON.parse(sentLines[0] ?? "{}");
+		expect(msg.jsonrpc).toBe("2.0");
+		expect(msg.method).toBe("event");
+		expect(msg.id).toBeUndefined();
+		expect(msg.params).toEqual({ type: "event.v1", x: 1 });
+	});
+
+	test("notify omits params when undefined", () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+		});
+
+		peer.notify("ping");
+		const msg = JSON.parse(sentLines[0] ?? "{}");
+		expect(msg.method).toBe("ping");
+		expect("params" in msg).toBe(false);
+	});
+
+	test("notify silently drops when the peer is closed", () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+		});
+
+		peer.close(new Error("closed"));
+		peer.notify("event", { type: "event.v1" });
+		expect(sentLines).toHaveLength(0);
 	});
 
 	test("rejects responses for unknown request ids", () => {
@@ -1007,9 +1028,12 @@ describe("bootstrapRuntime", () => {
 	test("fails when runtime modules directory does not exist", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			"No modules directory found at",
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
+			}),
+		).rejects.toThrow("No modules directory found at");
 	});
 
 	test("ignores directories without a manifest file", async () => {
@@ -1034,9 +1058,12 @@ describe("bootstrapRuntime", () => {
 		await mkdir(path.join(modulesRoot, "notes"), { recursive: true });
 		await writeFile(path.join(modulesRoot, ".DS_Store"), "noise");
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			`No modules available in ${modulesRoot}`,
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
+			}),
+		).rejects.toThrow(`No modules available in ${modulesRoot}`);
 	});
 
 	test("ignores non-module filesystem noise in the modules root", async () => {
@@ -1062,9 +1089,12 @@ describe("bootstrapRuntime", () => {
 			createModuleScript(),
 		);
 
-		await expect(bootstrapRuntime({ homeDir })).rejects.toThrow(
-			"is not valid JSON",
-		);
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
+			}),
+		).rejects.toThrow("is not valid JSON");
 	});
 
 	test("discovers, initializes, and shuts down a daemon module", async () => {
@@ -1077,6 +1107,7 @@ describe("bootstrapRuntime", () => {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1085,6 +1116,7 @@ describe("bootstrapRuntime", () => {
 		expect(runtime.daemons[0]?.tools).toEqual([]);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("restarts a daemon that exits after initialize", async () => {
@@ -1117,6 +1149,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1131,6 +1164,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("fails when a daemon exits before initialize responds", async () => {
@@ -1144,6 +1178,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1161,6 +1196,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1183,6 +1219,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1200,6 +1237,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				initializeTimeoutMs: 50,
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1218,6 +1256,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const bootstrap = bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			initializeTimeoutMs: 5_000,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1276,6 +1315,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1298,6 +1338,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1315,6 +1356,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1341,6 +1383,7 @@ sleep 10
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1369,6 +1412,7 @@ sleep 10
 			);
 		});
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("kills a started daemon that ignores SIGTERM after stdout closes", async () => {
@@ -1398,6 +1442,7 @@ done
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1425,6 +1470,7 @@ done
 			);
 		});
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("restarts a daemon that emits malformed stdout after initialize", async () => {
@@ -1457,6 +1503,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1472,6 +1519,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("terminates stdout failures for direct startDaemon callers", async () => {
@@ -1529,6 +1577,7 @@ sleep 10
 		await expect(
 			bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1548,6 +1597,7 @@ sleep 10
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1555,6 +1605,7 @@ sleep 10
 		expect(daemon).toBeDefined();
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 
 		const processInfo = daemon?.process;
 		expect(processInfo).toBeDefined();
@@ -1588,11 +1639,13 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 		await delay(100);
 
 		expect(await readFile(startCountPath, "utf8")).toBe("1");
@@ -1624,6 +1677,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1638,6 +1692,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("does not restart after the runtime abort signal is already aborted", async () => {
@@ -1674,6 +1729,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			abortSignal: abortController.signal,
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1685,6 +1741,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		expect(await readFile(startCountPath, "utf8")).toBe("1");
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("does not let a pending restart outlive stopDaemons", async () => {
@@ -1715,6 +1772,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) => {
 				const startCount = Number(
 					await readFile(startCountPath, "utf8").catch(() => "0"),
@@ -1734,6 +1792,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		});
 		const originalDaemon = runtime.daemons[0];
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 
 		expect(runtime.daemons[0]).toBe(originalDaemon);
 		expect(runtime.daemons[0]?.state).toBe("stopped");
@@ -1775,11 +1834,13 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 
 		await expect(readFile(cleanupMarker, "utf8")).resolves.toContain("cleanup");
 	});
@@ -1794,6 +1855,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1801,6 +1863,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(daemon).toBeDefined();
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 		await expect(daemon?.process.exited).resolves.toBeNumber();
 	});
 
@@ -1827,6 +1890,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1834,6 +1898,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(childPid).toBeGreaterThan(0);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 
 		await waitUntil(() => {
 			try {
@@ -1864,6 +1929,7 @@ exit 0
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1871,6 +1937,7 @@ exit 0
 		expect(childPid).toBeGreaterThan(0);
 
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 
 		await waitUntil(() => {
 			try {
@@ -1899,10 +1966,12 @@ exit 0
 		try {
 			const runtime = await bootstrapRuntime({
 				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			});
 			await stopDaemons(runtime.daemons);
+			runtime.eventQueue.close();
 		} finally {
 			console.error = originalConsoleError;
 		}
@@ -1912,108 +1981,17 @@ exit 0
 		).toBe(true);
 	});
 
-	test("logs event notifications until the LLM queue exists", async () => {
+	test("enqueues event.v1 notifications from daemon stdout", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
 			"event-module",
-			createEventModuleScript({
-				eventParams:
-					'{ type: "event.v1", kind: "message.received", text: "hello" }',
-			}),
-		);
-
-		const messages: string[] = [];
-		const originalConsoleError = console.error;
-		console.error = (...args: unknown[]) => {
-			messages.push(args.join(" "));
-		};
-
-		try {
-			const runtime = await bootstrapRuntime({
-				homeDir,
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			});
-			await stopDaemons(runtime.daemons);
-		} finally {
-			console.error = originalConsoleError;
-		}
-
-		expect(
-			messages.some((message) =>
-				message.includes(
-					'[event-module] event {"type":"event.v1","kind":"message.received","text":"hello"}',
-				),
-			),
-		).toBe(true);
-	});
-
-	test.each([
-		{
-			name: "missing params",
-			eventParamsExpression: "undefined",
-			expectedError: "invalid-event: event params must be an object",
-		},
-		{
-			name: "non-object params",
-			eventParamsExpression: '"oops"',
-			expectedError: "invalid-event: event params must be an object",
-		},
-		{
-			name: "missing type",
-			eventParamsExpression: '{ kind: "message.received" }',
-			expectedError: 'invalid-event: event type must be "event.v1"',
-		},
-		{
-			name: "wrong type",
-			eventParamsExpression:
-				'{ type: "message.received", kind: "message.received" }',
-			expectedError: 'invalid-event: event type must be "event.v1"',
-		},
-	])("rejects event notifications with $name", async ({
-		eventParamsExpression,
-		expectedError,
-	}) => {
-		const homeDir = await createTempDir("justclaw-home-");
-		await writeDaemonModule(
-			homeDir,
-			"invalid-event",
-			createEventModuleScript({
-				eventParams: eventParamsExpression,
-				emitAfterInitialize: false,
-			}),
-		);
-
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow(expectedError);
-	});
-
-	test("restarts a daemon after an invalid event envelope emitted post-initialize", async () => {
-		const homeDir = await createTempDir("justclaw-home-");
-		const startCountPath = path.join(homeDir, "invalid-event-restarts.txt");
-		await writeDaemonModule(
-			homeDir,
-			"event-restart",
 			`#!/usr/bin/env bun
-let starts = 0;
-try {
-	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
-} catch {}
-starts += 1;
-await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "message.received", text: "hello" } }));
 for await (const chunk of Bun.stdin.stream()) {
 	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
 	if (message.method === "initialize") {
 		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
-		if (starts === 1) {
-			console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "message.received", text: "hello" } }));
-		}
 	} else if (message.method === "shutdown") {
 		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
 		process.exit(0);
@@ -2024,19 +2002,19 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
-
-		await waitUntil(async () => {
-			return (
-				(await readFile(startCountPath, "utf8").catch(() => "0")) === "2" &&
-				runtime.daemons[0]?.state === "running" &&
-				runtime.daemons[0]?.restartAttempts === 1
-			);
+		const queued = await runtime.eventQueue.next();
+		expect(queued?.source).toBe("event-module");
+		expect(queued?.params).toEqual({
+			type: "event.v1",
+			kind: "message.received",
+			text: "hello",
 		});
-
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 
 	test("resolveModulesRoot rejects empty HOME", () => {
@@ -2075,11 +2053,13 @@ for await (const chunk of Bun.stdin.stream()) {
 			await chmod(path.join(moduleDir, "module.ts"), 0o755);
 
 			const runtime = await bootstrapRuntime({
+				eventQueuePath: path.join(justclawHome, "events.db"),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			});
 			expect(runtime.modulesRoot).toBe(path.join(justclawHome, "modules"));
 			await stopDaemons(runtime.daemons);
+			runtime.eventQueue.close();
 		} finally {
 			if (originalJustclawHome === undefined) {
 				delete process.env.JUSTCLAW_HOME;
@@ -2107,10 +2087,12 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		const runtime = await bootstrapRuntime({
 			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
 		await expect(stat(cleanupMarker)).rejects.toThrow();
 		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
 	});
 });

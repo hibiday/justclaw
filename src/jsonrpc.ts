@@ -92,6 +92,23 @@ export class JsonRpcPeer {
 		return promise;
 	}
 
+	notify(method: string, params?: unknown): void {
+		if (this.#closedError) {
+			return;
+		}
+
+		const notification: JsonRpcNotification = { jsonrpc: "2.0", method };
+		if (params !== undefined) {
+			notification.params = params;
+		}
+
+		try {
+			this.#sendLine(JSON.stringify(notification));
+		} catch {
+			// Same as best-effort outbound path: avoid throwing from notify.
+		}
+	}
+
 	handleLine(line: string): void {
 		let message: unknown;
 		try {

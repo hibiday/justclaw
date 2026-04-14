@@ -27,25 +27,31 @@ function createShutdownSignal(): {
 
 async function main(): Promise<void> {
 	const daemons: StartedDaemon[] = [];
+	let eventQueue:
+		| Awaited<ReturnType<typeof bootstrapRuntime>>["eventQueue"]
+		| undefined;
 	const shutdown = createShutdownSignal();
 	const abortController = new AbortController();
 	const shutdownTask = shutdown.promise.then(async () => {
 		abortController.abort();
+		eventQueue?.close();
 		await stopDaemons(daemons);
 	});
 
 	try {
-		const { modulesRoot } = await bootstrapRuntime({
+		const result = await bootstrapRuntime({
 			abortSignal: abortController.signal,
 			startedDaemons: daemons,
 		});
+		eventQueue = result.eventQueue;
 		console.error(
-			`Loaded ${daemons.length} daemon module(s) from ${modulesRoot}`,
+			`Loaded ${daemons.length} daemon module(s) from ${result.modulesRoot}`,
 		);
 
 		await shutdownTask;
 	} catch (error) {
 		abortController.abort();
+		eventQueue?.close();
 		await stopDaemons(daemons);
 		throw error;
 	} finally {
