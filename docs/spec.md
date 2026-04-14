@@ -35,6 +35,16 @@ Events are not declared. A module may emit any notification at any time; the cor
 
 A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls).
 
+### Tool Definition Format
+
+Each entry in the `tools` array follows the OpenAI function tool format:
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Tool name. Must be unique within the module. Used as `{module}__{name}` in the LLM context. |
+| `description` | string | Description for the LLM |
+| `parameters` | object | JSON Schema object describing the parameters |
+
 ## Reserved Fields
 
 All payloads (request `params`, response `result`, notification `params`) reserve the top-level `type` field for envelope-level discrimination. The convention is dot-separated and versioned (`event.v1`, `message.send.v1`, etc.).
@@ -147,7 +157,14 @@ If precise destination control is required (e.g., DM a specific user, send to a 
 
 ### `event.dropped.v1`
 
-When the core restarts and finds an event that was in the `running` state (i.e., the LLM cycle started but did not complete), it notifies the source module via `event.dropped.v1`. The source module can use this to decide whether to re-emit the event.
+The core notifies the source module when it **consumes an event for an LLM cycle but that cycle does not complete normally**. The source module can use this to decide whether to re-emit the event.
+
+That includes at least:
+
+- **Restart recovery:** the previous process exited while one or more events were still marked `running` in the queue (the LLM cycle had started but never finished).
+- **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully.
+
+In both cases the notification shape is the same.
 
 ```json
 {
@@ -173,7 +190,7 @@ When the core restarts and finds an event that was in the `running` state (i.e.,
 | `timestamp` | string | ISO 8601, when the event was originally received by the core |
 | `params` | object | Original event params as emitted by the source module |
 
-If the source module is no longer present at restart, the event is discarded silently. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
+If the source module is not available (for example, not loaded after restart or the daemon is gone), the core logs the loss and removes the queue row; it does not retry delivery. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
 ### Auto-routing
 

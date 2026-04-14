@@ -1,8 +1,5 @@
-import {
-	EventQueue,
-	resolveEventQueuePath,
-	timestampFromUUIDv7,
-} from "./event-queue";
+import { notifyEventDropped } from "./event-dropped";
+import { EventQueue, resolveEventQueuePath } from "./event-queue";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import {
 	type DaemonModuleManifest,
@@ -12,6 +9,12 @@ import {
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
 
 type DaemonState = "starting" | "running" | "stopping" | "stopped" | "failed";
+
+export type ToolDefinition = {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+};
 
 type StartedDaemon = {
 	manifest: DaemonModuleManifest;
@@ -27,7 +30,7 @@ type StartedDaemon = {
 	// otherwise stopDaemons() can return before that replacement is stopped.
 	restartTask?: Promise<void>;
 	restartAbortController?: AbortController;
-	tools: unknown[];
+	tools: ToolDefinition[];
 };
 
 type BootstrapRuntimeOptions = {
@@ -130,7 +133,10 @@ function parseEventNotificationParams(
 	return record as Record<string, unknown> & { type: "event.v1" };
 }
 
-function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
+function parseInitializeResult(
+	moduleName: string,
+	result: unknown,
+): ToolDefinition[] {
 	if (typeof result !== "object" || result === null || Array.isArray(result)) {
 		throw new Error(`${moduleName}: initialize result must be an object`);
 	}
@@ -146,7 +152,12 @@ function parseInitializeResult(moduleName: string, result: unknown): unknown[] {
 		);
 	}
 
-	return tools;
+	return tools.map((t, i) => {
+		if (typeof (t as { name?: unknown })?.name !== "string") {
+			throw new Error(`${moduleName}: tool[${i}].name must be a string`);
+		}
+		return t as ToolDefinition;
+	});
 }
 
 async function terminateDaemonProcess(daemon: StartedDaemon): Promise<void> {
@@ -648,19 +659,7 @@ export async function bootstrapRuntime(
 		}
 
 		for (const event of eventQueue.stale()) {
-			const daemon = daemons.find((d) => d.manifest.name === event.source);
-			if (daemon) {
-				daemon.peer.notify("event", {
-					type: "event.dropped.v1",
-					source: event.source,
-					timestamp: timestampFromUUIDv7(event.id),
-					params: event.params,
-				});
-			} else {
-				console.error(
-					`[core] event lost: source=${event.source} id=${event.id}`,
-				);
-			}
+			notifyEventDropped(daemons, event);
 			eventQueue.complete(event.id);
 		}
 	} catch (error) {
