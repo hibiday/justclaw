@@ -1436,7 +1436,11 @@ for await (const chunk of Bun.stdin.stream()) {
 		});
 
 		await waitUntil(async () => {
-			return (await readFile(startCountPath, "utf8")) === "2";
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.state === "running" &&
+				runtime.daemons[0]?.restartAttempts === 1
+			);
 		});
 		expect(runtime.daemons[0]?.state).toBe("running");
 		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
