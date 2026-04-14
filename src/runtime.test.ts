@@ -1325,6 +1325,27 @@ for await (const chunk of Bun.stdin.stream()) {
 		);
 	});
 
+	test("fails when a tool entry has a non-string name", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"bad-tool-name",
+			createModuleScript({
+				initializeResponse:
+					'{"tools":[{"description":"d","parameters":{"type":"object"}}]}',
+			}),
+		);
+
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow("bad-tool-name: tool[0].name must be a string");
+	});
+
 	test("rejects array initialize results", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(

@@ -1,3 +1,4 @@
+import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
 
 function createShutdownSignal(): {
@@ -39,6 +40,7 @@ async function main(): Promise<void> {
 	});
 
 	try {
+		const model = resolveModelConfig();
 		const result = await bootstrapRuntime({
 			abortSignal: abortController.signal,
 			startedDaemons: daemons,
@@ -48,7 +50,12 @@ async function main(): Promise<void> {
 			`Loaded ${daemons.length} daemon module(s) from ${result.modulesRoot}`,
 		);
 
-		await shutdownTask;
+		// If shutdown wins the race, we do not await runLlmLoop afterward. Main
+		// returns once shutdownTask finishes; runLlmLoop may still be blocked on
+		// runner.run (closing the queue does not cancel an in-flight LLM call).
+		// The event row can stay `running` until the next start, when stale
+		// recovery emits event.dropped.v1. Acceptable by design.
+		await Promise.race([runLlmLoop(eventQueue, daemons, model), shutdownTask]);
 	} catch (error) {
 		abortController.abort();
 		eventQueue?.close();
