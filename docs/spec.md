@@ -37,7 +37,7 @@ A daemon module may provide both tools and events. A timer module emits events o
 
 ## Reserved Fields
 
-All payloads (request `params`, response `result`, notification `params`) reserve the top-level `type` field as a string discriminator. The convention is dot-separated (`message.received`, `timer.fired`, etc.).
+All payloads (request `params`, response `result`, notification `params`) reserve the top-level `type` field for envelope-level discrimination. The convention is dot-separated and versioned (`event.v1`, `message.send.v1`, etc.).
 
 This applies to:
 
@@ -45,7 +45,7 @@ This applies to:
 - All tool requests and responses
 - All event payloads
 
-The `type` field allows modules and the core to dispatch on a single field without parsing the rest of the payload.
+For ordinary event semantics, modules should use another payload field such as `kind` rather than overloading `type`. `kind` is a convention, not a reserved protocol field.
 
 ## Methods
 
@@ -55,6 +55,7 @@ The `type` field allows modules and the core to dispatch on a single field witho
 | `tool/{name}` | core -> module | request | Invoke a tool exposed by the module |
 | `shutdown` | core -> module | request | Graceful stop |
 | `event` | module -> core | notification | Event emitted by the module |
+| `event` | core -> module | notification | Core-initiated notification (see Core → Module Messaging) |
 
 ## Lifecycle (daemon)
 
@@ -118,14 +119,18 @@ If the resolved interpreter is outside the sandbox's standard read-only allowlis
 
 ## Core → Module Messaging
 
-The core delivers outbound messages to modules via the `message.send` notification. Unlike module-emitted events (which the LLM consumes), this notification is consumed by module code, so its format is fixed.
+The core sends notifications to modules using `method: "event"` with a versioned `type` field as the discriminator. Unlike module-emitted events (which the LLM consumes), these notifications are consumed by module code, so their formats are fixed.
+
+### `message.send.v1`
+
+The core delivers outbound LLM-generated messages to modules via `message.send.v1`.
 
 ```json
 {
   "jsonrpc": "2.0",
   "method": "event",
   "params": {
-    "type": "message.send",
+    "type": "message.send.v1",
     "text": "..."
   }
 }
@@ -133,12 +138,42 @@ The core delivers outbound messages to modules via the `message.send` notificati
 
 | Field | Type | Description |
 |---|---|---|
-| `type` | string | Always `message.send` |
+| `type` | string | Always `message.send.v1` |
 | `text` | string | Message body |
 
 The notification carries no destination information. Modules are responsible for determining where to actually deliver the message based on their own conversational state. A messaging module typically tracks its most recent conversation context and uses it as the default destination.
 
-If precise destination control is required (e.g., DM a specific user, send to a non-default channel), modules should expose this as a tool with explicit parameters rather than relying on the `message.send` notification.
+If precise destination control is required (e.g., DM a specific user, send to a non-default channel), modules should expose this as a tool with explicit parameters rather than relying on the `message.send.v1` notification.
+
+### `event.dropped.v1`
+
+When the core restarts and finds an event that was in the `running` state (i.e., the LLM cycle started but did not complete), it notifies the source module via `event.dropped.v1`. The source module can use this to decide whether to re-emit the event.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "type": "event.dropped.v1",
+    "source": "{module-name}",
+    "timestamp": "2026-04-14T10:00:00.000Z",
+    "params": {
+      "type": "event.v1",
+      "kind": "message.received",
+      "..."
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `event.dropped.v1` |
+| `source` | string | Name of the module that originally emitted the event |
+| `timestamp` | string | ISO 8601, when the event was originally received by the core |
+| `params` | object | Original event params as emitted by the source module |
+
+If the source module is no longer present at restart, the event is discarded silently. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
 ### Auto-routing
 
@@ -197,11 +232,11 @@ send_message(module: string, text: string)
 | `module` | Target module name |
 | `text` | Message body |
 
-The core forwards this as a `message.send` notification to the named module, then updates the default delivery target.
+The core forwards this as a `message.send.v1` notification to the named module, then updates the default delivery target.
 
 ## Event Format for LLM
 
-Event payloads are arbitrary JSON objects. The core converts them to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
+Event payloads are arbitrary JSON objects. The canonical event envelope uses `type: "event.v1"`. The core uses `type` for envelope handling and does not forward it to the LLM. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
 **Conversion rules:**
 
@@ -223,7 +258,8 @@ Module emits:
   "jsonrpc": "2.0",
   "method": "event",
   "params": {
-    "type": "message.received",
+    "type": "event.v1",
+    "kind": "message.received",
     "user": "alice",
     "text": "hello",
     "tags": ["greeting", "casual"]
@@ -235,7 +271,7 @@ LLM receives:
 
 ```xml
 <event source="{module-name}" timestamp="2026-04-10T10:00:00Z">
-  <type>message.received</type>
+  <kind>message.received</kind>
   <user>alice</user>
   <text>hello</text>
   <tags>greeting</tags>
