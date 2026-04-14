@@ -164,6 +164,32 @@ async function writeRawDaemonModule(
 	await chmod(scriptPath, 0o755);
 }
 
+function createEventModuleScript({
+	eventParams,
+	emitAfterInitialize = true,
+}: {
+	eventParams: string;
+	emitAfterInitialize?: boolean;
+}): string {
+	return `#!/usr/bin/env bun
+let emitted = false;
+${emitAfterInitialize ? "" : `console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: ${eventParams} }));\nemitted = true;\n`}for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		${
+			emitAfterInitialize
+				? `if (!emitted) {\n\t\t\tconsole.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: ${eventParams} }));\n\t\t\temitted = true;\n\t\t}`
+				: ""
+		}
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`;
+}
+
 function createStdoutClosingShellScript(): string {
 	return `#!/bin/sh
 exec 1>&-
@@ -328,7 +354,7 @@ describe("JsonRpcPeer", () => {
 			JSON.stringify({
 				jsonrpc: "2.0",
 				method: "event",
-				params: { type: "message.received" },
+				params: { type: "event.v1", kind: "message.received" },
 			}),
 		);
 
@@ -1891,18 +1917,10 @@ exit 0
 		await writeDaemonModule(
 			homeDir,
 			"event-module",
-			`#!/usr/bin/env bun
-console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "message.received", text: "hello" } }));
-for await (const chunk of Bun.stdin.stream()) {
-	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
-	if (message.method === "initialize") {
-		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
-	} else if (message.method === "shutdown") {
-		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
-		process.exit(0);
-	}
-}
-`,
+			createEventModuleScript({
+				eventParams:
+					'{ type: "event.v1", kind: "message.received", text: "hello" }',
+			}),
 		);
 
 		const messages: string[] = [];
@@ -1925,10 +1943,100 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(
 			messages.some((message) =>
 				message.includes(
-					'[event-module] event {"type":"message.received","text":"hello"}',
+					'[event-module] event {"type":"event.v1","kind":"message.received","text":"hello"}',
 				),
 			),
 		).toBe(true);
+	});
+
+	test.each([
+		{
+			name: "missing params",
+			eventParamsExpression: "undefined",
+			expectedError: "invalid-event: event params must be an object",
+		},
+		{
+			name: "non-object params",
+			eventParamsExpression: '"oops"',
+			expectedError: "invalid-event: event params must be an object",
+		},
+		{
+			name: "missing type",
+			eventParamsExpression: '{ kind: "message.received" }',
+			expectedError: 'invalid-event: event type must be "event.v1"',
+		},
+		{
+			name: "wrong type",
+			eventParamsExpression:
+				'{ type: "message.received", kind: "message.received" }',
+			expectedError: 'invalid-event: event type must be "event.v1"',
+		},
+	])("rejects event notifications with $name", async ({
+		eventParamsExpression,
+		expectedError,
+	}) => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeDaemonModule(
+			homeDir,
+			"invalid-event",
+			createEventModuleScript({
+				eventParams: eventParamsExpression,
+				emitAfterInitialize: false,
+			}),
+		);
+
+		await expect(
+			bootstrapRuntime({
+				homeDir,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			}),
+		).rejects.toThrow(expectedError);
+	});
+
+	test("restarts a daemon after an invalid event envelope emitted post-initialize", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "invalid-event-restarts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"event-restart",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		if (starts === 1) {
+			console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "message.received", text: "hello" } }));
+		}
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8").catch(() => "0")) === "2" &&
+				runtime.daemons[0]?.state === "running" &&
+				runtime.daemons[0]?.restartAttempts === 1
+			);
+		});
+
+		await stopDaemons(runtime.daemons);
 	});
 
 	test("resolveModulesRoot rejects empty HOME", () => {
