@@ -6,11 +6,22 @@ import {
 } from "./module-manifest";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
 
+type DaemonState = "starting" | "running" | "stopping" | "stopped" | "failed";
+
 type StartedDaemon = {
 	manifest: DaemonModuleManifest;
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	peer: JsonRpcPeer;
-	stopping: boolean;
+	state: DaemonState;
+	restartAttempts: number;
+	// stdout can fail immediately after initialize resolves but before the
+	// caller observes the daemon as running. Preserve that fatal signal so
+	// supervision handles it without changing the initialize startup boundary.
+	fatalError?: Error;
+	// Shutdown must wait for a restart that already spawned a replacement;
+	// otherwise stopDaemons() can return before that replacement is stopped.
+	restartTask?: Promise<void>;
+	restartAbortController?: AbortController;
 	tools: unknown[];
 };
 
@@ -23,6 +34,8 @@ type BootstrapRuntimeOptions = {
 	) => Promise<SandboxLaunchSpec>;
 	startedDaemons?: StartedDaemon[];
 };
+
+type DaemonFailureHandler = (daemon: StartedDaemon, error: Error) => void;
 
 const INITIALIZE_TIMEOUT_MS = 5_000;
 const SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -136,6 +149,33 @@ async function terminateDaemonProcess(daemon: StartedDaemon): Promise<void> {
 	await terminateDaemonProcessGroup(daemon);
 }
 
+async function cleanupFailedStartupDaemon(
+	daemon: StartedDaemon,
+	error: Error,
+): Promise<void> {
+	daemon.state = "failed";
+	try {
+		await withTimeout(
+			daemon.peer.request("shutdown"),
+			SHUTDOWN_TIMEOUT_MS,
+			() => new Error(`${daemon.manifest.name}: shutdown timed out`),
+		);
+		await withTimeout(daemon.process.exited, SHUTDOWN_TIMEOUT_MS, () => {
+			return new Error(
+				`${daemon.manifest.name}: process did not exit after shutdown`,
+			);
+		});
+		await terminateDaemonProcessGroup(daemon);
+		return;
+	} catch {
+		// Startup still failed, but a daemon that reached the protocol should get
+		// the same cleanup opportunity as normal shutdown before signals.
+	}
+
+	daemon.peer.close(error);
+	await terminateDaemonProcess(daemon).catch(() => undefined);
+}
+
 function signalDaemonProcessGroup(
 	daemon: StartedDaemon,
 	signal: NodeJS.Signals,
@@ -197,19 +237,10 @@ function daemonProcessGroupExists(daemon: StartedDaemon): boolean {
 	}
 }
 
-function terminateAfterFatalStdoutFailure(daemon: StartedDaemon): void {
-	if (daemon.stopping) {
-		return;
-	}
-
-	void terminateDaemonProcess(daemon).catch((error) => {
-		console.error(
-			`[${daemon.manifest.name}] failed to terminate after stdout failure: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	});
-}
-
-async function pipeStdout(daemon: StartedDaemon): Promise<void> {
+async function pipeStdout(
+	daemon: StartedDaemon,
+	onFailure: DaemonFailureHandler,
+): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stdout, (line) => {
 			daemon.peer.handleLine(line);
@@ -217,18 +248,20 @@ async function pipeStdout(daemon: StartedDaemon): Promise<void> {
 		const error = new Error(
 			`${daemon.manifest.name}: stdout closed unexpectedly`,
 		);
-		if (!daemon.stopping) {
+		if (daemon.state === "running") {
 			console.error(`[${daemon.manifest.name}] ${error.message}`);
 		}
+		daemon.fatalError = error;
 		daemon.peer.close(error);
-		terminateAfterFatalStdoutFailure(daemon);
+		onFailure(daemon, error);
 	} catch (error) {
 		const peerError = error instanceof Error ? error : new Error(String(error));
-		if (!daemon.stopping) {
+		if (daemon.state === "running") {
 			console.error(`[${daemon.manifest.name}] ${peerError.message}`);
 		}
+		daemon.fatalError = peerError;
 		daemon.peer.close(peerError);
-		terminateAfterFatalStdoutFailure(daemon);
+		onFailure(daemon, peerError);
 	}
 }
 
@@ -270,6 +303,23 @@ function createPeer(
 	});
 }
 
+function terminateDaemonAfterDirectFailure(
+	daemon: StartedDaemon,
+	error: Error,
+): void {
+	if (daemon.state !== "running") {
+		return;
+	}
+
+	daemon.state = "failed";
+	daemon.peer.close(error);
+	void terminateDaemonProcess(daemon).catch((terminationError) => {
+		console.error(
+			`[${daemon.manifest.name}] failed to terminate after failure: ${terminationError instanceof Error ? terminationError.message : String(terminationError)}`,
+		);
+	});
+}
+
 export async function startDaemon(
 	manifest: DaemonModuleManifest,
 	options: Pick<
@@ -277,6 +327,8 @@ export async function startDaemon(
 		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
 	> & {
 		onSpawned?: (daemon: StartedDaemon) => void;
+		onFailure?: DaemonFailureHandler;
+		restartAttempts?: number;
 	} = {},
 ): Promise<StartedDaemon> {
 	throwIfAborted(options.abortSignal);
@@ -299,11 +351,15 @@ export async function startDaemon(
 		manifest,
 		process,
 		peer,
-		stopping: false,
+		state: "starting",
+		restartAttempts: options.restartAttempts ?? 0,
 		tools: [],
 	};
 
-	void pipeStdout(daemon);
+	void pipeStdout(
+		daemon,
+		options.onFailure ?? terminateDaemonAfterDirectFailure,
+	);
 	void pipeStderr(daemon);
 	options.onSpawned?.(daemon);
 
@@ -317,15 +373,40 @@ export async function startDaemon(
 			() => new Error(`${manifest.name}: initialize timed out`),
 		);
 		daemon.tools = parseInitializeResult(manifest.name, initializeResult);
+		daemon.state = "running";
+		if (daemon.fatalError) {
+			const fatalError = daemon.fatalError;
+			daemon.fatalError = undefined;
+			(options.onFailure ?? terminateDaemonAfterDirectFailure)(
+				daemon,
+				fatalError,
+			);
+		}
 		return daemon;
 	} catch (error) {
-		await stopDaemon(daemon);
+		await cleanupFailedStartupDaemon(
+			daemon,
+			error instanceof Error ? error : new Error(String(error)),
+		);
 		throw error;
 	}
 }
 
 export async function stopDaemon(daemon: StartedDaemon): Promise<void> {
-	daemon.stopping = true;
+	if (daemon.state === "stopped") {
+		return;
+	}
+
+	if (daemon.state === "failed") {
+		daemon.state = "stopping";
+		daemon.restartAbortController?.abort();
+		await terminateDaemonProcess(daemon).catch(() => undefined);
+		await daemon.restartTask;
+		daemon.state = "stopped";
+		return;
+	}
+
+	daemon.state = "stopping";
 	try {
 		await withTimeout(
 			daemon.peer.request("shutdown"),
@@ -338,6 +419,7 @@ export async function stopDaemon(daemon: StartedDaemon): Promise<void> {
 			);
 		});
 		await terminateDaemonProcessGroup(daemon);
+		daemon.state = "stopped";
 		return;
 	} catch {
 		// Continue to process termination below. Once graceful shutdown fails,
@@ -346,6 +428,146 @@ export async function stopDaemon(daemon: StartedDaemon): Promise<void> {
 	}
 
 	await terminateDaemonProcess(daemon).catch(() => undefined);
+	daemon.state = "stopped";
+}
+
+function superviseDaemon(
+	daemon: StartedDaemon,
+	options: Pick<
+		BootstrapRuntimeOptions,
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+	>,
+	daemons: StartedDaemon[],
+): void {
+	void daemon.process.exited.then(() => {
+		handleDaemonFailure(
+			daemon,
+			new Error(`${daemon.manifest.name}: process exited unexpectedly`),
+			options,
+			daemons,
+		);
+	});
+}
+
+function handleDaemonFailure(
+	daemon: StartedDaemon,
+	error: Error,
+	options: Pick<
+		BootstrapRuntimeOptions,
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+	>,
+	daemons: StartedDaemon[],
+): void {
+	if (daemon.state !== "running") {
+		return;
+	}
+
+	daemon.state = "failed";
+	daemon.peer.close(error);
+
+	const restartAbortController = new AbortController();
+	daemon.restartAbortController = restartAbortController;
+	const restartTask = restartFailedDaemon(
+		daemon,
+		error,
+		options,
+		daemons,
+		restartAbortController.signal,
+	);
+	daemon.restartTask = restartTask;
+	void restartTask.finally(() => {
+		if (daemon.restartTask === restartTask) {
+			daemon.restartTask = undefined;
+		}
+		if (daemon.restartAbortController === restartAbortController) {
+			daemon.restartAbortController = undefined;
+		}
+	});
+}
+
+async function restartFailedDaemon(
+	daemon: StartedDaemon,
+	error: Error,
+	options: Pick<
+		BootstrapRuntimeOptions,
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+	>,
+	daemons: StartedDaemon[],
+	restartSignal: AbortSignal,
+): Promise<void> {
+	try {
+		await terminateDaemonProcess(daemon);
+	} catch (terminationError) {
+		console.error(
+			`[${daemon.manifest.name}] failed to terminate after failure: ${terminationError instanceof Error ? terminationError.message : String(terminationError)}`,
+		);
+		return;
+	}
+
+	if (daemon.state !== "failed") {
+		return;
+	}
+
+	const daemonIndex = daemons.indexOf(daemon);
+	if (daemonIndex < 0) {
+		return;
+	}
+
+	if (daemon.restartAttempts >= 1) {
+		// One automatic restart recovers transient process failure without
+		// introducing restart-loop policy before config exists.
+		console.error(
+			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
+		);
+		return;
+	}
+
+	if (
+		restartSignal.aborted ||
+		options.abortSignal?.aborted ||
+		daemon.state !== "failed"
+	) {
+		return;
+	}
+
+	const abortController = new AbortController();
+	const abortRestart = () => {
+		abortController.abort();
+	};
+	restartSignal.addEventListener("abort", abortRestart, { once: true });
+	options.abortSignal?.addEventListener("abort", abortRestart, { once: true });
+	if (restartSignal.aborted || options.abortSignal?.aborted) {
+		abortRestart();
+	}
+
+	try {
+		const replacement = await startDaemon(daemon.manifest, {
+			abortSignal: abortController.signal,
+			initializeTimeoutMs: options.initializeTimeoutMs,
+			restartAttempts: daemon.restartAttempts + 1,
+			sandboxFactory: options.sandboxFactory,
+			onFailure: (failedDaemon, failureError) => {
+				handleDaemonFailure(failedDaemon, failureError, options, daemons);
+			},
+		});
+		if (daemon.state !== "failed" || daemons[daemonIndex] !== daemon) {
+			await stopDaemon(replacement);
+			return;
+		}
+		daemons[daemonIndex] = replacement;
+		superviseDaemon(replacement, options, daemons);
+		console.error(`[${daemon.manifest.name}] restarted after failure`);
+	} catch (restartError) {
+		if (restartSignal.aborted) {
+			return;
+		}
+		console.error(
+			`[${daemon.manifest.name}] restart failed: ${restartError instanceof Error ? restartError.message : String(restartError)}`,
+		);
+	} finally {
+		restartSignal.removeEventListener("abort", abortRestart);
+		options.abortSignal?.removeEventListener("abort", abortRestart);
+	}
 }
 
 export async function bootstrapRuntime(
@@ -371,9 +593,14 @@ export async function bootstrapRuntime(
 				abortSignal: options.abortSignal,
 				initializeTimeoutMs: options.initializeTimeoutMs,
 				sandboxFactory: options.sandboxFactory,
+				onFailure: (daemon, error) => {
+					handleDaemonFailure(daemon, error, options, daemons);
+				},
 				onSpawned: (daemon) => {
 					daemons.push(daemon);
 				},
+			}).then((daemon) => {
+				superviseDaemon(daemon, options, daemons);
 			});
 		}
 	} catch (error) {
@@ -393,4 +620,4 @@ export async function stopDaemons(daemons: StartedDaemon[]): Promise<void> {
 	);
 }
 
-export type { StartedDaemon };
+export type { DaemonState, StartedDaemon };
