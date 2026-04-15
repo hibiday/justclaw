@@ -1,3 +1,4 @@
+import path from "node:path";
 import { notifyEventDropped } from "./event-dropped";
 import { EventQueue, resolveEventQueuePath } from "./event-queue";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
@@ -628,6 +629,11 @@ export async function bootstrapRuntime(
 		process.env.JUSTCLAW_HOME,
 		options.homeDir,
 	);
+	// Ensure JUSTCLAW_HOME is always set in the environment so spawned modules
+	// can derive their own paths without duplicating the resolution logic.
+	if (!options.homeDir && !process.env.JUSTCLAW_HOME) {
+		process.env.JUSTCLAW_HOME = path.dirname(modulesRoot);
+	}
 	const dbPath =
 		options.eventQueuePath ??
 		resolveEventQueuePath(process.env.JUSTCLAW_HOME, options.homeDir);

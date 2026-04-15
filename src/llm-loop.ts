@@ -4,6 +4,7 @@ import {
 	Runner,
 	setDefaultOpenAIClient,
 	setOpenAIAPI,
+	setTracingDisabled,
 	type Tool,
 	tool,
 } from "@openai/agents";
@@ -15,6 +16,8 @@ import {
 	timestampFromUUIDv7,
 } from "./event-queue";
 import type { StartedDaemon } from "./runtime";
+
+setTracingDisabled(true);
 
 export function resolveModelConfig(): string {
 	const apiKey = process.env.JUSTCLAW_OPENAI_API_KEY;

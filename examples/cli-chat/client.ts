@@ -1,0 +1,86 @@
+#!/usr/bin/env bun
+import { existsSync } from "node:fs";
+import path from "node:path";
+
+const home =
+	process.env.JUSTCLAW_HOME ??
+	(process.env.HOME ? path.join(process.env.HOME, "justclaw") : null);
+if (!home) {
+	throw new Error("JUSTCLAW_HOME is not set and HOME is not set");
+}
+const socketPath = path.join(home, "modules", "cli-chat", "cli-chat.sock");
+
+if (!existsSync(socketPath)) {
+	process.stderr.write("[error] cannot connect to cli-chat daemon\n");
+	process.exit(1);
+}
+
+const isTTY = Boolean(process.stdin.isTTY);
+function prompt(): void {
+	if (isTTY) {
+		process.stderr.write("> ");
+	}
+}
+
+const stdinUtf8Decoder = new TextDecoder();
+/** Replaced in connect open() for a fresh decoder per connection. */
+let serverToClientUtf8Decoder = new TextDecoder();
+
+async function stdinLoop(socket: Bun.Socket<undefined>): Promise<void> {
+	const reader = Bun.stdin.stream().getReader();
+	let buffer = "";
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) {
+			buffer += stdinUtf8Decoder.decode();
+			const tail = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+			if (tail.length > 0) {
+				socket.write(`${tail}\n`);
+			}
+			process.exit(0);
+		}
+		buffer += stdinUtf8Decoder.decode(value, { stream: true });
+		let newlineIndex = buffer.indexOf("\n");
+		while (newlineIndex >= 0) {
+			const rawLine = buffer.slice(0, newlineIndex);
+			buffer = buffer.slice(newlineIndex + 1);
+			const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+			socket.write(`${line}\n`);
+			newlineIndex = buffer.indexOf("\n");
+		}
+	}
+}
+
+try {
+	Bun.connect({
+		unix: socketPath,
+		socket: {
+			open(socket) {
+				serverToClientUtf8Decoder = new TextDecoder();
+				prompt();
+				void stdinLoop(socket);
+			},
+			data(_socket, data) {
+				const text = serverToClientUtf8Decoder.decode(data, { stream: true });
+				if (text.length > 0) {
+					process.stdout.write(text);
+					prompt();
+				}
+			},
+			close() {
+				process.stdout.write(serverToClientUtf8Decoder.decode());
+				process.stderr.write("[disconnected]\n");
+				process.exit(1);
+			},
+			error() {
+				process.stdout.write(serverToClientUtf8Decoder.decode());
+				process.stderr.write("[disconnected]\n");
+				process.exit(1);
+			},
+		},
+	});
+} catch {
+	process.stderr.write("[error] cannot connect to cli-chat daemon\n");
+	process.exit(1);
+}
