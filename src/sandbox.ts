@@ -174,6 +174,18 @@ export function createDarwinSandboxProfile(
 	env: NodeJS.ProcessEnv = process.env,
 	extraReadonlyPaths: string[] = [],
 ): string {
+	// sandbox-exec's (subpath moduleDir) does not grant read access to parent
+	// directories themselves, but Bun reads ancestor directories on startup.
+	// Use (literal …) for each ancestor up to the filesystem root (excluding /).
+	const moduleDirAncestorLiterals: string[] = [];
+	let ancestor = path.dirname(moduleDir);
+	while (ancestor !== path.dirname(ancestor)) {
+		moduleDirAncestorLiterals.push(
+			`  (literal ${quoteSandboxString(ancestor)})`,
+		);
+		ancestor = path.dirname(ancestor);
+	}
+
 	const allowedReadonlySubpaths = [
 		moduleDir,
 		...DARWIN_READONLY_PATHS,
@@ -194,6 +206,7 @@ export function createDarwinSandboxProfile(
 		"(allow file-read-metadata)",
 		"(allow file-read* file-map-executable",
 		allowedReadonlySubpaths,
+		...moduleDirAncestorLiterals,
 		")",
 		"(allow file-write*",
 		`  (subpath ${quoteSandboxString(moduleDir)})`,
@@ -478,7 +491,7 @@ export async function createSandboxLaunchSpec(
 	const env =
 		platform === "linux"
 			? { ...(options.env ?? process.env), TMPDIR: "/tmp" }
-			: (options.env ?? process.env);
+			: { ...(options.env ?? process.env) };
 	const lookupExecutable = options.lookupExecutable ?? defaultLookupExecutable;
 	const pathExists = options.pathExists ?? defaultPathExists;
 	const readTextFile = options.readTextFile ?? defaultReadTextFile;
