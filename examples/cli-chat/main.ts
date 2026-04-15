@@ -18,6 +18,24 @@ const socketPath = path.join(
 let currentClient: Bun.Socket<undefined> | null = null;
 const pendingMessages: string[] = [];
 let socketLineBuffer = "";
+/** Replaced in open() so each accepted socket gets a fresh stream decoder. */
+let socketUtf8Decoder = new TextDecoder();
+
+const stdinUtf8Decoder = new TextDecoder();
+
+function appendSocketLines(chunk: string): void {
+	socketLineBuffer += chunk;
+	let newlineIndex = socketLineBuffer.indexOf("\n");
+	while (newlineIndex >= 0) {
+		const rawLine = socketLineBuffer.slice(0, newlineIndex);
+		socketLineBuffer = socketLineBuffer.slice(newlineIndex + 1);
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (line.length > 0) {
+			emitEvent({ kind: "message.received", text: line });
+		}
+		newlineIndex = socketLineBuffer.indexOf("\n");
+	}
+}
 
 function writeLine(obj: unknown): void {
 	process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -63,6 +81,7 @@ Bun.listen({
 				return;
 			}
 			currentClient = socket;
+			socketUtf8Decoder = new TextDecoder();
 			socketLineBuffer = "";
 			const queued = pendingMessages.splice(0);
 			for (const t of queued) {
@@ -70,20 +89,11 @@ Bun.listen({
 			}
 		},
 		data(_socket, data) {
-			socketLineBuffer += new TextDecoder().decode(data);
-			let newlineIndex = socketLineBuffer.indexOf("\n");
-			while (newlineIndex >= 0) {
-				const rawLine = socketLineBuffer.slice(0, newlineIndex);
-				socketLineBuffer = socketLineBuffer.slice(newlineIndex + 1);
-				const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-				if (line.length > 0) {
-					emitEvent({ kind: "message.received", text: line });
-				}
-				newlineIndex = socketLineBuffer.indexOf("\n");
-			}
+			appendSocketLines(socketUtf8Decoder.decode(data, { stream: true }));
 		},
 		close(socket) {
 			if (currentClient === socket) {
+				appendSocketLines(socketUtf8Decoder.decode());
 				currentClient = null;
 				socketLineBuffer = "";
 			}
@@ -148,7 +158,6 @@ function handleStdinLine(line: string): void {
 
 async function readStdinLoop(): Promise<void> {
 	const reader = Bun.stdin.stream().getReader();
-	const decoder = new TextDecoder();
 	let buffer = "";
 
 	while (true) {
@@ -156,7 +165,7 @@ async function readStdinLoop(): Promise<void> {
 		if (done) {
 			break;
 		}
-		buffer += decoder.decode(value, { stream: true });
+		buffer += stdinUtf8Decoder.decode(value, { stream: true });
 		let newlineIndex = buffer.indexOf("\n");
 		while (newlineIndex >= 0) {
 			const rawLine = buffer.slice(0, newlineIndex);
@@ -169,7 +178,7 @@ async function readStdinLoop(): Promise<void> {
 		}
 	}
 
-	buffer += decoder.decode();
+	buffer += stdinUtf8Decoder.decode();
 	const tail = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
 	if (tail.length > 0) {
 		handleStdinLine(tail);
