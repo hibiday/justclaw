@@ -25,6 +25,27 @@ function prompt(): void {
 const stdinUtf8Decoder = new TextDecoder();
 /** Replaced in connect open() for a fresh decoder per connection. */
 let serverToClientUtf8Decoder = new TextDecoder();
+let waitingLocalCommandResponse = false;
+let delayedPromptTimer: Timer | null = null;
+
+function clearDelayedPromptTimer(): void {
+	if (delayedPromptTimer) {
+		clearTimeout(delayedPromptTimer);
+		delayedPromptTimer = null;
+	}
+}
+
+function schedulePromptAfterResponse(): void {
+	if (!isTTY) {
+		return;
+	}
+	clearDelayedPromptTimer();
+	delayedPromptTimer = setTimeout(() => {
+		waitingLocalCommandResponse = false;
+		delayedPromptTimer = null;
+		prompt();
+	}, 50);
+}
 
 async function stdinLoop(socket: Bun.Socket<undefined>): Promise<void> {
 	const reader = Bun.stdin.stream().getReader();
@@ -46,6 +67,10 @@ async function stdinLoop(socket: Bun.Socket<undefined>): Promise<void> {
 			const rawLine = buffer.slice(0, newlineIndex);
 			buffer = buffer.slice(newlineIndex + 1);
 			const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+			waitingLocalCommandResponse = line.startsWith("/");
+			if (waitingLocalCommandResponse) {
+				clearDelayedPromptTimer();
+			}
 			socket.write(`${line}\n`);
 			newlineIndex = buffer.indexOf("\n");
 		}
@@ -65,15 +90,21 @@ try {
 				const text = serverToClientUtf8Decoder.decode(data, { stream: true });
 				if (text.length > 0) {
 					process.stdout.write(text);
-					prompt();
+					if (waitingLocalCommandResponse) {
+						schedulePromptAfterResponse();
+					} else if (text.endsWith("\n")) {
+						prompt();
+					}
 				}
 			},
 			close() {
+				clearDelayedPromptTimer();
 				process.stdout.write(serverToClientUtf8Decoder.decode());
 				process.stderr.write("[disconnected]\n");
 				process.exit(1);
 			},
 			error() {
+				clearDelayedPromptTimer();
 				process.stdout.write(serverToClientUtf8Decoder.decode());
 				process.stderr.write("[disconnected]\n");
 				process.exit(1);
