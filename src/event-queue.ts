@@ -1,11 +1,14 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 export type QueuedEvent = {
 	id: string;
 	source: string;
-	params: Record<string, unknown> & { type: "event.v1" };
+	params: Record<string, unknown>;
 };
+
+export const ACTIVE_SESSION_META_KEY = "active_session_id";
 
 export function timestampFromUUIDv7(uuid: string): string {
 	return new Date(
@@ -38,6 +41,8 @@ export class EventQueue {
 	#waiter: Waiter | null = null;
 
 	constructor(dbPath: string) {
+		// SQLite opens the file path as-is; it does not create missing parents.
+		mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
 		this.#db = new Database(dbPath);
 		this.#db.exec("PRAGMA journal_mode=WAL;");
 		this.#db.exec(`
@@ -49,12 +54,15 @@ export class EventQueue {
 				running_since TEXT
 			);
 		`);
+		this.#db.exec(`
+			CREATE TABLE IF NOT EXISTS meta (
+				key   TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+		`);
 	}
 
-	enqueue(
-		source: string,
-		params: Record<string, unknown> & { type: "event.v1" },
-	): void {
+	enqueue(source: string, params: Record<string, unknown>): void {
 		if (this.#closed) {
 			return;
 		}
@@ -118,6 +126,24 @@ export class EventQueue {
 
 	complete(id: string): void {
 		this.#db.run("DELETE FROM events WHERE id = ?", [id]);
+	}
+
+	getMeta(key: string): string | null {
+		const row = this.#db
+			.query("SELECT value FROM meta WHERE key = ?")
+			.get(key) as { value: string } | null;
+		return row?.value ?? null;
+	}
+
+	setMeta(key: string, value: string): void {
+		this.#db.run(
+			"INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			[key, value],
+		);
+	}
+
+	deleteMeta(key: string): void {
+		this.#db.run("DELETE FROM meta WHERE key = ?", [key]);
 	}
 
 	stale(): QueuedEvent[] {

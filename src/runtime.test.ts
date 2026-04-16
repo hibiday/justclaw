@@ -11,7 +11,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import type { AgentInputItem, Runner } from "@openai/agents";
+import { EventQueue } from "./event-queue";
 import { JsonRpcPeer } from "./jsonrpc";
+import { runLlmLoop } from "./llm-loop";
 import {
 	discoverDaemonManifests,
 	parseDaemonManifest,
@@ -30,6 +33,7 @@ import {
 	resolveSandboxBackend,
 	type SandboxLaunchSpec,
 } from "./sandbox";
+import { SessionStore } from "./session-store";
 
 const tempDirs: string[] = [];
 const originalJustclawHome = process.env.JUSTCLAW_HOME;
@@ -57,6 +61,14 @@ async function createTempDir(prefix: string): Promise<string> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function createSessionContext(homeDir: string): {
+	sessionStore: SessionStore;
+} {
+	return {
+		sessionStore: new SessionStore(path.join(homeDir, "history")),
+	};
 }
 
 async function waitUntil(
@@ -162,6 +174,59 @@ async function writeRawDaemonModule(
 	const scriptPath = path.join(moduleDir, "module.ts");
 	await writeFile(scriptPath, script);
 	await chmod(scriptPath, 0o755);
+}
+
+/** Daemon script: JSON-RPC over stdin/stdout with a pending-request map; runs `firstInitAsyncBodyLines` once after first `initialize`. */
+function createJsonRpcStdinClientModuleScript(
+	resultPath: string,
+	firstInitAsyncBodyLines: string[],
+): string {
+	const initBody = firstInitAsyncBodyLines
+		.map((line) => `            ${line}`)
+		.join("\n");
+	return `#!/usr/bin/env bun
+const resultPath = ${JSON.stringify(resultPath)};
+const pending = new Map();
+let nextId = 100;
+function sendRequest(method, params) {
+  const id = nextId++;
+  const msg = { jsonrpc: "2.0", id, method };
+  if (params !== undefined) msg.params = params;
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+  return new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
+}
+const chunks = [];
+let initialized = false;
+for await (const chunk of Bun.stdin.stream()) {
+  chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8");
+  const lines = text.split(/\\r?\\n/);
+  while (lines.length > 1) {
+    const line = lines.shift();
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if ("method" in msg) {
+      if (msg.method === "initialize") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }) + "\\n");
+        if (!initialized) {
+          initialized = true;
+          (async () => {
+${initBody}
+          })();
+        }
+      } else if (msg.method === "shutdown") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: "ok" }) + "\\n");
+        process.exit(0);
+      }
+    } else {
+      const h = pending.get(msg.id);
+      if (h) { pending.delete(msg.id); "error" in msg ? h.reject(new Error(msg.error.message)) : h.resolve(msg.result); }
+    }
+  }
+  chunks.length = 0;
+  if (lines[0]) chunks.push(Buffer.from(lines[0]));
+}
+`;
 }
 
 function createStdoutClosingShellScript(): string {
@@ -393,6 +458,37 @@ describe("JsonRpcPeer", () => {
 		).toThrow("unknown request id 99");
 	});
 
+	test("logs and ignores responses with null id", () => {
+		const log: string[] = [];
+		const originalConsoleError = console.error;
+		console.error = (...args: unknown[]) => {
+			log.push(args.join(" "));
+		};
+
+		try {
+			const peer = new JsonRpcPeer({
+				name: "test",
+				sendLine: () => {},
+			});
+			peer.handleLine(
+				JSON.stringify({
+					jsonrpc: "2.0",
+					id: null,
+					error: { code: -32700, message: "Parse error" },
+				}),
+			);
+			expect(log.some((line) => line.includes("null id"))).toBe(true);
+
+			log.length = 0;
+			peer.handleLine(
+				JSON.stringify({ jsonrpc: "2.0", id: null, result: "orphan" }),
+			);
+			expect(log.some((line) => line.includes("null id"))).toBe(true);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
+
 	test("rejects malformed error responses", async () => {
 		const peer = new JsonRpcPeer({
 			name: "test",
@@ -413,17 +509,88 @@ describe("JsonRpcPeer", () => {
 		);
 	});
 
-	test("rejects inbound requests", () => {
+	test("calls onRequest handler and returns result", async () => {
+		const sentLines: string[] = [];
 		const peer = new JsonRpcPeer({
 			name: "test",
-			sendLine: () => {},
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+			onRequest: async (method) => {
+				if (method === "ping") return "pong";
+				throw new Error("unexpected method");
+			},
 		});
 
-		expect(() =>
-			peer.handleLine(
-				JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
-			),
-		).toThrow("request handling is not supported");
+		peer.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "ping" }));
+		await delay(10);
+
+		expect(sentLines).toHaveLength(1);
+		const response = JSON.parse(sentLines[0] ?? "{}");
+		expect(response.id).toBe(7);
+		expect(response.result).toBe("pong");
+	});
+
+	test("sends error response when onRequest throws", async () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+			onRequest: async () => {
+				throw new Error("handler error");
+			},
+		});
+
+		peer.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 8, method: "fail" }));
+		await delay(10);
+
+		expect(sentLines).toHaveLength(1);
+		const response = JSON.parse(sentLines[0] ?? "{}");
+		expect(response.id).toBe(8);
+		expect(response.error?.code).toBe(-32000);
+		expect(response.error?.message).toBe("handler error");
+	});
+
+	test("echoes string id in response to inbound request", async () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+			onRequest: async () => "ok",
+		});
+
+		peer.handleLine(
+			JSON.stringify({ jsonrpc: "2.0", id: "req-abc", method: "ping" }),
+		);
+		await delay(10);
+
+		expect(sentLines).toHaveLength(1);
+		const response = JSON.parse(sentLines[0] ?? "{}");
+		expect(response.id).toBe("req-abc");
+		expect(response.result).toBe("ok");
+	});
+
+	test("responds Method not found when no request handler is registered", () => {
+		const sentLines: string[] = [];
+		const peer = new JsonRpcPeer({
+			name: "test",
+			sendLine: (line) => {
+				sentLines.push(line);
+			},
+		});
+
+		peer.handleLine(
+			JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+		);
+
+		expect(sentLines).toHaveLength(1);
+		const response = JSON.parse(sentLines[0] ?? "{}");
+		expect(response.id).toBe(1);
+		expect(response.error?.code).toBe(-32601);
 	});
 });
 
@@ -1020,9 +1187,13 @@ describe("sandbox", () => {
 
 describe("bootstrapRuntime", () => {
 	test("fails when HOME is unavailable", async () => {
-		await expect(bootstrapRuntime({ homeDir: "" })).rejects.toThrow(
-			"HOME is not set and JUSTCLAW_HOME is not set",
-		);
+		const sessionHome = await createTempDir("justclaw-bs-no-home-");
+		await expect(
+			bootstrapRuntime({
+				homeDir: "",
+				...createSessionContext(sessionHome),
+			}),
+		).rejects.toThrow("HOME is not set and JUSTCLAW_HOME is not set");
 	});
 
 	test("fails when runtime modules directory does not exist", async () => {
@@ -1032,6 +1203,7 @@ describe("bootstrapRuntime", () => {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 			}),
 		).rejects.toThrow("No modules directory found at");
 	});
@@ -1062,6 +1234,7 @@ describe("bootstrapRuntime", () => {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 			}),
 		).rejects.toThrow(`No modules available in ${modulesRoot}`);
 	});
@@ -1093,6 +1266,7 @@ describe("bootstrapRuntime", () => {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 			}),
 		).rejects.toThrow("is not valid JSON");
 	});
@@ -1108,6 +1282,7 @@ describe("bootstrapRuntime", () => {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1150,6 +1325,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1179,6 +1355,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1197,6 +1374,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1220,6 +1398,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1238,6 +1417,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				initializeTimeoutMs: 50,
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1257,6 +1437,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const bootstrap = bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			initializeTimeoutMs: 5_000,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1285,16 +1466,23 @@ for await (const chunk of Bun.stdin.stream()) {
 			throw new Error("Expected bad-init manifest");
 		}
 		let daemon: StartedDaemon | undefined;
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
 
-		await expect(
-			startDaemon(manifest, {
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-				onSpawned: (spawnedDaemon) => {
-					daemon = spawnedDaemon;
-				},
-			}),
-		).rejects.toThrow('initialize result "tools" must be an array');
+		try {
+			await expect(
+				startDaemon(manifest, {
+					queue,
+					...createSessionContext(homeDir),
+					sandboxFactory: async (manifest) =>
+						createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+					onSpawned: (spawnedDaemon) => {
+						daemon = spawnedDaemon;
+					},
+				}),
+			).rejects.toThrow('initialize result "tools" must be an array');
+		} finally {
+			queue.close();
+		}
 
 		expect(daemon?.state).toBe("failed");
 		await expect(daemon?.process.exited).resolves.toBeNumber();
@@ -1316,6 +1504,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1340,6 +1529,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1360,6 +1550,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1378,6 +1569,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1405,6 +1597,7 @@ sleep 10
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1464,6 +1657,7 @@ done
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1525,6 +1719,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1563,10 +1758,14 @@ sleep 10
 			throw new Error("Expected direct-stdout-failure manifest");
 		}
 
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
 		const daemon = await startDaemon(manifest, {
+			queue,
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
+		queue.close();
 
 		await expect(
 			Promise.race([
@@ -1599,6 +1798,7 @@ sleep 10
 			bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			}),
@@ -1619,6 +1819,7 @@ sleep 10
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1661,6 +1862,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1699,6 +1901,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1751,6 +1954,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			abortSignal: abortController.signal,
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1794,6 +1998,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) => {
 				const startCount = Number(
 					await readFile(startCountPath, "utf8").catch(() => "0"),
@@ -1856,6 +2061,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1877,6 +2083,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1912,6 +2119,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1951,6 +2159,7 @@ exit 0
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1988,6 +2197,7 @@ exit 0
 			const runtime = await bootstrapRuntime({
 				homeDir,
 				eventQueuePath: path.join(homeDir, "events.db"),
+				...createSessionContext(homeDir),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			});
@@ -2024,6 +2234,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -2075,6 +2286,7 @@ for await (const chunk of Bun.stdin.stream()) {
 
 			const runtime = await bootstrapRuntime({
 				eventQueuePath: path.join(justclawHome, "events.db"),
+				...createSessionContext(justclawHome),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			});
@@ -2095,6 +2307,596 @@ for await (const chunk of Bun.stdin.stream()) {
 		}
 	});
 
+	test("handles sessions.new.v1, sessions.list.v1, and sessions.get.v1 from a module", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-result.json");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const preExistingHistory = [{ role: "user", content: "hi" }];
+		const existingId = "01900000-0000-7000-8000-00000000cafe";
+		const unreadableId = "01900000-0000-7000-8000-00000000dead";
+		await sessionStore.save(existingId, preExistingHistory as never);
+		await writeFile(path.join(historyDir, `${unreadableId}.json`), "{");
+
+		await writeDaemonModule(
+			homeDir,
+			"session-module",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const newResult = await sendRequest("sessions.new.v1");',
+				'const listResult = await sendRequest("sessions.list.v1");',
+				`const getResult = await sendRequest("sessions.get.v1", { id: ${JSON.stringify(existingId)} });`,
+				"await Bun.write(resultPath, JSON.stringify({ newResult, listResult, getResult }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			newResult: { id: string };
+			listResult: { ids: string[] };
+			getResult: { history: unknown[] };
+		};
+
+		expect(result.newResult.id).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
+		expect(result.listResult.ids).toContain(result.newResult.id);
+		expect(result.listResult.ids).toContain(existingId);
+		expect(result.listResult.ids).not.toContain(unreadableId);
+		expect(result.getResult.history).toEqual(preExistingHistory);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.get.v1 returns JSON-RPC error for invalid id format", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-get-invalid.json");
+
+		await writeDaemonModule(
+			homeDir,
+			"session-get-invalid",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				"try {",
+				'  await sendRequest("sessions.get.v1", { id: "not-a-uuid" });',
+				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
+				"} catch (e) {",
+				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
+				"}",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			ok?: boolean;
+			err?: string;
+		};
+
+		expect(result.ok).toBeUndefined();
+		expect(result.err).toContain("invalid session id");
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.get.v1 returns JSON-RPC error when session does not exist", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-get-missing.json");
+		const missingId = "01900000-0000-7000-8000-00000000dead";
+
+		await writeDaemonModule(
+			homeDir,
+			"session-get-missing",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				"try {",
+				`  await sendRequest("sessions.get.v1", { id: ${JSON.stringify(missingId)} });`,
+				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
+				"} catch (e) {",
+				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
+				"}",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			ok?: boolean;
+			err?: string;
+		};
+
+		expect(result.ok).toBeUndefined();
+		expect(result.err).toContain("sessions.get.v1");
+		expect(result.err).toContain("does not exist");
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.get.v1 returns JSON-RPC error when session file is unreadable", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-get-corrupt.json");
+		const historyDir = path.join(homeDir, "history");
+		const corruptId = "01900000-0000-7000-8000-00000000beef";
+		await mkdir(historyDir, { recursive: true });
+		await writeFile(path.join(historyDir, `${corruptId}.json`), "not-json");
+
+		await writeDaemonModule(
+			homeDir,
+			"session-get-corrupt",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				"try {",
+				`  await sendRequest("sessions.get.v1", { id: ${JSON.stringify(corruptId)} });`,
+				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
+				"} catch (e) {",
+				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
+				"}",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			ok?: boolean;
+			err?: string;
+		};
+
+		expect(result.ok).toBeUndefined();
+		expect(result.err).toContain("sessions.get.v1");
+		expect(result.err).toContain("could not be read");
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.switch.v1 returns JSON-RPC error when session does not exist", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-switch-missing.json");
+		const missingId = "01900000-0000-7000-8000-00000000dead";
+
+		await writeDaemonModule(
+			homeDir,
+			"session-switch-missing",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				"try {",
+				`  await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(missingId)} });`,
+				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
+				"} catch (e) {",
+				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
+				"}",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			ok?: boolean;
+			err?: string;
+		};
+
+		expect(result.ok).toBeUndefined();
+		expect(result.err).toContain("sessions.switch.v1");
+		expect(result.err).toContain("unreadable or does not exist");
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.active.v1 fails before any session is activated", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-active-result.json");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+
+		await writeDaemonModule(
+			homeDir,
+			"session-active-module",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				"try {",
+				'  await sendRequest("sessions.active.v1");',
+				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
+				"} catch (e) {",
+				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
+				"}",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			ok?: boolean;
+			err?: string;
+		};
+
+		expect(result.ok).toBeUndefined();
+		expect(result.err).toContain("no active session");
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.active.v1 returns newest readable history id when LLM has not adopted", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-active-newest.json");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const older = "01900000-0000-7000-8000-000000000001";
+		const newer = "01900000-0000-7000-8000-000000000002";
+		await sessionStore.save(older, [] as never);
+		await sessionStore.save(newer, [] as never);
+
+		await writeDaemonModule(
+			homeDir,
+			"session-active-newest",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const activeResult = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			activeResult: { id: string };
+		};
+
+		expect(result.activeResult.id).toBe(newer);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.active.v1 skips unreadable newest history id when LLM has not adopted", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(
+			homeDir,
+			"session-active-newest-readable.json",
+		);
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const readable = "01900000-0000-7000-8000-000000000001";
+		const unreadableNewest = "01900000-0000-7000-8000-000000000002";
+		await sessionStore.save(readable, [] as never);
+		await writeFile(path.join(historyDir, `${unreadableNewest}.json`), "{");
+
+		await writeDaemonModule(
+			homeDir,
+			"session-active-newest-readable",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const activeResult = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			activeResult: { id: string };
+		};
+
+		expect(result.activeResult.id).toBe(readable);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.active.v1 returns meta active session id when readable", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-active-meta.json");
+		const dbPath = path.join(homeDir, "events.db");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const older = "01900000-0000-7000-8000-000000000001";
+		const newer = "01900000-0000-7000-8000-000000000002";
+		await sessionStore.save(older, [] as never);
+		await sessionStore.save(newer, [] as never);
+		const seededQueue = new EventQueue(dbPath);
+		seededQueue.setMeta("active_session_id", older);
+		seededQueue.close();
+
+		await writeDaemonModule(
+			homeDir,
+			"session-active-meta",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const activeResult = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: dbPath,
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			activeResult: { id: string };
+		};
+
+		expect(result.activeResult.id).toBe(older);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.new.v1 does not replace existing active session", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-new-keeps-active.json");
+		const dbPath = path.join(homeDir, "events.db");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const activeId = "01900000-0000-7000-8000-000000000001";
+		await sessionStore.save(activeId, [] as never);
+
+		await writeDaemonModule(
+			homeDir,
+			"session-new-keeps-active",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const before = await sendRequest("sessions.active.v1");',
+				'const created = await sendRequest("sessions.new.v1");',
+				'const after = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ before, created, after }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: dbPath,
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			before: { id: string };
+			created: { id: string };
+			after: { id: string };
+		};
+
+		expect(result.before.id).toBe(activeId);
+		expect(result.created.id).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		);
+		expect(result.after.id).toBe(activeId);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.delete.v1 clears active metadata without auto-failover", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-delete-active.json");
+		const dbPath = path.join(homeDir, "events.db");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const activeId = "01900000-0000-7000-8000-000000000001";
+		await sessionStore.save(activeId, [] as never);
+		const fallbackId = "01900000-0000-7000-8000-000000000002";
+		await sessionStore.save(fallbackId, [] as never);
+		const seededQueue = new EventQueue(dbPath);
+		seededQueue.setMeta("active_session_id", activeId);
+		seededQueue.close();
+
+		await writeDaemonModule(
+			homeDir,
+			"session-delete-active",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				`await sendRequest("sessions.delete.v1", { id: ${JSON.stringify(activeId)} });`,
+				'const active = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ active }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: dbPath,
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			active: { id: string };
+		};
+
+		expect(result.active.id).toBe(fallbackId);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.active.v1 falls back when active_session_id is invalid", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-active-invalid-meta.json");
+		const dbPath = path.join(homeDir, "events.db");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const fallbackId = "01900000-0000-7000-8000-000000000002";
+		await sessionStore.save(
+			"01900000-0000-7000-8000-000000000001",
+			[] as never,
+		);
+		await sessionStore.save(fallbackId, [] as never);
+		const seededQueue = new EventQueue(dbPath);
+		seededQueue.setMeta("active_session_id", "not-a-uuid");
+		seededQueue.close();
+
+		await writeDaemonModule(
+			homeDir,
+			"session-active-invalid-meta",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const activeResult = await sendRequest("sessions.active.v1");',
+				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: dbPath,
+			sessionStore,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+		const result = JSON.parse(await readFile(resultPath, "utf8")) as {
+			activeResult: { id: string };
+		};
+
+		expect(result.activeResult.id).toBe(fallbackId);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
+	test("sessions.switch.v1 request is applied before subsequent event.v1 is processed by LLM loop", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const resultPath = path.join(homeDir, "session-switch-result.json");
+		const historyDir = path.join(homeDir, "history");
+		const sessionStore = new SessionStore(historyDir);
+		const sessionId = "01900000-0000-7000-8000-00000000000b";
+		const savedHistory: AgentInputItem[] = [
+			{ role: "user", content: "hello from session B" } as AgentInputItem,
+		];
+		await sessionStore.save(sessionId, savedHistory);
+
+		await writeDaemonModule(
+			homeDir,
+			"session-switch-module",
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				`const switchResult = await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(sessionId)} });`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "after-switch" } }) + "\\n");',
+				"await Bun.write(resultPath, JSON.stringify({ switchResult }));",
+			]),
+		);
+
+		let runtime:
+			| {
+					daemons: StartedDaemon[];
+					eventQueue: EventQueue;
+			  }
+			| undefined;
+		let loopTask: Promise<void> | undefined;
+
+		try {
+			runtime = await bootstrapRuntime({
+				homeDir,
+				eventQueuePath: path.join(homeDir, "events.db"),
+				sessionStore,
+				sandboxFactory: async (manifest) =>
+					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+			});
+
+			await waitUntil(() => Bun.file(resultPath).exists());
+			const moduleResult = JSON.parse(await readFile(resultPath, "utf8")) as {
+				switchResult: string;
+			};
+			expect(moduleResult.switchResult).toBe("ok");
+
+			let capturedInput: unknown;
+			let runnerCallCount = 0;
+			const mockRunner = {
+				run: async (_agent: unknown, input: unknown) => {
+					runnerCallCount++;
+					capturedInput = input;
+					return {
+						finalOutput: null,
+						history: savedHistory,
+					};
+				},
+			} as unknown as Runner;
+
+			loopTask = runLlmLoop(runtime.eventQueue, runtime.daemons, "test-model", {
+				runner: mockRunner,
+				sessionStore,
+			});
+
+			await waitUntil(() => capturedInput !== undefined);
+
+			expect(runnerCallCount).toBe(1);
+			expect(Array.isArray(capturedInput)).toBe(true);
+			const input = capturedInput as AgentInputItem[];
+			expect(input[0]).toMatchObject({
+				role: "user",
+				content: "hello from session B",
+			});
+			const xmlInput = input[input.length - 1];
+			expect(xmlInput).toMatchObject({
+				role: "user",
+			});
+			expect(String((xmlInput as { content?: unknown }).content)).toContain(
+				"<kind>after-switch</kind>",
+			);
+		} finally {
+			runtime?.eventQueue.close();
+			await loopTask;
+			if (runtime) {
+				await stopDaemons(runtime.daemons);
+			}
+		}
+	});
+
 	test("cleanup marker is absent before shutdown side effect runs", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const cleanupMarker = path.join(homeDir, "cleanup-marker.txt");
@@ -2109,6 +2911,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});

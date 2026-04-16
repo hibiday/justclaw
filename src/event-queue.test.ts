@@ -12,6 +12,7 @@ import {
 import { resolveModulesRoot } from "./module-manifest";
 import { bootstrapRuntime, stopDaemons } from "./runtime";
 import type { SandboxLaunchSpec } from "./sandbox";
+import { SessionStore } from "./session-store";
 
 async function waitUntil(
 	predicate: () => boolean | Promise<boolean>,
@@ -184,6 +185,22 @@ describe("EventQueue", () => {
 		queue.close();
 		await expect(queue.next()).resolves.toBeUndefined();
 	});
+
+	test("meta helpers read, upsert, and delete values", () => {
+		const homeDir = path.join(os.tmpdir(), `jq-meta-${Bun.randomUUIDv7()}`);
+		tempDirs.push(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+
+		expect(queue.getMeta("active_session_id")).toBeNull();
+		queue.setMeta("active_session_id", "session-a");
+		expect(queue.getMeta("active_session_id")).toBe("session-a");
+		queue.setMeta("active_session_id", "session-b");
+		expect(queue.getMeta("active_session_id")).toBe("session-b");
+		queue.deleteMeta("active_session_id");
+		expect(queue.getMeta("active_session_id")).toBeNull();
+
+		queue.close();
+	});
 });
 
 describe("resolveEventQueuePath", () => {
@@ -289,6 +306,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: dbPath,
+			sessionStore: new SessionStore(path.join(homeDir, "history")),
 			sandboxFactory: async (m) =>
 				createUnsandboxedSpec(m.moduleDir, m.execPath),
 		});
@@ -360,6 +378,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			const runtime = await bootstrapRuntime({
 				homeDir,
 				eventQueuePath: dbPath,
+				sessionStore: new SessionStore(path.join(homeDir, "history")),
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 			});

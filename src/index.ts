@@ -1,5 +1,6 @@
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
+import { resolveHistoryDir, SessionStore } from "./session-store";
 
 function createShutdownSignal(): {
 	dispose: () => void;
@@ -41,9 +42,12 @@ async function main(): Promise<void> {
 
 	try {
 		const model = resolveModelConfig();
+		const sessionStore = new SessionStore(resolveHistoryDir());
+		await sessionStore.ensureDefaultSessionIfEmpty();
 		const result = await bootstrapRuntime({
 			abortSignal: abortController.signal,
 			startedDaemons: daemons,
+			sessionStore,
 		});
 		eventQueue = result.eventQueue;
 		console.error(
@@ -55,7 +59,10 @@ async function main(): Promise<void> {
 		// runner.run (closing the queue does not cancel an in-flight LLM call).
 		// The event row can stay `running` until the next start, when stale
 		// recovery emits event.dropped.v1. Acceptable by design.
-		await Promise.race([runLlmLoop(eventQueue, daemons, model), shutdownTask]);
+		await Promise.race([
+			runLlmLoop(eventQueue, daemons, model, { sessionStore }),
+			shutdownTask,
+		]);
 	} catch (error) {
 		abortController.abort();
 		eventQueue?.close();

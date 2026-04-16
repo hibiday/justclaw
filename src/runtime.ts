@@ -1,6 +1,10 @@
 import path from "node:path";
 import { notifyEventDropped } from "./event-dropped";
-import { EventQueue, resolveEventQueuePath } from "./event-queue";
+import {
+	ACTIVE_SESSION_META_KEY,
+	EventQueue,
+	resolveEventQueuePath,
+} from "./event-queue";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import {
 	type DaemonModuleManifest,
@@ -8,6 +12,7 @@ import {
 	resolveModulesRoot,
 } from "./module-manifest";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
+import type { SessionStore } from "./session-store";
 
 type DaemonState = "starting" | "running" | "stopping" | "stopped" | "failed";
 
@@ -43,6 +48,7 @@ type BootstrapRuntimeOptions = {
 		manifest: DaemonModuleManifest,
 	) => Promise<SandboxLaunchSpec>;
 	startedDaemons?: StartedDaemon[];
+	sessionStore: SessionStore;
 };
 
 type DaemonFailureHandler = (daemon: StartedDaemon, error: Error) => void;
@@ -299,6 +305,24 @@ async function pipeStdout(
 	}
 }
 
+function requireSessionParamsId(
+	manifestName: string,
+	params: unknown,
+	method: string,
+): string {
+	if (
+		typeof params !== "object" ||
+		params === null ||
+		typeof (params as Record<string, unknown>).id !== "string" ||
+		(params as Record<string, unknown>).id === ""
+	) {
+		throw new Error(
+			`${manifestName}: ${method} requires a non-empty string "id"`,
+		);
+	}
+	return (params as Record<string, unknown>).id as string;
+}
+
 async function pipeStderr(daemon: StartedDaemon): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stderr, (line) => {
@@ -314,7 +338,8 @@ async function pipeStderr(daemon: StartedDaemon): Promise<void> {
 function createPeer(
 	manifest: DaemonModuleManifest,
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
-	queue?: EventQueue,
+	queue: EventQueue,
+	sessionStore: SessionStore,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -327,7 +352,7 @@ function createPeer(
 					manifest.name,
 					message.params,
 				);
-				queue?.enqueue(manifest.name, params);
+				queue.enqueue(manifest.name, params);
 				return;
 			}
 
@@ -335,7 +360,119 @@ function createPeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
+		onRequest: async (method, params) => {
+			if (method === "sessions.new.v1") {
+				const id = Bun.randomUUIDv7();
+				await sessionStore.create(id);
+				return { id };
+			}
+
+			if (method === "sessions.switch.v1") {
+				const id = requireSessionParamsId(
+					manifest.name,
+					params,
+					"sessions.switch.v1",
+				);
+				// Pre-check: reject the request immediately if the session does not exist,
+				// so the module gets a synchronous error rather than a later event.dropped.v1.
+				// The LLM loop loads the file again at apply time because the file may be
+				// removed or become unreadable between this check and the queue drain.
+				if ((await sessionStore.load(id)) === null) {
+					throw new Error(
+						`${manifest.name}: sessions.switch.v1: session "${id}" is unreadable or does not exist`,
+					);
+				}
+				queue.enqueue(manifest.name, { type: "sessions.switch.v1", id });
+				return "ok";
+			}
+
+			if (method === "sessions.active.v1") {
+				const activeId = await resolveReadableOrFallbackActiveSessionId(
+					queue,
+					sessionStore,
+				);
+				if (activeId !== null) {
+					return { id: activeId };
+				}
+
+				throw new Error(
+					`${manifest.name}: sessions.active.v1: no active session`,
+				);
+			}
+
+			if (method === "sessions.list.v1") {
+				return { ids: sessionStore.list() };
+			}
+
+			if (method === "sessions.delete.v1") {
+				const id = requireSessionParamsId(
+					manifest.name,
+					params,
+					"sessions.delete.v1",
+				);
+				await sessionStore.delete(id);
+				if (id === queue.getMeta(ACTIVE_SESSION_META_KEY)) {
+					queue.deleteMeta(ACTIVE_SESSION_META_KEY);
+				}
+				return "ok";
+			}
+
+			if (method === "sessions.get.v1") {
+				const id = requireSessionParamsId(
+					manifest.name,
+					params,
+					"sessions.get.v1",
+				);
+				const history = await sessionStore.load(id);
+				if (history === null) {
+					throw new Error(
+						`${manifest.name}: sessions.get.v1: session "${id}" does not exist or could not be read`,
+					);
+				}
+				return { history };
+			}
+
+			throw new Error(`${manifest.name}: unsupported method "${method}"`);
+		},
 	});
+}
+
+async function resolveReadableOrFallbackActiveSessionId(
+	queue: EventQueue,
+	sessionStore: SessionStore,
+): Promise<string | null> {
+	const metaId = queue.getMeta(ACTIVE_SESSION_META_KEY);
+	if (metaId !== null) {
+		try {
+			const history = await sessionStore.load(metaId);
+			if (history !== null) {
+				return metaId;
+			}
+			console.warn(
+				`[core] active_session_id "${metaId}" is missing, unreadable, or invalid; falling back to newest readable session`,
+			);
+		} catch (error) {
+			console.warn(
+				`[core] active_session_id metadata lookup: session "${metaId}" is invalid or unreadable (${error instanceof Error ? error.message : String(error)})`,
+			);
+		}
+	}
+
+	const fallbackId = sessionStore.newestReadableSessionId();
+	return fallbackId;
+}
+
+function seedActiveSessionMetadata(
+	queue: EventQueue,
+	sessionStore: SessionStore,
+): void {
+	if (queue.getMeta(ACTIVE_SESSION_META_KEY) !== null) {
+		return;
+	}
+	const initialId = sessionStore.newestReadableSessionId();
+	if (initialId !== null) {
+		queue.setMeta(ACTIVE_SESSION_META_KEY, initialId);
+	}
 }
 
 function terminateDaemonAfterDirectFailure(
@@ -359,13 +496,13 @@ export async function startDaemon(
 	manifest: DaemonModuleManifest,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
 	> & {
 		onSpawned?: (daemon: StartedDaemon) => void;
 		onFailure?: DaemonFailureHandler;
 		restartAttempts?: number;
-		queue?: EventQueue;
-	} = {},
+		queue: EventQueue;
+	},
 ): Promise<StartedDaemon> {
 	throwIfAborted(options.abortSignal);
 	const sandboxSpec = await (options.sandboxFactory ?? createSandboxLaunchSpec)(
@@ -382,7 +519,12 @@ export async function startDaemon(
 		stderr: "pipe",
 	});
 
-	const peer = createPeer(manifest, process, options.queue);
+	const peer = createPeer(
+		manifest,
+		process,
+		options.queue,
+		options.sessionStore,
+	);
 	const daemon: StartedDaemon = {
 		manifest,
 		process,
@@ -471,7 +613,7 @@ function superviseDaemon(
 	daemon: StartedDaemon,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -492,7 +634,7 @@ function handleDaemonFailure(
 	error: Error,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -530,7 +672,7 @@ async function restartFailedDaemon(
 	error: Error,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs"
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -588,6 +730,7 @@ async function restartFailedDaemon(
 			restartAttempts: daemon.restartAttempts + 1,
 			sandboxFactory: options.sandboxFactory,
 			queue: eventQueue,
+			sessionStore: options.sessionStore,
 			onFailure: (failedDaemon, failureError) => {
 				handleDaemonFailure(
 					failedDaemon,
@@ -619,7 +762,7 @@ async function restartFailedDaemon(
 }
 
 export async function bootstrapRuntime(
-	options: BootstrapRuntimeOptions = {},
+	options: BootstrapRuntimeOptions,
 ): Promise<{
 	modulesRoot: string;
 	daemons: StartedDaemon[];
@@ -638,6 +781,7 @@ export async function bootstrapRuntime(
 		options.eventQueuePath ??
 		resolveEventQueuePath(process.env.JUSTCLAW_HOME, options.homeDir);
 	const eventQueue = new EventQueue(dbPath);
+	seedActiveSessionMetadata(eventQueue, options.sessionStore);
 	const daemons = options.startedDaemons ?? [];
 
 	try {
@@ -653,6 +797,7 @@ export async function bootstrapRuntime(
 				initializeTimeoutMs: options.initializeTimeoutMs,
 				sandboxFactory: options.sandboxFactory,
 				queue: eventQueue,
+				sessionStore: options.sessionStore,
 				onFailure: (daemon, error) => {
 					handleDaemonFailure(daemon, error, options, daemons, eventQueue);
 				},
