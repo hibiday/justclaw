@@ -1,4 +1,4 @@
-export type JsonRpcId = number;
+export type JsonRpcId = string | number | null;
 
 export type JsonRpcRequest = {
 	jsonrpc: "2.0";
@@ -38,6 +38,11 @@ type JsonRpcPeerOptions = {
 	name: string;
 	sendLine: (line: string) => void;
 	onNotification?: (message: JsonRpcNotification) => void;
+	onRequest?: (
+		method: string,
+		params: unknown,
+		id: JsonRpcId,
+	) => unknown | Promise<unknown>;
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -52,14 +57,21 @@ export class JsonRpcPeer {
 	#name: string;
 	#sendLine: (line: string) => void;
 	#onNotification?: (message: JsonRpcNotification) => void;
+	#onRequest?: (
+		method: string,
+		params: unknown,
+		id: JsonRpcId,
+	) => unknown | Promise<unknown>;
 	#nextId = 1;
-	#pending = new Map<JsonRpcId, PendingRequest>();
+	// JsonRpcId includes null for parsed wire messages; outbound requests never use null ids, so pending keys are string | number only.
+	#pending = new Map<string | number, PendingRequest>();
 	#closedError: Error | null = null;
 
 	constructor(options: JsonRpcPeerOptions) {
 		this.#name = options.name;
 		this.#sendLine = options.sendLine;
 		this.#onNotification = options.onNotification;
+		this.#onRequest = options.onRequest;
 	}
 
 	request(method: string, params?: unknown): Promise<unknown> {
@@ -122,7 +134,7 @@ export class JsonRpcPeer {
 		}
 
 		if ("method" in message) {
-			this.#handleNotification(message);
+			this.#handleInboundMessage(message);
 			return;
 		}
 
@@ -141,13 +153,39 @@ export class JsonRpcPeer {
 		}
 	}
 
-	#handleNotification(message: Record<string, unknown>): void {
-		if ("id" in message) {
-			throw new Error(`${this.#name}: request handling is not supported`);
-		}
-
+	#handleInboundMessage(message: Record<string, unknown>): void {
 		if (typeof message.method !== "string") {
 			throw new Error(`${this.#name}: notification method must be a string`);
+		}
+
+		if ("id" in message) {
+			if (
+				typeof message.id !== "string" &&
+				typeof message.id !== "number" &&
+				message.id !== null
+			) {
+				throw new Error(
+					`${this.#name}: request id must be a string, number, or null`,
+				);
+			}
+			if (!this.#onRequest) {
+				if (!this.#closedError) {
+					this.#sendLine(
+						JSON.stringify({
+							jsonrpc: "2.0",
+							id: message.id,
+							error: { code: -32601, message: "Method not found" },
+						}),
+					);
+				}
+				return;
+			}
+			void this.#handleInboundRequest(
+				message.id,
+				message.method,
+				message.params,
+			);
+			return;
 		}
 
 		this.#onNotification?.({
@@ -157,9 +195,66 @@ export class JsonRpcPeer {
 		});
 	}
 
+	async #handleInboundRequest(
+		id: JsonRpcId,
+		method: string,
+		params: unknown,
+	): Promise<void> {
+		try {
+			const result = await this.#onRequest?.(method, params, id);
+			if (!this.#closedError) {
+				this.#sendLine(JSON.stringify({ jsonrpc: "2.0", id, result }));
+			}
+		} catch (error) {
+			if (!this.#closedError) {
+				const msg = error instanceof Error ? error.message : String(error);
+				this.#sendLine(
+					JSON.stringify({
+						jsonrpc: "2.0",
+						id,
+						error: { code: -32000, message: msg },
+					}),
+				);
+			}
+		}
+	}
+
 	#handleResponse(message: Record<string, unknown>): void {
-		if (typeof message.id !== "number") {
-			throw new Error(`${this.#name}: response id must be a number`);
+		if (
+			typeof message.id !== "string" &&
+			typeof message.id !== "number" &&
+			message.id !== null
+		) {
+			throw new Error(
+				`${this.#name}: response id must be a string, number, or null`,
+			);
+		}
+
+		if (message.id === null) {
+			// JSON-RPC 2.0: responses use id null when the request id could not be
+			// recovered (e.g. parse error on the peer). Never throw from handleLine:
+			// a buggy module must not tear down the core transport.
+			if ("error" in message) {
+				const remoteError = message.error;
+				if (
+					isObject(remoteError) &&
+					typeof remoteError.code === "number" &&
+					typeof remoteError.message === "string"
+				) {
+					console.error(
+						`[${this.#name}] ignoring JSON-RPC response with null id: ${formatRemoteError(remoteError as JsonRpcErrorResponse["error"])}`,
+					);
+				} else {
+					console.error(
+						`[${this.#name}] ignoring JSON-RPC response with null id (malformed error object)`,
+					);
+				}
+			} else {
+				console.error(
+					`[${this.#name}] ignoring JSON-RPC response with null id`,
+				);
+			}
+			return;
 		}
 
 		const pending = this.#pending.get(message.id);

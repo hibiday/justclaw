@@ -64,8 +64,191 @@ For ordinary event semantics, modules should use another payload field such as `
 | `initialize` | core -> module | request | Module returns its tools |
 | `tool/{name}` | core -> module | request | Invoke a tool exposed by the module |
 | `shutdown` | core -> module | request | Graceful stop |
-| `event` | module -> core | notification | Event emitted by the module |
+| `event` | module -> core | notification | LLM-bound event emitted by the module |
+| `sessions.new.v1` | module -> core | request | Create a new session; core returns its id |
+| `sessions.switch.v1` | module -> core | request | Enqueue a switch to an existing session (returns when enqueued, not when applied) |
+| `sessions.active.v1` | module -> core | request | Return the currently active session id |
+| `sessions.list.v1` | module -> core | request | List all session ids |
+| `sessions.get.v1` | module -> core | request | Retrieve history for a session |
+| `sessions.delete.v1` | module -> core | request | Delete a session's history file |
 | `event` | core -> module | notification | Core-initiated notification (see Core → Module Messaging) |
+
+## Module → Core Notification Types
+
+Modules emit LLM-bound events as notifications with `method: "event"`. The `type` field must be `"event.v1"`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "type": "event.v1",
+    "kind": "message.received",
+    "..."
+  }
+}
+```
+
+See [Event Format for LLM](#event-format-for-llm) for how the payload reaches the LLM.
+
+## Module → Core Session Requests
+
+Session operations use JSON-RPC request/response so the module can confirm the result before emitting subsequent events.
+
+The bundled runtime always configures a session store (per-session history files under the history directory). A file is treated as a session only when all of the following hold: filename is UUID `{id}.json`, file is readable, JSON parsing succeeds, and the top-level JSON value is an array (minimum condition for `AgentInputItem[]`). Other `*.json` files and unreadable/invalid UUID files are not sessions. The session methods below assume that store is present.
+
+Before any module is started, the bundled entrypoint ensures the history directory is non-empty: if there are no readable UUID `{id}.json` sessions yet (including a missing directory), it creates one empty session file with a new UUIDv7 and writes `[]`. That step is not a module-visible `sessions.new.v1` request; it exists so the LLM loop can adopt a session from disk without a prior `sessions.new.v1`. A line is written to the process stderr when this happens. On runtime startup, if `events.db` metadata does not yet contain `active_session_id`, the core seeds it from the newest readable UUID session id on disk. That startup seed fixes the initial active session before any module-visible `sessions.new.v1` calls can occur. Custom callers of `bootstrapRuntime` alone may omit the initial history-file creation step; in that configuration `sessions.active.v1` can still fail when there are no readable UUID sessions and the loop has not adopted a session yet.
+
+### `sessions.new.v1`
+
+Creates a new session and immediately writes an empty history file (`[]`). The core generates a UUIDv7 as the session identifier and returns it. The session appears in `sessions.list.v1` as soon as this call returns. The session is not activated; `sessions.new.v1` never changes the active session. Use `sessions.switch.v1` to switch.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "sessions.new.v1" }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": { "id": "0196f4a2-..." } }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | UUID (case-insensitive). The core returns UUIDv7 from this method. Used as the filename `$JUSTCLAW_HOME/history/{id}.json`. |
+
+### `sessions.switch.v1`
+
+Requests a switch to an existing session. The core enqueues that switch on the LLM queue and returns `"ok"` when the enqueue succeeds. The response means **the switch is queued**, not that the LLM loop has already loaded the new session or updated its active-session state.
+
+The session becomes active before the next `event.v1` is processed by the LLM.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 2, "method": "sessions.switch.v1", "params": { "id": "0196f4a2-..." } }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 2, "result": "ok" }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Session identifier. Must be a UUID (case-insensitive). Use the value returned by `sessions.new.v1` or an existing on-disk id. |
+
+If no readable history file exists for the given id, the core returns a JSON-RPC error.
+
+If the history file is removed or becomes unreadable **after** `sessions.switch.v1` returns `"ok"` but **before** the LLM loop applies that queued switch, the core does not change the in-memory session: it notifies the module that enqueued the switch row with `event.dropped.v1` (same shape as other dropped queue work), completes that queue row, and leaves the previously active session unchanged.
+
+**Ordering guarantee:** because the module receives a response before sending the next notification, the session switch is registered in the core before any subsequent `event.v1` is enqueued. The LLM loop drains pending session switches immediately after dequeuing each event, so the correct session is always active when the event is processed.
+
+**`sessions.active.v1` immediately after `sessions.switch.v1`:** the switch is applied asynchronously by the LLM loop. If the module calls `sessions.active.v1` in the same turn, before the loop has consumed the enqueued switch, the result can still be the **previous** active id. There is no guarantee that `"ok"` from `sessions.switch.v1` and a following `sessions.active.v1` observe the same id in that narrow window.
+
+The core does not process `event.v1` until a session is active. If the LLM has not adopted a session yet, the core first tries the persisted active session id in `events.db` metadata. If that id is missing or unreadable, the core falls back to the **lexicographically greatest** readable UUID session id among `{id}.json` files in the history directory (for UUIDv7 ids in canonical string form, that is the newest id). You can also set the active session explicitly with `sessions.switch.v1`. If there are no readable UUID session files and no applicable `sessions.switch.v1` before the event is consumed, the core notifies the source module with `event.dropped.v1` and completes the queue row without running the LLM.
+
+### `sessions.active.v1`
+
+Returns the id of the currently active session. The source of truth is persisted `events.db` metadata key `active_session_id`, which is updated when the LLM loop successfully applies a session switch or adopts a fallback session.
+
+Lookup order:
+
+1. Persisted `events.db` metadata key `active_session_id`
+2. Fallback: newest-on-disk readable UUID id (lexicographic maximum) when metadata is missing or unusable
+
+Metadata is considered unusable when `active_session_id` is missing, unreadable, or invalid (for example non-UUID text). In those cases the core logs a warning and continues with fallback lookup.
+
+This method is read-only: it does not update `active_session_id` metadata. Metadata is updated only by the LLM loop when it applies a session switch or adopts a fallback session.
+
+If `sessions.switch.v1` was just accepted (`"ok"`) but the loop has not yet applied that switch, this method can still return the prior value until the switch is drained. See **Ordering guarantee** under `sessions.switch.v1`.
+
+The core returns a JSON-RPC error when no id is available from either step above. After a normal bundled startup with an empty history, the bootstrap step above always leaves at least one file, so this error does not occur on first boot until every session file is removed, becomes unreadable, or the store is otherwise empty.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "method": "sessions.active.v1" }
+```
+
+Response (when a session is active):
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "result": { "id": "0196f4a2-..." } }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Session identifier. Must be a UUID (case-insensitive). Use the value returned by `sessions.new.v1` or an existing on-disk id. |
+
+### `sessions.list.v1`
+
+Returns the ids of all readable sessions (UUID `{id}.json` files that can be read, parsed as JSON, and treated as arrays). Non-UUID `*.json` files and unreadable UUID files are omitted. The list is sorted lexicographically, which is chronological order for UUIDv7 ids.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "method": "sessions.list.v1" }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "result": { "ids": ["0196f4a2-...", "0196f4a3-..."] } }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ids` | string[] | UUID basenames of readable `{id}.json` session files, lexicographically sorted. Non-UUID `*.json` files and unreadable UUID files are omitted. |
+
+### `sessions.get.v1`
+
+Returns the conversation history for a session. If no readable history file exists for the given id, the core returns a JSON-RPC error (same idea as `sessions.switch.v1` for a missing or unreadable session). When the file exists and contains `[]`, `history` is an empty array.
+
+The `history` field contains the raw `AgentInputItem[]` used internally by the LLM loop. Its structure is not versioned and may change.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 4, "method": "sessions.get.v1", "params": { "id": "0196f4a2-..." } }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 4, "result": { "history": [ ... ] } }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Session identifier of the session whose history to retrieve. Must be a UUID (case-insensitive). |
+
+### `sessions.delete.v1`
+
+Deletes the history file for the given session. If no file exists for the id, the operation succeeds silently (idempotent).
+
+If the deleted id is currently active (persisted metadata), the core deletes `active_session_id` immediately. The core does not auto-switch during `sessions.delete.v1`; fallback adoption can happen later when the LLM loop needs a session for event processing.
+
+If a session is deleted while an LLM turn is in-flight, completion of that turn does not recreate the deleted session file. Deleted sessions are never written again.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "sessions.delete.v1", "params": { "id": "0196f4a2-..." } }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": "ok" }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Session identifier. Must be a UUID (case-insensitive). Use the value returned by `sessions.new.v1` or an existing on-disk id. |
 
 ## Lifecycle (daemon)
 
@@ -163,8 +346,9 @@ That includes at least:
 
 - **Restart recovery:** the previous process exited while one or more events were still marked `running` in the queue (the LLM cycle had started but never finished).
 - **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully.
+- **No adoptable session:** a session store is configured, the event was consumed from the queue, but no session could be adopted (no readable UUID `{id}.json` files on disk yet and no `sessions.switch.v1` applied before this event in the loop).
 
-In both cases the notification shape is the same.
+In all cases the notification shape is the same.
 
 ```json
 {

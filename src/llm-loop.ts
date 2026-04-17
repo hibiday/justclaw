@@ -11,11 +11,13 @@ import {
 import OpenAI from "openai";
 import { notifyEventDropped } from "./event-dropped";
 import {
+	ACTIVE_SESSION_META_KEY,
 	type EventQueue,
 	type QueuedEvent,
 	timestampFromUUIDv7,
 } from "./event-queue";
 import type { StartedDaemon } from "./runtime";
+import type { SessionStore } from "./session-store";
 
 setTracingDisabled(true);
 
@@ -144,7 +146,130 @@ function buildSendMessageTool(
 
 export type LlmLoopOptions = {
 	runner?: Runner;
+	sessionStore?: SessionStore;
 };
+
+function resetSessionState(state: {
+	currentSessionId: string | null;
+	history: AgentInputItem[];
+}): void {
+	state.currentSessionId = null;
+	state.history = [];
+}
+
+async function loadSessionIntoState(
+	id: string,
+	state: { currentSessionId: string | null; history: AgentInputItem[] },
+	sessionStore: SessionStore,
+	context: string,
+): Promise<boolean> {
+	try {
+		const loaded = await sessionStore.load(id);
+		if (loaded === null) {
+			return false;
+		}
+		state.history = loaded;
+		state.currentSessionId = id;
+		return true;
+	} catch (error) {
+		console.warn(
+			`[core] ${context}: session "${id}" is invalid or unreadable (${error instanceof Error ? error.message : String(error)})`,
+		);
+		return false;
+	}
+}
+
+async function applySessionSwitch(
+	newId: string,
+	state: { currentSessionId: string | null; history: AgentInputItem[] },
+	eventQueue: EventQueue,
+	sessionStore: SessionStore,
+): Promise<boolean> {
+	if (newId === state.currentSessionId) {
+		eventQueue.setMeta(ACTIVE_SESSION_META_KEY, newId);
+		return true;
+	}
+	if (state.currentSessionId !== null) {
+		if (await shouldPersistCurrentSession(state, eventQueue)) {
+			await sessionStore.save(state.currentSessionId, state.history);
+		}
+	}
+	if (
+		!(await loadSessionIntoState(
+			newId,
+			state,
+			sessionStore,
+			"sessions.switch.v1 apply",
+		))
+	) {
+		console.error(
+			`[core] sessions.switch.v1: history for session "${newId}" is missing or unreadable at apply time; switch not applied`,
+		);
+		return false;
+	}
+	eventQueue.setMeta(ACTIVE_SESSION_META_KEY, newId);
+	return true;
+}
+
+async function adoptSessionFromMetadata(
+	state: { currentSessionId: string | null; history: AgentInputItem[] },
+	eventQueue: EventQueue,
+	sessionStore: SessionStore,
+): Promise<boolean> {
+	const metaSessionId = eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
+	if (metaSessionId !== null) {
+		if (
+			await loadSessionIntoState(
+				metaSessionId,
+				state,
+				sessionStore,
+				"active_session_id metadata adopt",
+			)
+		) {
+			return true;
+		}
+		console.warn(
+			`[core] active session metadata points to unreadable session "${metaSessionId}"; falling back to newest readable session`,
+		);
+	}
+
+	const fallbackId = sessionStore.newestReadableSessionId();
+	if (fallbackId === null) {
+		return false;
+	}
+	if (
+		!(await loadSessionIntoState(
+			fallbackId,
+			state,
+			sessionStore,
+			"newest readable fallback adopt",
+		))
+	) {
+		return false;
+	}
+	eventQueue.setMeta(ACTIVE_SESSION_META_KEY, fallbackId);
+	return true;
+}
+
+async function shouldPersistCurrentSession(
+	state: { currentSessionId: string | null; history: AgentInputItem[] },
+	eventQueue: EventQueue,
+): Promise<boolean> {
+	if (state.currentSessionId === null) {
+		return false;
+	}
+	return state.currentSessionId === eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
+}
+
+function isSessionsSwitchV1(
+	params: Record<string, unknown>,
+): params is { type: "sessions.switch.v1"; id: string } {
+	return (
+		params.type === "sessions.switch.v1" &&
+		typeof params.id === "string" &&
+		params.id !== ""
+	);
+}
 
 export async function runLlmLoop(
 	eventQueue: EventQueue,
@@ -153,6 +278,7 @@ export async function runLlmLoop(
 	options?: LlmLoopOptions,
 ): Promise<void> {
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
+	const sessionStore = options?.sessionStore;
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
@@ -160,12 +286,84 @@ export async function runLlmLoop(
 		tools: [],
 	});
 
-	let history: AgentInputItem[] = [];
+	const session = {
+		currentSessionId: null as string | null,
+		history: [] as AgentInputItem[],
+	};
 
 	while (true) {
 		const event = await eventQueue.next();
 		if (!event) {
 			break;
+		}
+
+		if (
+			session.currentSessionId !== eventQueue.getMeta(ACTIVE_SESSION_META_KEY)
+		) {
+			resetSessionState(session);
+		}
+
+		if (isSessionsSwitchV1(event.params)) {
+			if (!sessionStore) {
+				console.warn(
+					`[core] sessions.switch.v1 requires a configured session store; dropping switch for "${event.params.id}"`,
+				);
+				notifyEventDropped(daemons, event);
+				eventQueue.complete(event.id);
+				continue;
+			}
+			let applied = false;
+			try {
+				applied = await applySessionSwitch(
+					event.params.id,
+					session,
+					eventQueue,
+					sessionStore,
+				);
+			} catch (error) {
+				console.error(
+					`[core] sessions.switch.v1 failed for "${event.params.id}": ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+			if (!applied) {
+				notifyEventDropped(daemons, event);
+			}
+			eventQueue.complete(event.id);
+			continue;
+		}
+
+		// QueuedEvent.params is untyped; only event.v1 may reach the LLM.
+		if (event.params.type !== "event.v1") {
+			console.warn(
+				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(event.params.type)} (expected event.v1); dropping`,
+			);
+			eventQueue.complete(event.id);
+			continue;
+		}
+
+		if (sessionStore && session.currentSessionId === null) {
+			try {
+				await adoptSessionFromMetadata(session, eventQueue, sessionStore);
+			} catch (error) {
+				console.error(
+					`[core] failed to adopt initial session for event from ${event.source} (id=${event.id}): ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				notifyEventDropped(daemons, event);
+				eventQueue.complete(event.id);
+				continue;
+			}
+		}
+		if (sessionStore && session.currentSessionId === null) {
+			console.error(
+				`[core] no active session for event from ${event.source} (id=${event.id}); add a session history file or call sessions.switch.v1 — dropping`,
+			);
+			notifyEventDropped(daemons, event);
+			eventQueue.complete(event.id);
+			continue;
 		}
 
 		let currentTarget = event.source;
@@ -183,8 +381,11 @@ export async function runLlmLoop(
 		try {
 			const result = await runner.run(
 				agent,
-				history.length > 0
-					? [...history, { role: "user", content: xml } as AgentInputItem]
+				session.history.length > 0
+					? [
+							...session.history,
+							{ role: "user", content: xml } as AgentInputItem,
+						]
 					: xml,
 			);
 			const text = result.finalOutput;
@@ -194,7 +395,14 @@ export async function runLlmLoop(
 				);
 				targetDaemon?.peer.notify("event", { type: "message.send.v1", text });
 			}
-			history = result.history;
+			session.history = result.history;
+			if (sessionStore && session.currentSessionId !== null) {
+				if (await shouldPersistCurrentSession(session, eventQueue)) {
+					await sessionStore.save(session.currentSessionId, session.history);
+				} else {
+					resetSessionState(session);
+				}
+			}
 			eventQueue.complete(event.id);
 		} catch (error) {
 			console.error(

@@ -20,6 +20,14 @@ const pendingMessages: string[] = [];
 let socketLineBuffer = "";
 /** Replaced in open() so each accepted socket gets a fresh stream decoder. */
 let socketUtf8Decoder = new TextDecoder();
+let nextRequestId = 10_000;
+const pendingRpc = new Map<
+	number,
+	{
+		resolve: (value: unknown) => void;
+		reject: (error: Error) => void;
+	}
+>();
 
 const stdinUtf8Decoder = new TextDecoder();
 
@@ -31,7 +39,11 @@ function appendSocketLines(chunk: string): void {
 		socketLineBuffer = socketLineBuffer.slice(newlineIndex + 1);
 		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 		if (line.length > 0) {
-			emitEvent({ kind: "message.received", text: line });
+			if (line.startsWith("/")) {
+				void handleSlashCommand(line);
+			} else {
+				emitEvent({ kind: "message.received", text: line });
+			}
 		}
 		newlineIndex = socketLineBuffer.indexOf("\n");
 	}
@@ -47,6 +59,203 @@ function emitEvent(params: Record<string, unknown>): void {
 		method: "event",
 		params: { type: "event.v1", ...params },
 	});
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function rpcRequest(
+	method: string,
+	params?: Record<string, unknown>,
+): Promise<unknown> {
+	const id = nextRequestId++;
+	writeLine(
+		params === undefined
+			? { jsonrpc: "2.0", id, method }
+			: { jsonrpc: "2.0", id, method, params },
+	);
+	return new Promise((resolve, reject) => {
+		pendingRpc.set(id, { resolve, reject });
+	});
+}
+
+function rpcErrorMessage(error: unknown): string {
+	if (!isRecord(error) || typeof error.message !== "string") {
+		return "unknown error";
+	}
+	return error.message;
+}
+
+function oneLine(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+function formatHistoryItem(item: unknown): string {
+	if (!isRecord(item)) {
+		return JSON.stringify(item);
+	}
+
+	const role = typeof item.role === "string" ? item.role : "unknown";
+	if (typeof item.content === "string") {
+		return `${role}: ${oneLine(item.content)}`;
+	}
+
+	if (Array.isArray(item.content)) {
+		const parts: string[] = [];
+		for (const chunk of item.content) {
+			if (!isRecord(chunk)) {
+				continue;
+			}
+			if (typeof chunk.text === "string") {
+				parts.push(oneLine(chunk.text));
+				continue;
+			}
+			if (typeof chunk.input_text === "string") {
+				parts.push(oneLine(chunk.input_text));
+			}
+		}
+		if (parts.length > 0) {
+			return `${role}: ${parts.join(" / ")}`;
+		}
+	}
+
+	if (typeof item.type === "string" && typeof item.name === "string") {
+		return `${item.type}: ${item.name}`;
+	}
+
+	return JSON.stringify(item);
+}
+
+async function resolveSessionId(selector?: string): Promise<string | null> {
+	if (!selector) {
+		const active = await rpcRequest("sessions.active.v1");
+		return isRecord(active) && typeof active.id === "string" ? active.id : null;
+	}
+	if (!/^\d+$/.test(selector)) {
+		return selector;
+	}
+	const list = await rpcRequest("sessions.list.v1");
+	const listIds =
+		isRecord(list) && Array.isArray(list.ids)
+			? list.ids.filter((value): value is string => typeof value === "string")
+			: [];
+	const position = Number.parseInt(selector, 10);
+	if (position < 1 || position > listIds.length) {
+		return null;
+	}
+	return listIds[position - 1] ?? null;
+}
+
+async function handleSlashCommand(input: string): Promise<void> {
+	const trimmed = input.trim();
+	const [command, ...rest] = trimmed.split(/\s+/);
+
+	if (command === "/sessions") {
+		try {
+			const list = await rpcRequest("sessions.list.v1");
+			const active = await rpcRequest("sessions.active.v1");
+			const listIds = isRecord(list) && Array.isArray(list.ids) ? list.ids : [];
+			const activeId =
+				isRecord(active) && typeof active.id === "string" ? active.id : null;
+			if (listIds.length === 0) {
+				deliverToClient("[session] no sessions");
+				return;
+			}
+			let index = 1;
+			for (const rawId of listIds) {
+				if (typeof rawId !== "string") {
+					continue;
+				}
+				const marker = rawId === activeId ? "*" : " ";
+				deliverToClient(`[session] ${marker} [${index}] ${rawId}`);
+				index += 1;
+			}
+		} catch (error) {
+			deliverToClient(`[session] list failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	if (command === "/session") {
+		const selector = rest[0];
+		if (!selector) {
+			deliverToClient("[session] usage: /session <id|number>");
+			return;
+		}
+		try {
+			const id = await resolveSessionId(selector);
+			if (!id) {
+				deliverToClient(`[session] invalid number: ${selector}`);
+				return;
+			}
+			await rpcRequest("sessions.switch.v1", { id });
+			deliverToClient(`[session] switch queued: ${id}`);
+		} catch (error) {
+			deliverToClient(`[session] switch failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	if (command === "/new") {
+		try {
+			const created = await rpcRequest("sessions.new.v1");
+			const id =
+				isRecord(created) && typeof created.id === "string" ? created.id : null;
+			if (!id) {
+				deliverToClient("[session] create failed: invalid response");
+				return;
+			}
+			await rpcRequest("sessions.switch.v1", { id });
+			deliverToClient(`[session] created and switched: ${id}`);
+		} catch (error) {
+			deliverToClient(`[session] create failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	if (command === "/log") {
+		const selector = rest[0];
+		try {
+			const id = await resolveSessionId(selector);
+			if (!id) {
+				deliverToClient(
+					selector
+						? `[log] invalid number: ${selector}`
+						: "[log] failed to resolve active session",
+				);
+				return;
+			}
+			const response = await rpcRequest("sessions.get.v1", { id });
+			const history =
+				isRecord(response) && Array.isArray(response.history)
+					? response.history
+					: null;
+			if (!history) {
+				deliverToClient("[log] failed: invalid response");
+				return;
+			}
+			deliverToClient(`[log] session ${id} (${history.length} items)`);
+			if (history.length === 0) {
+				deliverToClient("[log] (empty)");
+				return;
+			}
+			const start = Math.max(0, history.length - 20);
+			if (start > 0) {
+				deliverToClient(`[log] showing last ${history.length - start} items`);
+			}
+			for (let i = start; i < history.length; i += 1) {
+				deliverToClient(`[log] ${i + 1}: ${formatHistoryItem(history[i])}`);
+			}
+		} catch (error) {
+			deliverToClient(`[log] failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	deliverToClient(
+		"[session] unknown command. use /sessions, /session <id|number>, /new, or /log [id|number]",
+	);
 }
 
 function deliverToClient(text: string): void {
@@ -101,10 +310,6 @@ Bun.listen({
 	},
 });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 function handleStdinLine(line: string): void {
 	let msg: unknown;
 	try {
@@ -114,6 +319,20 @@ function handleStdinLine(line: string): void {
 	}
 
 	if (!isRecord(msg) || msg.jsonrpc !== "2.0") {
+		return;
+	}
+
+	if (typeof msg.id === "number" && !("method" in msg)) {
+		const pending = pendingRpc.get(msg.id);
+		if (!pending) {
+			return;
+		}
+		pendingRpc.delete(msg.id);
+		if (isRecord(msg.error)) {
+			pending.reject(new Error(rpcErrorMessage(msg.error)));
+			return;
+		}
+		pending.resolve(msg.result);
 		return;
 	}
 
