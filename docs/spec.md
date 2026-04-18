@@ -338,6 +338,32 @@ The notification carries no destination information. Modules are responsible for
 
 If precise destination control is required (e.g., DM a specific user, send to a non-default channel), modules should expose this as a tool with explicit parameters rather than relying on the `message.send.v1` notification.
 
+### `tool_call.v1`
+
+The core notifies the current message target each time a workspace tool completes. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "type": "tool_call.v1",
+    "tool": "shell",
+    "input": { "commands": ["ls -la"] },
+    "output": "{\"output\":[{\"stdout\":\"...\",\"stderr\":\"\",\"outcome\":{\"type\":\"exit\",\"exitCode\":0}}]}"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `tool_call.v1` |
+| `tool` | string | Tool name (`shell` or `apply_patch`) |
+| `input` | object | Arguments passed to the tool by the LLM |
+| `output` | string | JSON-encoded result returned by the tool |
+
+For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `apply_patch`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
+
 ### `event.dropped.v1`
 
 The core notifies the source module when it **consumes an event for an LLM cycle but that cycle does not complete normally**. The source module can use this to decide whether to re-emit the event.
@@ -434,6 +460,38 @@ send_message(module: string, text: string)
 | `text` | Message body |
 
 The core forwards this as a `message.send.v1` notification to the named module, then updates the default delivery target.
+
+### Built-in Tool: `shell`
+
+Executes shell commands sequentially inside the workspace sandbox. Each command runs as `sh -c <command>`. Commands do not share state between calls.
+
+```
+shell(commands: string[], timeout_ms?: number)
+```
+
+| Parameter | Description |
+|---|---|
+| `commands` | Shell commands to execute in order |
+| `timeout_ms` | Per-command timeout in milliseconds (default: 30000) |
+
+The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/` and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+
+### Built-in Tool: `apply_patch`
+
+Creates, updates, or deletes a file inside the workspace sandbox.
+
+```
+apply_patch(type: "create_file" | "update_file" | "delete_file", path: string, content?: string, diff?: string)
+```
+
+| Parameter | Description |
+|---|---|
+| `type` | Operation type |
+| `path` | Absolute path to the file (must be inside the workspace) |
+| `content` | Full file content (required for `create_file`) |
+| `diff` | Unified diff with absolute paths using `-p0` strip (required for `update_file`) |
+
+Paths outside the workspace are rejected. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
 ## Event Format for LLM
 

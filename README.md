@@ -14,7 +14,7 @@ The core provides:
 - **Reasoning** — LLM-based inference and planning
 - **Memory** — Persistent context management across sessions
 - **Identity** — Agent personality, values, and behavioral boundaries
-- **Built-in tools** — A minimal set of built-in capabilities for common operations, including `send_message` for explicit message delivery
+- **Built-in tools** — A minimal set of built-in capabilities for common operations: `send_message` for explicit message delivery, `shell` for running commands in the workspace sandbox, and `apply_patch` for creating, updating, and deleting files in the workspace
 
 Functionality beyond the built-ins can be added through modules.
 
@@ -40,14 +40,17 @@ For the wire protocol, lifecycle, and message formats, see [docs/spec.md](docs/s
 ### Directory Structure
 
 ```
-$HOME/justclaw/modules/
-  {module-name}/
-    module.json      # manifest
-    {entrypoint}     # executable
-    ...              # module-specific data and state
+$HOME/justclaw/
+  modules/
+    {module-name}/
+      module.json      # manifest
+      {entrypoint}     # executable
+      ...              # module-specific data and state
+  workspace/           # LLM workspace (rw); available via shell and apply_patch tools
+  history/             # session history files (ro inside workspace sandbox)
 ```
 
-If `JUSTCLAW_HOME` is set, the runtime uses `JUSTCLAW_HOME/modules/` instead. Each runtime module directory is writable inside the platform sandbox via `bwrap` or `sandbox-exec`. State management is the module's own responsibility.
+If `JUSTCLAW_HOME` is set, the runtime uses that directory instead of `$HOME/justclaw/`. Each module directory is writable inside the platform sandbox via `bwrap` or `sandbox-exec`. State management is the module's own responsibility.
 
 ### Manifest (module.json)
 
