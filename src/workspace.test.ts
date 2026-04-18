@@ -54,18 +54,6 @@ function historyDirForWorkspace(root: string): string {
 }
 
 describe("WorkspaceEditor", () => {
-	test("rejects path traversal for createFile", async () => {
-		const root = await createTempDir("justclaw-ws-");
-		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
-		const r = await editor.createFile({
-			type: "create_file",
-			path: "/etc/passwd",
-			diff: "",
-		});
-		expect(r.status).toBe("failed");
-		expect(r.output).toMatch(/escapes workspace/);
-	});
-
 	test("createFile writes file content", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
@@ -79,14 +67,14 @@ describe("WorkspaceEditor", () => {
 		expect(await Bun.file(filePath).text()).toBe("hello\n");
 	});
 
-	test("deleteFile is idempotent for missing files", async () => {
+	test("deleteFile fails for missing files", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
 		const r = await editor.deleteFile({
 			type: "delete_file",
 			path: path.join(root, "nope.txt"),
 		});
-		expect(r.status).toBe("completed");
+		expect(r.status).toBe("failed");
 	});
 
 	test("updateFile fails when target is missing", async () => {

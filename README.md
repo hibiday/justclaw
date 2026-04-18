@@ -48,6 +48,7 @@ $HOME/justclaw/
       ...              # module-specific data and state
   workspace/           # LLM workspace (rw); available via shell and apply_patch tools
   history/             # session history files (ro inside workspace sandbox)
+  character/           # agent identity files (rw inside workspace sandbox); see Character files in spec
 ```
 
 If `JUSTCLAW_HOME` is set, the runtime uses that directory instead of `$HOME/justclaw/`. Each module directory is writable inside the platform sandbox via `bwrap` or `sandbox-exec`. State management is the module's own responsibility.

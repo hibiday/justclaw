@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { loadAgentContext, resolveCharacterDir } from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
@@ -46,11 +47,15 @@ async function main(): Promise<void> {
 		const model = resolveModelConfig();
 		const workspaceDir = resolveWorkspaceDir();
 		const historyDir = resolveHistoryDir();
+		const characterDir = resolveCharacterDir();
 		mkdirSync(workspaceDir, { recursive: true });
+		mkdirSync(characterDir, { recursive: true });
+		const contextInstructions = await loadAgentContext(characterDir);
 		const workspaceTools = createWorkspaceTools(
 			workspaceDir,
 			historyDir,
 			process.platform,
+			characterDir,
 		);
 		const workspaceInstructions = [
 			`Your workspace is at ${workspaceDir}. Use it for all file operations.`,
@@ -79,6 +84,7 @@ async function main(): Promise<void> {
 				sessionStore,
 				workspaceTools,
 				workspaceInstructions,
+				contextInstructions,
 			}),
 			shutdownTask,
 		]);

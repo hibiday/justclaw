@@ -234,6 +234,36 @@ describe("runLlmLoop", () => {
 		expect((dropped[0] as { type?: string }).type).toBe("event.dropped.v1");
 	});
 
+	test("includes contextInstructions in agent system prompt", async () => {
+		const home = await createTempDir("justclaw-llm-ctx-");
+		const dbPath = path.join(home, "events.db");
+		const sessionStore = new SessionStore(path.join(home, "history"));
+		await sessionStore.ensureDefaultSessionIfEmpty();
+
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		let capturedAgent: { instructions?: string } | undefined;
+		const mockRunner = {
+			run: async (agent: unknown) => {
+				capturedAgent = agent as { instructions?: string };
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, [], "test-model", {
+			runner: mockRunner,
+			sessionStore,
+			workspaceInstructions: "WORKSPACE_BLOCK",
+			contextInstructions: "CONTEXT_BLOCK",
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(capturedAgent?.instructions).toBe("CONTEXT_BLOCK\nWORKSPACE_BLOCK");
+	});
+
 	test("skips LLM for sessions.switch.v1 and completes the event", async () => {
 		const home = await createTempDir("justclaw-llm-session-");
 		const dbPath = path.join(home, "events.db");

@@ -23,6 +23,22 @@ describe("workspace sandbox profiles", () => {
 		expect(profile).toContain("(allow network*)");
 	});
 
+	test("darwin workspace profile grants read-write on optional character dir", () => {
+		const ws = "/Users/dev/justclaw/workspace";
+		const hist = "/Users/dev/justclaw/history";
+		const ch = "/Users/dev/justclaw/character";
+		const profile = createDarwinWorkspaceSandboxProfile(
+			ws,
+			hist,
+			process.env,
+			true,
+			ch,
+		);
+		expect(profile).toContain(`(subpath ${JSON.stringify(ch)})`);
+		const writeSection = profile.slice(profile.indexOf("(allow file-write*"));
+		expect(writeSection).toContain(`(subpath ${JSON.stringify(ch)})`);
+	});
+
 	test("darwin workspace profile omits history when includeHistoryDir is false", () => {
 		const ws = "/tmp/ws";
 		const hist = "/tmp/hist";
@@ -59,6 +75,27 @@ describe("workspace sandbox profiles", () => {
 		expect(joined).toContain("--ro-bind /hist /hist");
 		expect(joined).toContain("--chdir /ws");
 		expect(cmd[cmd.length - 1]).toBe("--");
+	});
+
+	test("linux workspace bwrap command rw-binds character dir when present", async () => {
+		const pathExists = async (p: string) =>
+			p === "/bin" ||
+			p === "/tmp" ||
+			p === "/ws" ||
+			p === "/hist" ||
+			p === "/char";
+		const cmd = await createLinuxWorkspaceBwrapCommand(
+			"/usr/bin/bwrap",
+			"/ws",
+			"/hist",
+			{
+				pathExists,
+				realPath: async (p) => p,
+				bindHistoryDir: true,
+				characterDir: "/char",
+			},
+		);
+		expect(cmd.join(" ")).toContain("--bind /char /char");
 	});
 
 	test("linux workspace bwrap command skips history ro-bind when bindHistoryDir is false", async () => {

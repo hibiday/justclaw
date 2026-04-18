@@ -310,6 +310,49 @@ If the resolved interpreter is outside the sandbox's standard read-only allowlis
 
 **Rationale:** This preserves common user-local runtimes such as Bun installed outside `/usr` while keeping the sandbox policy minimal and read-only.
 
+## Character directory
+
+The core resolves a **character** directory for optional static agent context and for files the agent may edit alongside the workspace.
+
+| Resolution | Path |
+|---|---|
+| `JUSTCLAW_CHARACTER` set | Absolute path from this env var |
+| else `JUSTCLAW_HOME` set | `$JUSTCLAW_HOME/character` |
+| else | `$HOME/justclaw/character` |
+
+If neither `JUSTCLAW_HOME` nor `HOME` is available, character directory resolution fails the same way as workspace resolution when no overrides exist.
+
+The bundled entrypoint creates the directory if missing (recursive mkdir), same as the workspace directory.
+
+### Character files
+
+The core reads the following files from the character directory, in order:
+
+| File | Purpose |
+|---|---|
+| `AGENTS.md` | System instructions for the LLM (equivalent to CLAUDE.md / AGENTS.md in coding agents) |
+| `SOUL.md` | Core values and ethical guidelines |
+| `IDENTITY.md` | Personality, tone, and style |
+| `USER.md` | User information and preferences |
+| `MEMORY.md` | Cross-session memory |
+
+Each present file is read as UTF-8, trimmed, and formatted as:
+
+```
+## FILENAME.md
+<trimmed content>
+```
+
+Sections are joined with a blank line. The combined string is passed to the LLM as **context instructions** ahead of workspace instructions in the system prompt.
+
+Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors propagate and fail startup.
+
+All files are read once at process start. Because the character directory is rw-mounted in the workspace sandbox, the LLM can edit these files via the `shell` tool; those changes take effect on the next process start.
+
+### Workspace sandbox
+
+Built-in `shell` and `apply_patch` (and the `patch` helper used for `update_file`) run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory and read-write access to the character directory, and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+
 ## Core → Module Messaging
 
 The core sends notifications to modules using `method: "event"` with a versioned `type` field as the discriminator. Unlike module-emitted events (which the LLM consumes), these notifications are consumed by module code, so their formats are fixed.
@@ -474,11 +517,11 @@ shell(commands: string[], timeout_ms?: number)
 | `commands` | Shell commands to execute in order |
 | `timeout_ms` | Per-command timeout in milliseconds (default: 30000) |
 
-The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/` and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory (see [Character directory](#character-directory)), and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
 ### Built-in Tool: `apply_patch`
 
-Creates, updates, or deletes a file inside the workspace sandbox.
+Creates, updates, or deletes a file inside the workspace sandbox. Allowed paths are the workspace directory and the character directory.
 
 ```
 apply_patch(type: "create_file" | "update_file" | "delete_file", path: string, content?: string, diff?: string)
@@ -487,11 +530,11 @@ apply_patch(type: "create_file" | "update_file" | "delete_file", path: string, c
 | Parameter | Description |
 |---|---|
 | `type` | Operation type |
-| `path` | Absolute path to the file (must be inside the workspace) |
+| `path` | Absolute path to the file, inside the sandbox (workspace or character directory) |
 | `content` | Full file content (required for `create_file`) |
 | `diff` | Unified diff with absolute paths using `-p0` strip (required for `update_file`) |
 
-Paths outside the workspace are rejected. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+The path is resolved to an absolute path. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
 ## Event Format for LLM
 
