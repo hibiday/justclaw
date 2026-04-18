@@ -340,7 +340,7 @@ If precise destination control is required (e.g., DM a specific user, send to a 
 
 ### `tool_call.v1`
 
-The core notifies the current message target each time a workspace tool completes. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
+The core notifies the current message target each time a tool completes — both workspace tools (`shell`, `apply_patch`) and tools exposed by modules. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
 
 ```json
 {

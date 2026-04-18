@@ -413,7 +413,9 @@ export async function runLlmLoop(
 			...(options?.workspaceTools ?? []).map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemons),
 			),
-			...buildModuleTools(daemons),
+			...buildModuleTools(daemons).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemons),
+			),
 			buildSendMessageTool(daemons, (name) => {
 				currentTarget = name;
 			}),
