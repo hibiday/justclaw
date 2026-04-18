@@ -127,6 +127,87 @@ function formatHistoryItem(item: unknown): string {
 	return JSON.stringify(item);
 }
 
+function formatToolCall(
+	toolName: string,
+	input: unknown,
+	outputStr: string,
+): string[] {
+	const lines: string[] = [];
+
+	if (
+		toolName === "shell" &&
+		isRecord(input) &&
+		Array.isArray(input.commands)
+	) {
+		for (const cmd of input.commands) {
+			if (typeof cmd === "string") {
+				lines.push(`[shell] $ ${cmd}`);
+			}
+		}
+		try {
+			const result = JSON.parse(outputStr) as unknown;
+			if (isRecord(result) && Array.isArray(result.output)) {
+				for (const entry of result.output) {
+					if (!isRecord(entry)) {
+						continue;
+					}
+					if (typeof entry.stdout === "string" && entry.stdout.trim()) {
+						lines.push(entry.stdout.trimEnd());
+					}
+					if (typeof entry.stderr === "string" && entry.stderr.trim()) {
+						lines.push(`[stderr] ${entry.stderr.trimEnd()}`);
+					}
+					if (isRecord(entry.outcome)) {
+						if (entry.outcome.type === "timeout") {
+							lines.push("[shell] timed out");
+						} else if (
+							typeof entry.outcome.exitCode === "number" &&
+							entry.outcome.exitCode !== 0
+						) {
+							lines.push(`[shell] exit ${entry.outcome.exitCode}`);
+						}
+					}
+				}
+			}
+		} catch {
+			/* malformed output — skip */
+		}
+		return lines;
+	}
+
+	if (toolName === "apply_patch" && isRecord(input)) {
+		const op = typeof input.type === "string" ? input.type : "?";
+		const filePath = typeof input.path === "string" ? input.path : "?";
+		try {
+			const result = JSON.parse(outputStr) as unknown;
+			const status =
+				isRecord(result) && typeof result.status === "string"
+					? result.status
+					: "completed";
+			const detail =
+				isRecord(result) && typeof result.output === "string"
+					? `: ${result.output}`
+					: "";
+			lines.push(`[patch] ${op} ${filePath} → ${status}${detail}`);
+		} catch {
+			lines.push(`[patch] ${op} ${filePath}`);
+		}
+		if (op === "create_file" && typeof input.content === "string") {
+			for (const l of input.content.trimEnd().split("\n")) {
+				lines.push(`  ${l}`);
+			}
+		} else if (op === "update_file" && typeof input.diff === "string") {
+			for (const l of input.diff.trimEnd().split("\n")) {
+				lines.push(`  ${l}`);
+			}
+		}
+		return lines;
+	}
+
+	lines.push(`[tool:${toolName}] ${outputStr}`);
+	return lines;
+}
+
 async function resolveSessionId(selector?: string): Promise<string | null> {
 	if (!selector) {
 		const active = await rpcRequest("sessions.active.v1");
@@ -367,6 +448,15 @@ function handleStdinLine(line: string): void {
 
 	if (pType === "message.send.v1" && typeof params.text === "string") {
 		deliverToClient(params.text);
+		return;
+	}
+
+	if (pType === "tool_call.v1") {
+		const toolName = typeof params.tool === "string" ? params.tool : "unknown";
+		const outputStr = typeof params.output === "string" ? params.output : "";
+		for (const line of formatToolCall(toolName, params.input, outputStr)) {
+			deliverToClient(line);
+		}
 		return;
 	}
 
