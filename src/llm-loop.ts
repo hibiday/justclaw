@@ -89,6 +89,39 @@ export function eventToXml(event: QueuedEvent): string {
 		: `<event ${attrs}></event>`;
 }
 
+function wrapWithNotification(
+	t: Tool,
+	getTarget: () => string,
+	daemons: StartedDaemon[],
+): Tool {
+	if (t.type !== "function") {
+		return t;
+	}
+	const originalInvoke = t.invoke.bind(t);
+	return {
+		...t,
+		invoke: async (runContext, input, details) => {
+			const output = await originalInvoke(runContext, input, details);
+			let inputForNotify: unknown = input;
+			try {
+				inputForNotify = JSON.parse(input) as unknown;
+			} catch {
+				// keep raw string when invoke receives non-JSON input
+			}
+			const outputStr =
+				typeof output === "string" ? output : JSON.stringify(output);
+			const daemon = daemons.find((d) => d.manifest.name === getTarget());
+			daemon?.peer.notify("event", {
+				type: "tool_call.v1",
+				tool: t.name,
+				input: inputForNotify,
+				output: outputStr,
+			});
+			return output;
+		},
+	};
+}
+
 function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 	return daemons.flatMap((daemon) =>
 		daemon.tools.map((toolDef) =>
@@ -147,6 +180,8 @@ function buildSendMessageTool(
 export type LlmLoopOptions = {
 	runner?: Runner;
 	sessionStore?: SessionStore;
+	workspaceTools?: Tool[];
+	workspaceInstructions?: string;
 };
 
 function resetSessionState(state: {
@@ -279,10 +314,16 @@ export async function runLlmLoop(
 ): Promise<void> {
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
 	const sessionStore = options?.sessionStore;
+	const instructions = [
+		options?.workspaceInstructions,
+		"You are a helpful assistant.",
+	]
+		.filter(Boolean)
+		.join("\n");
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
-		instructions: "You are a helpful assistant.",
+		instructions,
 		tools: [],
 	});
 
@@ -369,6 +410,9 @@ export async function runLlmLoop(
 		let currentTarget = event.source;
 
 		const tools: Tool[] = [
+			...(options?.workspaceTools ?? []).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemons),
+			),
 			...buildModuleTools(daemons),
 			buildSendMessageTool(daemons, (name) => {
 				currentTarget = name;

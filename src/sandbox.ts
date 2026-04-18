@@ -35,6 +35,24 @@ type LinuxBubblewrapOptions = {
 	readTextFile?: (path: string) => Promise<string>;
 };
 
+export type LinuxWorkspaceBwrapOptions = {
+	pathExists?: (path: string) => Promise<boolean>;
+	realPath?: (path: string) => Promise<string>;
+	/** When false, skip --ro-bind for history (directory missing on host). */
+	bindHistoryDir?: boolean;
+};
+
+export type WorkspaceSandboxBaseOptions = {
+	platform?: NodeJS.Platform;
+	env?: NodeJS.ProcessEnv;
+	pathExists?: (path: string) => Promise<boolean>;
+	realPath?: (path: string) => Promise<string>;
+	lookupExecutable?: (
+		command: string,
+		env: NodeJS.ProcessEnv,
+	) => Promise<string | null>;
+};
+
 type ResolvedShebangInterpreter = {
 	lookupPath: string;
 	realPath: string;
@@ -210,6 +228,63 @@ export function createDarwinSandboxProfile(
 		")",
 		"(allow file-write*",
 		`  (subpath ${quoteSandboxString(moduleDir)})`,
+		allowedTempSubpaths,
+		")",
+		"(allow network*)",
+	].join("\n");
+}
+
+function collectDarwinAncestorLiterals(dir: string): string[] {
+	const literals: string[] = [];
+	let ancestor = path.dirname(dir);
+	while (ancestor !== path.dirname(ancestor)) {
+		literals.push(`  (literal ${quoteSandboxString(ancestor)})`);
+		ancestor = path.dirname(ancestor);
+	}
+	return literals;
+}
+
+/**
+ * sandbox-exec profile for a workspace (rw) and optional session history (ro).
+ * When {@link includeHistoryDir} is false, {@link historyDir} is omitted from the profile
+ * (host directory does not exist yet).
+ */
+export function createDarwinWorkspaceSandboxProfile(
+	workspaceDir: string,
+	historyDir: string,
+	env: NodeJS.ProcessEnv = process.env,
+	includeHistoryDir = true,
+): string {
+	const workspaceAncestors = collectDarwinAncestorLiterals(workspaceDir);
+	const historyAncestors = includeHistoryDir
+		? collectDarwinAncestorLiterals(historyDir)
+		: [];
+
+	const readonlySubpathEntries = [
+		workspaceDir,
+		...(includeHistoryDir ? [historyDir] : []),
+		...DARWIN_READONLY_PATHS,
+		...getDarwinTempPaths(env),
+	]
+		.map((p) => `  (subpath ${quoteSandboxString(p)})`)
+		.join("\n");
+	const allowedTempSubpaths = getDarwinTempPaths(env)
+		.map((tempPath) => `  (subpath ${quoteSandboxString(tempPath)})`)
+		.join("\n");
+
+	return [
+		"(version 1)",
+		"(deny default)",
+		'(import "system.sb")',
+		"(allow process*)",
+		"(allow file-read-metadata)",
+		"(allow file-read* file-map-executable",
+		readonlySubpathEntries,
+		...workspaceAncestors,
+		...historyAncestors,
+		")",
+		"(allow file-write*",
+		`  (subpath ${quoteSandboxString(workspaceDir)})`,
 		allowedTempSubpaths,
 		")",
 		"(allow network*)",
@@ -481,6 +556,132 @@ export async function createLinuxBubblewrapCommand(
 	);
 
 	return cmd;
+}
+
+export async function createLinuxWorkspaceBwrapCommand(
+	bwrapPath: string,
+	workspaceDir: string,
+	historyDir: string,
+	options: LinuxWorkspaceBwrapOptions = {},
+): Promise<string[]> {
+	const pathExists = options.pathExists ?? defaultPathExists;
+	const realPath = options.realPath ?? defaultRealPath;
+	const bindHistoryDir = options.bindHistoryDir ?? true;
+
+	const cmd = [
+		bwrapPath,
+		"--die-with-parent",
+		"--new-session",
+		"--unshare-pid",
+	];
+	const mountedRoots = new Set<string>();
+
+	for (const readonlyPath of LINUX_READONLY_PATHS) {
+		if (await pathExists(readonlyPath)) {
+			appendReadonlyMount(cmd, readonlyPath);
+			mountedRoots.add(readonlyPath);
+		}
+	}
+
+	if (await pathExists("/etc/resolv.conf")) {
+		try {
+			const resolverPath = await realPath("/etc/resolv.conf");
+			if (!isPathCovered(resolverPath, mountedRoots)) {
+				appendReadonlyFileMount(cmd, resolverPath);
+				mountedRoots.add(resolverPath);
+			}
+		} catch {}
+	}
+
+	if (!(await pathExists(workspaceDir))) {
+		throw new Error(
+			`Required workspace sandbox path is unavailable: ${workspaceDir}`,
+		);
+	}
+	appendWritableMount(cmd, workspaceDir);
+	mountedRoots.add(workspaceDir);
+
+	if (bindHistoryDir) {
+		if (await pathExists(historyDir)) {
+			appendReadonlyMount(cmd, historyDir);
+			mountedRoots.add(historyDir);
+		}
+	}
+
+	const tmpPath = "/tmp";
+	if (!(await pathExists(tmpPath))) {
+		throw new Error(
+			`Required writable sandbox path is unavailable: ${tmpPath}`,
+		);
+	}
+	appendWritableMount(cmd, tmpPath);
+	mountedRoots.add(tmpPath);
+
+	cmd.push("--proc", "/proc", "--dev", "/dev", "--chdir", workspaceDir, "--");
+
+	return cmd;
+}
+
+export async function createWorkspaceSandboxBaseCommand(
+	workspaceDir: string,
+	historyDir: string,
+	options: WorkspaceSandboxBaseOptions = {},
+): Promise<{
+	backend: SandboxBackend;
+	cmdPrefix: string[];
+	env: NodeJS.ProcessEnv;
+}> {
+	const platform = options.platform ?? process.platform;
+	const envBase = options.env ?? process.env;
+	const pathExists = options.pathExists ?? defaultPathExists;
+	const lookupExecutable = options.lookupExecutable ?? defaultLookupExecutable;
+	const realPath = options.realPath ?? defaultRealPath;
+
+	const historyExists = await pathExists(historyDir);
+
+	if (platform === "darwin") {
+		const env = { ...envBase };
+		const sandboxExecPath = await lookupExecutable("sandbox-exec", env);
+		if (!sandboxExecPath) {
+			throw new Error("sandbox-exec backend is unavailable");
+		}
+		const profile = createDarwinWorkspaceSandboxProfile(
+			workspaceDir,
+			historyDir,
+			env,
+			historyExists,
+		);
+		return {
+			backend: "sandbox-exec",
+			cmdPrefix: [sandboxExecPath, "-p", profile, "--"],
+			env,
+		};
+	}
+
+	if (platform === "linux") {
+		const env = { ...envBase, TMPDIR: "/tmp" };
+		const bwrapPath = await lookupExecutable("bwrap", env);
+		if (!bwrapPath) {
+			throw new Error("bwrap backend is unavailable");
+		}
+		const cmdPrefix = await createLinuxWorkspaceBwrapCommand(
+			bwrapPath,
+			workspaceDir,
+			historyDir,
+			{
+				pathExists,
+				realPath,
+				bindHistoryDir: historyExists,
+			},
+		);
+		return {
+			backend: "bwrap",
+			cmdPrefix,
+			env,
+		};
+	}
+
+	throw new Error(`Unsupported sandbox platform: ${platform}`);
 }
 
 export async function createSandboxLaunchSpec(
