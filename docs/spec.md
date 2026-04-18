@@ -343,15 +343,26 @@ Each present file is read as UTF-8, trimmed, and formatted as:
 <trimmed content>
 ```
 
-Sections are joined with a blank line. The combined string is passed to the LLM as **context instructions** ahead of workspace instructions in the system prompt.
+Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
 
-Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors propagate and fail startup.
+Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors from reading a present file propagate and abort `runLlmLoop` (they are not caught per-event).
 
-All files are read once at process start. Because the character directory is rw-mounted in the workspace sandbox, the LLM can edit these files via the `shell` tool; those changes take effect on the next process start.
+The bundled LLM loop re-reads these files from disk immediately before each `event.v1` is passed to the model. Because the character directory is rw-mounted in the workspace sandbox, the LLM can edit these files via workspace tools; edits take effect on the next turn.
 
 ### Workspace sandbox
 
-Built-in `shell` and `apply_patch` (and the `patch` helper used for `update_file`) run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory and read-write access to the character directory, and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory and read-write access to the character directory, and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+
+## Agent system prompt
+
+The bundled LLM loop rebuilds the agent `instructions` string immediately before each LLM turn. It is composed of two parts:
+
+| Part | Source | Content |
+|---|---|---|
+| Context instructions | Character files on disk (`AGENTS.md`, `SOUL.md`, etc.) | Sections per file, as described under [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
+| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules). |
+
+The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Runtime instructions are omitted when any of the three resolved paths is unavailable to the builder (the bundled entrypoint always supplies all three). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
 
 ## Core → Module Messaging
 
@@ -383,7 +394,7 @@ If precise destination control is required (e.g., DM a specific user, send to a 
 
 ### `tool_call.v1`
 
-The core notifies the current message target each time a tool completes — both workspace tools (`shell`, `apply_patch`) and tools exposed by modules. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
+The core notifies the current message target each time a tool completes — both workspace tools (`shell`, `edit`) and tools exposed by modules. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
 
 ```json
 {
@@ -401,11 +412,11 @@ The core notifies the current message target each time a tool completes — both
 | Field | Type | Description |
 |---|---|---|
 | `type` | string | Always `tool_call.v1` |
-| `tool` | string | Tool name (`shell` or `apply_patch`) |
+| `tool` | string | Tool name (`shell` or `edit`) |
 | `input` | object | Arguments passed to the tool by the LLM |
 | `output` | string | JSON-encoded result returned by the tool |
 
-For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `apply_patch`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
+For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `edit`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
 
 ### `event.dropped.v1`
 
@@ -519,12 +530,12 @@ shell(commands: string[], timeout_ms?: number)
 
 The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory (see [Character directory](#character-directory)), and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
-### Built-in Tool: `apply_patch`
+### Built-in Tool: `edit`
 
-Creates, updates, or deletes a file inside the workspace sandbox. Allowed paths are the workspace directory and the character directory.
+Creates, edits, or deletes a file inside the workspace sandbox. Allowed paths are the workspace directory and the character directory.
 
 ```
-apply_patch(type: "create_file" | "update_file" | "delete_file", path: string, content?: string, diff?: string)
+edit(type: "create_file" | "edit_file" | "delete_file", path: string, content?: string, old?: string, new?: string)
 ```
 
 | Parameter | Description |
@@ -532,7 +543,8 @@ apply_patch(type: "create_file" | "update_file" | "delete_file", path: string, c
 | `type` | Operation type |
 | `path` | Absolute path to the file, inside the sandbox (workspace or character directory) |
 | `content` | Full file content (required for `create_file`) |
-| `diff` | Unified diff with absolute paths using `-p0` strip (required for `update_file`) |
+| `old` | Exact substring to replace (required for `edit_file`; must appear exactly once in the file) |
+| `new` | Replacement text (required for `edit_file`) |
 
 The path is resolved to an absolute path. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 

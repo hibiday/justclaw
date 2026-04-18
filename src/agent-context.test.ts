@@ -43,11 +43,10 @@ describe("loadAgentContext", () => {
 	test("returns a single ## FILENAME section when only one file exists", async () => {
 		const dir = await mkdtemp(path.join(os.tmpdir(), "justclaw-ch-"));
 		try {
-			await Bun.write(
-				path.join(dir, "SOUL.md"),
-				"  line one\nline two  \n",
+			await Bun.write(path.join(dir, "SOUL.md"), "  line one\nline two  \n");
+			expect(await loadAgentContext(dir)).toBe(
+				"## SOUL.md\nline one\nline two",
 			);
-			expect(await loadAgentContext(dir)).toBe("## SOUL.md\nline one\nline two");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

@@ -175,7 +175,7 @@ function formatToolCall(
 		return lines;
 	}
 
-	if (toolName === "apply_patch" && isRecord(input)) {
+	if (toolName === "edit" && isRecord(input)) {
 		const op = typeof input.type === "string" ? input.type : "?";
 		const filePath = typeof input.path === "string" ? input.path : "?";
 		try {
@@ -188,23 +188,31 @@ function formatToolCall(
 				isRecord(result) && typeof result.output === "string"
 					? `: ${result.output}`
 					: "";
-			lines.push(`[patch] ${op} ${filePath} → ${status}${detail}`);
+			lines.push(`[edit] ${op} ${filePath} → ${status}${detail}`);
 		} catch {
-			lines.push(`[patch] ${op} ${filePath}`);
+			lines.push(`[edit] ${op} ${filePath}`);
 		}
 		if (op === "create_file" && typeof input.content === "string") {
 			for (const l of input.content.trimEnd().split("\n")) {
 				lines.push(`  ${l}`);
 			}
-		} else if (op === "update_file" && typeof input.diff === "string") {
-			for (const l of input.diff.trimEnd().split("\n")) {
-				lines.push(`  ${l}`);
+		} else if (op === "edit_file") {
+			if (typeof input.old === "string") {
+				lines.push(`  - old: ${input.old}`);
+			}
+			if (typeof input.new === "string") {
+				lines.push(`  - new: ${input.new}`);
 			}
 		}
 		return lines;
 	}
 
-	lines.push(`[tool:${toolName}] ${outputStr}`);
+	if (input !== undefined && input !== null) {
+		lines.push(`[tool:${toolName}] ${JSON.stringify(input)}`);
+		lines.push(`  → ${outputStr}`);
+	} else {
+		lines.push(`[tool:${toolName}] ${outputStr}`);
+	}
 	return lines;
 }
 

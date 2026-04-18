@@ -14,7 +14,7 @@ The core provides:
 - **Reasoning** — LLM-based inference and planning
 - **Memory** — Persistent context management across sessions
 - **Identity** — Agent personality, values, and behavioral boundaries
-- **Built-in tools** — A minimal set of built-in capabilities for common operations: `send_message` for explicit message delivery, `shell` for running commands in the workspace sandbox, and `apply_patch` for creating, updating, and deleting files in the workspace
+- **Built-in tools** — A minimal set of built-in capabilities for common operations: `send_message` for explicit message delivery, `shell` for running commands in the workspace sandbox, and `edit` for creating, editing, and deleting files in the workspace
 
 Functionality beyond the built-ins can be added through modules.
 
@@ -46,7 +46,7 @@ $HOME/justclaw/
       module.json      # manifest
       {entrypoint}     # executable
       ...              # module-specific data and state
-  workspace/           # LLM workspace (rw); available via shell and apply_patch tools
+  workspace/           # LLM workspace (rw); available via shell and edit tools
   history/             # session history files (ro inside workspace sandbox)
   character/           # agent identity files (rw inside workspace sandbox); see Character files in spec
 ```

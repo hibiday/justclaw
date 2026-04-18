@@ -77,15 +77,73 @@ describe("WorkspaceEditor", () => {
 		expect(r.status).toBe("failed");
 	});
 
-	test("updateFile fails when target is missing", async () => {
+	test("editFile fails when target is missing", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
-		const r = await editor.updateFile({
-			type: "update_file",
+		const r = await editor.editFile({
+			type: "edit_file",
 			path: path.join(root, "missing.txt"),
-			diff: "",
+			old: "x",
+			new: "y",
 		});
 		expect(r.status).toBe("failed");
 		expect(r.output).toMatch(/not found/);
+	});
+
+	test("editFile replaces a unique old string", async () => {
+		const root = await createTempDir("justclaw-ws-");
+		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+		const filePath = path.join(root, "doc.txt");
+		await editor.createFile({
+			type: "create_file",
+			path: filePath,
+			diff: "alpha\nbeta\ngamma\n",
+		});
+		const r = await editor.editFile({
+			type: "edit_file",
+			path: filePath,
+			old: "beta",
+			new: "BETA",
+		});
+		expect(r.status).toBe("completed");
+		expect(await Bun.file(filePath).text()).toBe("alpha\nBETA\ngamma\n");
+	});
+
+	test("editFile fails when old string is absent", async () => {
+		const root = await createTempDir("justclaw-ws-");
+		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+		const filePath = path.join(root, "doc.txt");
+		await editor.createFile({
+			type: "create_file",
+			path: filePath,
+			diff: "only one line\n",
+		});
+		const r = await editor.editFile({
+			type: "edit_file",
+			path: filePath,
+			old: "missing",
+			new: "x",
+		});
+		expect(r.status).toBe("failed");
+		expect(r.output).toMatch(/old string not found/);
+	});
+
+	test("editFile fails when old string is not unique", async () => {
+		const root = await createTempDir("justclaw-ws-");
+		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+		const filePath = path.join(root, "doc.txt");
+		await editor.createFile({
+			type: "create_file",
+			path: filePath,
+			diff: "foo foo foo\n",
+		});
+		const r = await editor.editFile({
+			type: "edit_file",
+			path: filePath,
+			old: "foo",
+			new: "bar",
+		});
+		expect(r.status).toBe("failed");
+		expect(r.output).toMatch(/not unique \(3 occurrences\)/);
 	});
 });

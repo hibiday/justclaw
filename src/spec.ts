@@ -1,0 +1,59 @@
+export function buildRuntimeInstructions(
+	workspaceDir: string,
+	historyDir: string,
+	characterDir: string,
+): string {
+	return `## Workspace
+
+Path: ${workspaceDir}
+
+Your primary working area for file operations. Files here persist across sessions. You have read-write access.
+
+### shell(commands, timeout_ms?)
+
+Execute shell commands sequentially inside the workspace sandbox. Each command runs as \`sh -c <command>\` and does not share state with prior calls.
+
+### edit(type, path, content?, old?, new?)
+
+**create_file** — write full content to a new file (content field).
+**edit_file** — replace a string in an existing file. old must match exactly once; if not unique, include more surrounding context.
+**delete_file** — remove a file.
+
+\`\`\`
+{ "type": "create_file", "path": "/abs/path/file.txt", "content": "..." }
+{ "type": "edit_file", "path": "/abs/path/file.txt", "old": "...", "new": "..." }
+{ "type": "delete_file", "path": "/abs/path/file.txt" }
+\`\`\`
+
+## History
+
+Path: ${historyDir}
+
+Past conversation sessions. You have read-only access. Each session is stored as {id}.json where id is a UUIDv7. Each file is a JSON array. Use shell with grep, jq, or cat to explore sessions.
+
+Item shapes:
+
+- User message (inbound event): \`{"type":"message","role":"user","content":"<event source=\\"...\\" timestamp=\\"...\\">...</event>"}\`
+- Assistant response: \`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"..."}],"status":"completed"}\`
+- Tool call: \`{"type":"function_call","name":"...","callId":"...","arguments":"...","status":"completed"}\`
+- Tool result: \`{"type":"function_call_result","name":"...","callId":"...","output":{"type":"text","text":"..."},"status":"completed"}\`
+
+## Character
+
+Path: ${characterDir}
+
+Files that define your identity and memory. You have read-write access. These files are read at the start of every turn and injected into your system prompt ahead of this section. Update them actively — when you learn user preferences, important facts, or want to adjust your own behavior, write the change to the appropriate file immediately. Changes take effect on the next turn.
+
+| File | Purpose |
+|---|---|
+| AGENTS.md | System instructions |
+| SOUL.md | Core values and ethical guidelines |
+| IDENTITY.md | Personality, tone, and style |
+| USER.md | User information and preferences |
+| MEMORY.md | Cross-session memory |
+
+## Modules
+
+Loaded modules expose tools as {module}__{tool}. Call them to interact with a module.
+send_message(module, text) sends text to a module and routes all subsequent output in this cycle to that module.`;
+}

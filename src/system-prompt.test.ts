@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { buildRuntimeInstructions } from "./spec";
 import { buildSystemPrompt } from "./system-prompt";
+
+describe("buildRuntimeInstructions", () => {
+	test("embeds workspace, history, and character paths", () => {
+		const text = buildRuntimeInstructions("/tmp/ws", "/tmp/hist", "/tmp/ch");
+		expect(text).toContain("Path: /tmp/ws");
+		expect(text).toContain("Path: /tmp/hist");
+		expect(text).toContain("Path: /tmp/ch");
+	});
+});
 
 describe("buildSystemPrompt", () => {
 	test("returns empty string when both inputs are absent", () => {
@@ -7,26 +17,32 @@ describe("buildSystemPrompt", () => {
 	});
 
 	test("omits undefined and empty string parts", () => {
-		expect(
-			buildSystemPrompt({
-				contextInstructions: "",
-				workspaceInstructions: "ws only",
-			}),
-		).toBe("ws only");
+		expect(buildSystemPrompt({ contextInstructions: "" })).toBe("");
 		expect(
 			buildSystemPrompt({
 				contextInstructions: "ctx",
-				workspaceInstructions: "",
 			}),
 		).toBe("ctx");
 	});
 
-	test("joins context then workspace with a single newline", () => {
+	test("joins context and runtime with a blank line when all path options are set", () => {
 		expect(
 			buildSystemPrompt({
 				contextInstructions: "alpha",
-				workspaceInstructions: "beta",
+				workspaceDir: "/w",
+				historyDir: "/h",
+				characterDir: "/c",
 			}),
-		).toBe("alpha\nbeta");
+		).toBe(`alpha\n\n${buildRuntimeInstructions("/w", "/h", "/c")}`);
+	});
+
+	test("omits runtime block when any of the path trio is missing", () => {
+		expect(
+			buildSystemPrompt({
+				contextInstructions: "only-ctx",
+				workspaceDir: "/w",
+				historyDir: "/h",
+			}),
+		).toBe("only-ctx");
 	});
 });

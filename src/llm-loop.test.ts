@@ -9,6 +9,7 @@ import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import { runLlmLoop } from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
 import { SessionStore } from "./session-store";
+import { buildRuntimeInstructions } from "./spec";
 
 const tempDirs: string[] = [];
 
@@ -234,8 +235,11 @@ describe("runLlmLoop", () => {
 		expect((dropped[0] as { type?: string }).type).toBe("event.dropped.v1");
 	});
 
-	test("includes contextInstructions in agent system prompt", async () => {
+	test("reloads character files into the agent system prompt each turn", async () => {
 		const home = await createTempDir("justclaw-llm-ctx-");
+		const characterDir = path.join(home, "character");
+		await mkdir(characterDir, { recursive: true });
+		await Bun.write(path.join(characterDir, "AGENTS.md"), "CONTEXT_BLOCK");
 		const dbPath = path.join(home, "events.db");
 		const sessionStore = new SessionStore(path.join(home, "history"));
 		await sessionStore.ensureDefaultSessionIfEmpty();
@@ -254,14 +258,17 @@ describe("runLlmLoop", () => {
 		const loopTask = runLlmLoop(queue, [], "test-model", {
 			runner: mockRunner,
 			sessionStore,
-			workspaceInstructions: "WORKSPACE_BLOCK",
-			contextInstructions: "CONTEXT_BLOCK",
+			workspaceDir: "/tmp/ws",
+			historyDir: "/tmp/hist",
+			characterDir,
 		});
 		await delay(80);
 		queue.close();
 		await loopTask;
 
-		expect(capturedAgent?.instructions).toBe("CONTEXT_BLOCK\nWORKSPACE_BLOCK");
+		expect(capturedAgent?.instructions).toBe(
+			`## AGENTS.md\nCONTEXT_BLOCK\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir)}`,
+		);
 	});
 
 	test("skips LLM for sessions.switch.v1 and completes the event", async () => {

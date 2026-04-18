@@ -2,8 +2,6 @@ import path from "node:path";
 import {
 	type ApplyPatchOperation,
 	type ApplyPatchResult,
-	type Editor,
-	type EditorInvocationContext,
 	type Shell,
 	type ShellAction,
 	type ShellOutputResult,
@@ -162,7 +160,7 @@ export class WorkspaceShell implements Shell {
 // Path boundary enforcement is delegated to the platform sandbox (bwrap / sandbox-exec).
 // The sandbox grants rw access to the workspace and character directories, and the kernel
 // enforces it. createFile and deleteFile run inside the sandbox for the same reason as
-// updateFile (runPatch): host-side Bun.write / Bun.file().delete() bypass that enforcement.
+// editFile (string replace then runCreateFile): host-side Bun.write / Bun.file().delete() bypass that enforcement.
 
 async function runCreateFile(
 	workspaceDir: string,
@@ -181,7 +179,10 @@ async function runCreateFile(
 	const proc = Bun.spawn({
 		cmd: [
 			...spec.cmdPrefix,
-			"sh", "-c", 'mkdir -p "$1" && cat > "$2"', "--",
+			"sh",
+			"-c",
+			'mkdir -p "$1" && cat > "$2"',
+			"--",
 			path.dirname(absPath),
 			absPath,
 		],
@@ -221,33 +222,86 @@ async function runDeleteFile(
 	return { ok: proc.exitCode === 0, stderr };
 }
 
-async function runPatch(
+async function runReadFile(
 	workspaceDir: string,
 	historyDir: string,
 	platform: NodeJS.Platform,
-	diff: string,
-	flags: string[] = ["-p0", "--forward"],
+	absPath: string,
 	characterDir?: string,
-): Promise<{ ok: boolean; stderr: string }> {
+): Promise<{ ok: boolean; content: string; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
 		{ platform, characterDir },
 	);
 	const proc = Bun.spawn({
-		cmd: [...spec.cmdPrefix, "patch", ...flags],
+		cmd: [...spec.cmdPrefix, "cat", absPath],
 		cwd: workspaceDir,
-		stdin: new TextEncoder().encode(diff),
+		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		env: spec.env,
 	});
-	const stderr = await new Response(proc.stderr).text();
+	const [content, stderr] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
 	await proc.exited;
-	return { ok: proc.exitCode === 0, stderr };
+	return { ok: proc.exitCode === 0, content, stderr };
 }
 
-export class WorkspaceEditor implements Editor {
+async function runEditFile(
+	workspaceDir: string,
+	historyDir: string,
+	platform: NodeJS.Platform,
+	absPath: string,
+	old: string,
+	new_: string,
+	characterDir?: string,
+): Promise<ApplyPatchResult> {
+	if (old.length === 0) {
+		return { status: "failed", output: "old string must not be empty" };
+	}
+	const read = await runReadFile(
+		workspaceDir,
+		historyDir,
+		platform,
+		absPath,
+		characterDir,
+	);
+	if (!read.ok) {
+		return { status: "failed", output: "file not found" };
+	}
+	const content = read.content;
+	const count = content.split(old).length - 1;
+	if (count === 0) {
+		return { status: "failed", output: "old string not found" };
+	}
+	if (count > 1) {
+		return {
+			status: "failed",
+			output: `old string is not unique (${count} occurrences)`,
+		};
+	}
+	const updated = content.replace(old, new_);
+	const w = await runCreateFile(
+		workspaceDir,
+		historyDir,
+		platform,
+		absPath,
+		updated,
+		characterDir,
+	);
+	if (!w.ok) {
+		return {
+			status: "failed",
+			output: w.stderr.trim() || "write failed",
+		};
+	}
+	return { status: "completed" };
+}
+
+export class WorkspaceEditor {
 	readonly #workspaceDir: string;
 	readonly #historyDir: string;
 	readonly #platform: NodeJS.Platform;
@@ -267,7 +321,6 @@ export class WorkspaceEditor implements Editor {
 
 	async createFile(
 		op: Extract<ApplyPatchOperation, { type: "create_file" }>,
-		_context?: EditorInvocationContext,
 	): Promise<ApplyPatchResult> {
 		const resolved = path.resolve(op.path);
 		// op.diff carries the file content for create_file (passed as the "content" field
@@ -289,34 +342,26 @@ export class WorkspaceEditor implements Editor {
 		return { status: "completed" };
 	}
 
-	async updateFile(
-		op: Extract<ApplyPatchOperation, { type: "update_file" }>,
-		_context?: EditorInvocationContext,
-	): Promise<ApplyPatchResult> {
+	async editFile(op: {
+		type: "edit_file";
+		path: string;
+		old: string;
+		new: string;
+	}): Promise<ApplyPatchResult> {
 		const resolved = path.resolve(op.path);
-		if (!(await Bun.file(resolved).exists())) {
-			return { status: "failed", output: `file not found: ${op.path}` };
-		}
-		const patched = await runPatch(
+		return runEditFile(
 			this.#workspaceDir,
 			this.#historyDir,
 			this.#platform,
-			op.diff,
-			["-p0", "--forward"],
+			resolved,
+			op.old,
+			op.new,
 			this.#characterDir,
 		);
-		if (!patched.ok) {
-			return {
-				status: "failed",
-				output: patched.stderr.trim() || "patch failed",
-			};
-		}
-		return { status: "completed" };
 	}
 
 	async deleteFile(
 		op: Extract<ApplyPatchOperation, { type: "delete_file" }>,
-		_context?: EditorInvocationContext,
 	): Promise<ApplyPatchResult> {
 		const resolved = path.resolve(op.path);
 		const result = await runDeleteFile(
@@ -391,19 +436,18 @@ export function createWorkspaceTools(
 		},
 	});
 
-	const applyPatchFunctionTool = tool({
-		name: "apply_patch",
+	const editFunctionTool = tool({
+		name: "edit",
 		description:
-			"Create, update, or delete a file inside the workspace sandbox. " +
+			"Create, edit, or delete a file inside the workspace sandbox. " +
 			"Use absolute host paths (e.g. the path you see in the shell). " +
-			"For create_file supply the full file content in the `content` field. " +
-			"For update_file supply a unified diff with absolute paths in the `diff` field.",
+			"For edit_file, old must match exactly once in the file; expand the context if not unique.",
 		parameters: {
 			type: "object",
 			properties: {
 				type: {
 					type: "string",
-					enum: ["create_file", "update_file", "delete_file"],
+					enum: ["create_file", "edit_file", "delete_file"],
 				},
 				path: {
 					type: "string",
@@ -413,10 +457,14 @@ export function createWorkspaceTools(
 					type: "string",
 					description: "Full file content (required for create_file)",
 				},
-				diff: {
+				old: {
 					type: "string",
 					description:
-						"Unified diff with absolute paths (required for update_file)",
+						"Exact substring to replace (required for edit_file; must appear exactly once)",
+				},
+				new: {
+					type: "string",
+					description: "Replacement text (required for edit_file)",
 				},
 			},
 			required: ["type", "path"],
@@ -429,26 +477,29 @@ export function createWorkspaceTools(
 				type,
 				path: filePath,
 				content,
-				diff,
+				old,
+				new: newText,
 			} = input as {
 				type: string;
 				path: string;
 				content?: string;
-				diff?: string;
+				old?: string;
+				new?: string;
 			};
 			let result: ApplyPatchResult | undefined;
 			if (type === "create_file") {
-				// Reuse the Editor interface: pass content via the diff field.
+				// Reuse ApplyPatchOperation shape: pass content via the diff field.
 				result = await editor.createFile({
 					type: "create_file",
 					path: filePath,
 					diff: content ?? "",
 				});
-			} else if (type === "update_file") {
-				result = await editor.updateFile({
-					type: "update_file",
+			} else if (type === "edit_file") {
+				result = await editor.editFile({
+					type: "edit_file",
 					path: filePath,
-					diff: diff ?? "",
+					old: old ?? "",
+					new: newText ?? "",
 				});
 			} else if (type === "delete_file") {
 				result = await editor.deleteFile({
@@ -465,5 +516,5 @@ export function createWorkspaceTools(
 		},
 	});
 
-	return [shellFunctionTool, applyPatchFunctionTool];
+	return [shellFunctionTool, editFunctionTool];
 }
