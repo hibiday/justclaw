@@ -192,6 +192,15 @@ function formatToolCall(
 		} catch {
 			lines.push(`[patch] ${op} ${filePath}`);
 		}
+		if (op === "create_file" && typeof input.content === "string") {
+			for (const l of input.content.trimEnd().split("\n")) {
+				lines.push(`  ${l}`);
+			}
+		} else if (op === "update_file" && typeof input.diff === "string") {
+			for (const l of input.diff.trimEnd().split("\n")) {
+				lines.push(`  ${l}`);
+			}
+		}
 		return lines;
 	}
 
