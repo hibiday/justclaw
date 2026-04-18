@@ -9,6 +9,7 @@ import {
 	tool,
 } from "@openai/agents";
 import OpenAI from "openai";
+import { loadAgentContext } from "./agent-context";
 import { notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
@@ -18,6 +19,7 @@ import {
 } from "./event-queue";
 import type { StartedDaemon } from "./runtime";
 import type { SessionStore } from "./session-store";
+import { buildSystemPrompt } from "./system-prompt";
 
 setTracingDisabled(true);
 
@@ -181,7 +183,10 @@ export type LlmLoopOptions = {
 	runner?: Runner;
 	sessionStore?: SessionStore;
 	workspaceTools?: Tool[];
-	workspaceInstructions?: string;
+	workspaceDir?: string;
+	historyDir?: string;
+	characterDir?: string;
+	contextInstructions?: string;
 };
 
 function resetSessionState(state: {
@@ -314,16 +319,10 @@ export async function runLlmLoop(
 ): Promise<void> {
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
 	const sessionStore = options?.sessionStore;
-	const instructions = [
-		options?.workspaceInstructions,
-		"You are a helpful assistant.",
-	]
-		.filter(Boolean)
-		.join("\n");
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
-		instructions,
+		instructions: "",
 		tools: [],
 	});
 
@@ -421,7 +420,16 @@ export async function runLlmLoop(
 			}),
 		];
 
-		const agent = baseAgent.clone({ tools });
+		const contextInstructions = options?.characterDir
+			? await loadAgentContext(options.characterDir)
+			: options?.contextInstructions;
+		const instructions = buildSystemPrompt({
+			contextInstructions,
+			workspaceDir: options?.workspaceDir,
+			historyDir: options?.historyDir,
+			characterDir: options?.characterDir,
+		});
+		const agent = baseAgent.clone({ tools, instructions });
 		const xml = eventToXml(event);
 
 		try {

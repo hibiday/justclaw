@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { resolveCharacterDir } from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
@@ -46,17 +47,15 @@ async function main(): Promise<void> {
 		const model = resolveModelConfig();
 		const workspaceDir = resolveWorkspaceDir();
 		const historyDir = resolveHistoryDir();
+		const characterDir = resolveCharacterDir();
 		mkdirSync(workspaceDir, { recursive: true });
+		mkdirSync(characterDir, { recursive: true });
 		const workspaceTools = createWorkspaceTools(
 			workspaceDir,
 			historyDir,
 			process.platform,
+			characterDir,
 		);
-		const workspaceInstructions = [
-			`Your workspace is at ${workspaceDir}. Use it for all file operations.`,
-			`Conversation history is available read-only at ${historyDir}.`,
-		].join("\n");
-
 		const sessionStore = new SessionStore(historyDir);
 		await sessionStore.ensureDefaultSessionIfEmpty();
 		const result = await bootstrapRuntime({
@@ -78,7 +77,9 @@ async function main(): Promise<void> {
 			runLlmLoop(eventQueue, daemons, model, {
 				sessionStore,
 				workspaceTools,
-				workspaceInstructions,
+				workspaceDir,
+				historyDir,
+				characterDir,
 			}),
 			shutdownTask,
 		]);
