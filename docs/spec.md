@@ -299,6 +299,12 @@ Core                            Module
 
 ## Module Execution
 
+Each daemon module directory contains a `module.json` manifest. Required fields: `name` (must match the directory name), `mode` (`"daemon"`), `exec` (path to the entrypoint, relative to the module directory). Optional field:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `replyable` | boolean | `false` | When `true`, the core may deliver `message.send.v1` to this module and the LLM may use `send_message` / final text routing to this module. Non-replyable modules still receive tool calls and emit events; outbound user messaging is not routed to them. |
+
 When the core starts a module, it executes the manifest's `exec` path inside the platform sandbox. Linux uses `bwrap`; macOS uses `sandbox-exec`.
 
 If the entrypoint begins with a shebang, the core inspects it before spawning:
@@ -309,6 +315,14 @@ If the entrypoint begins with a shebang, the core inspects it before spawning:
 If the resolved interpreter is outside the sandbox's standard read-only allowlist, the core exposes the interpreter's parent directory as an additional read-only path, without exposing `/`.
 
 **Rationale:** This preserves common user-local runtimes such as Bun installed outside `/usr` while keeping the sandbox policy minimal and read-only.
+
+## Operator instructions
+
+The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` once at startup. If present, its content is prepended to the character context instructions before every LLM turn.
+
+This file is outside all sandbox write paths, so the agent cannot modify it. It is loaded once at process startup; changes to the file are not visible until the process restarts.
+
+Use this file for immutable operator-level instructions that must persist regardless of character directory contents.
 
 ## Character directory
 
@@ -351,7 +365,7 @@ The bundled LLM loop re-reads these files from disk immediately before each `eve
 
 ### Workspace sandbox
 
-Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory and read-write access to the character directory, and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, and read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
 
 ## Agent system prompt
 
@@ -360,9 +374,11 @@ The bundled LLM loop rebuilds the agent `instructions` string immediately before
 | Part | Source | Content |
 |---|---|---|
 | Context instructions | Character files on disk (`AGENTS.md`, `SOUL.md`, etc.) | Sections per file, as described under [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
-| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules). |
+| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, and a table of loaded modules with replyable flag and tool names). |
 
-The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Runtime instructions are omitted when any of the three resolved paths is unavailable to the builder (the bundled entrypoint always supplies all three). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
+The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
+
+Before each LLM turn, the bundled loop refreshes the module table from the currently loaded daemons so `replyable` and tool names match the live process set. A successful `restart_modules` updates processes immediately and **ends the current LLM run**. The **next** dequeued event gets the updated prompt and module tool names.
 
 ## Core → Module Messaging
 
@@ -513,7 +529,25 @@ send_message(module: string, text: string)
 | `module` | Target module name |
 | `text` | Message body |
 
-The core forwards this as a `message.send.v1` notification to the named module, then updates the default delivery target.
+The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true`; otherwise the tool returns an error. On success, the core updates the default delivery target.
+
+Trailing free-form assistant text after the LLM run is delivered the same way: only when the current delivery target module is replyable.
+
+### Built-in Tool: `restart_modules`
+
+Reloads daemon modules from the modules directory (same discovery path as startup). Manifest discovery and parsing run **before** any running module is stopped. If discovery or parsing fails, or if the directory contains no valid modules, existing processes stay up and the tool returns an error string.
+
+```
+restart_modules({ continuation: string })
+```
+
+| Parameter | Description |
+|---|---|
+| `continuation` | Required. Ignored when reload fails. When reload succeeds and `continuation` is non-empty (after trim), the core enqueues exactly one follow-up internal event with `source` set to the **current** `event.source` and `params` fixed to `{ "type": "event.v1", "text": "<trimmed continuation>" }`. Pass an empty string when no follow-up is needed. The LLM does not supply `source` or arbitrary params. |
+
+The bundled LLM loop implements this as a core tool (not wrapped with `tool_call.v1` notification). It requires a configured session store and modules root; if those are missing, the tool returns an error string instead of reloading.
+
+**Turn boundary:** After `restart_modules` **succeeds**, processes match disk and the current LLM run ends immediately after that tool call. The agent does not continue with more tool calls or trailing free-form text in the reloaded state. The **next** `event.v1` shows the new module table and runs normally against the reloaded modules. Use a non-empty `continuation` when you want the core to enqueue exactly one handoff event under that new module set.
 
 ### Built-in Tool: `shell`
 
@@ -528,7 +562,7 @@ shell(commands: string[], timeout_ms?: number)
 | `commands` | Shell commands to execute in order |
 | `timeout_ms` | Per-command timeout in milliseconds (default: 30000) |
 
-The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory (see [Character directory](#character-directory)), and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory (see [Character directory](#character-directory)), read-write access to the runtime modules directory, and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
 ### Built-in Tool: `edit`
 

@@ -34,6 +34,24 @@ export function resolveCharacterDir(
 }
 
 /**
+ * Reads `AGENTS.md` from the justclaw home directory (operator-level instructions).
+ * Called once at startup so the content is fixed for the lifetime of the process;
+ * the agent cannot modify it even if sandbox write paths change in the future.
+ * Returns the trimmed content, or an empty string when the file is absent.
+ */
+export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
+	const filePath = path.join(homeDir, "AGENTS.md");
+	try {
+		return (await readFile(filePath, "utf8")).trim();
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+			return "";
+		}
+		throw e;
+	}
+}
+
+/**
  * Reads present files from {@link CHARACTER_FILES} under `characterDir`.
  * Each non-empty file becomes a `## FILENAME\n<content>` section.
  * Sections are joined with a blank line. Missing files are silently skipped;

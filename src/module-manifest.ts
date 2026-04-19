@@ -6,6 +6,7 @@ type RawManifest = {
 	name?: unknown;
 	exec?: unknown;
 	mode?: unknown;
+	replyable?: unknown;
 };
 
 export type DaemonModuleManifest = {
@@ -14,6 +15,7 @@ export type DaemonModuleManifest = {
 	exec: string;
 	moduleDir: string;
 	execPath: string;
+	replyable: boolean;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,7 +131,7 @@ export function parseDaemonManifest(
 		);
 	}
 
-	const { name, exec, mode } = parsed satisfies RawManifest;
+	const { name, exec, mode, replyable } = parsed satisfies RawManifest;
 
 	if (typeof name !== "string" || name.length === 0) {
 		throw new Error(
@@ -166,5 +168,6 @@ export function parseDaemonManifest(
 		exec,
 		moduleDir,
 		execPath,
+		replyable: replyable === true,
 	};
 }

@@ -39,7 +39,7 @@ type StartedDaemon = {
 	tools: ToolDefinition[];
 };
 
-type BootstrapRuntimeOptions = {
+export type BootstrapRuntimeOptions = {
 	abortSignal?: AbortSignal;
 	homeDir?: string;
 	eventQueuePath?: string;
@@ -761,6 +761,59 @@ async function restartFailedDaemon(
 	}
 }
 
+export async function reloadDaemons(
+	daemonsRef: { current: StartedDaemon[] },
+	modulesRoot: string,
+	eventQueue: EventQueue,
+	options: Pick<
+		BootstrapRuntimeOptions,
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+	>,
+): Promise<void> {
+	// Discover and parse before stopping anything so failures leave running daemons untouched.
+	const manifests = await discoverDaemonManifests(modulesRoot);
+	if (manifests.length === 0) {
+		throw new Error(`No modules available in ${modulesRoot}`);
+	}
+
+	await stopDaemons(daemonsRef.current);
+	daemonsRef.current.length = 0;
+
+	try {
+		for (const manifest of manifests) {
+			throwIfAborted(options.abortSignal);
+			await startDaemon(manifest, {
+				abortSignal: options.abortSignal,
+				initializeTimeoutMs: options.initializeTimeoutMs,
+				sandboxFactory: options.sandboxFactory,
+				queue: eventQueue,
+				sessionStore: options.sessionStore,
+				onFailure: (daemon, error) => {
+					handleDaemonFailure(
+						daemon,
+						error,
+						options,
+						daemonsRef.current,
+						eventQueue,
+					);
+				},
+				onSpawned: (daemon) => {
+					daemonsRef.current.push(daemon);
+				},
+			}).then((daemon) => {
+				superviseDaemon(daemon, options, daemonsRef.current, eventQueue);
+			});
+		}
+	} catch (error) {
+		await stopDaemons(daemonsRef.current);
+		daemonsRef.current.length = 0;
+		throw error;
+	}
+}
+
 export async function bootstrapRuntime(
 	options: BootstrapRuntimeOptions,
 ): Promise<{
@@ -782,45 +835,28 @@ export async function bootstrapRuntime(
 		resolveEventQueuePath(process.env.JUSTCLAW_HOME, options.homeDir);
 	const eventQueue = new EventQueue(dbPath);
 	seedActiveSessionMetadata(eventQueue, options.sessionStore);
-	const daemons = options.startedDaemons ?? [];
+	const startupRef = { current: options.startedDaemons ?? [] };
 
 	try {
-		const manifests = await discoverDaemonManifests(modulesRoot);
-		if (manifests.length === 0) {
-			throw new Error(`No modules available in ${modulesRoot}`);
-		}
-
-		for (const manifest of manifests) {
-			throwIfAborted(options.abortSignal);
-			await startDaemon(manifest, {
-				abortSignal: options.abortSignal,
-				initializeTimeoutMs: options.initializeTimeoutMs,
-				sandboxFactory: options.sandboxFactory,
-				queue: eventQueue,
-				sessionStore: options.sessionStore,
-				onFailure: (daemon, error) => {
-					handleDaemonFailure(daemon, error, options, daemons, eventQueue);
-				},
-				onSpawned: (daemon) => {
-					daemons.push(daemon);
-				},
-			}).then((daemon) => {
-				superviseDaemon(daemon, options, daemons, eventQueue);
-			});
-		}
+		await reloadDaemons(startupRef, modulesRoot, eventQueue, {
+			abortSignal: options.abortSignal,
+			sandboxFactory: options.sandboxFactory,
+			initializeTimeoutMs: options.initializeTimeoutMs,
+			sessionStore: options.sessionStore,
+		});
 
 		for (const event of eventQueue.stale()) {
-			notifyEventDropped(daemons, event);
+			notifyEventDropped(startupRef.current, event);
 			eventQueue.complete(event.id);
 		}
 	} catch (error) {
 		eventQueue.close();
-		await stopDaemons(daemons);
-		daemons.length = 0;
+		await stopDaemons(startupRef.current);
+		startupRef.current.length = 0;
 		throw error;
 	}
 
-	return { modulesRoot, daemons, eventQueue };
+	return { modulesRoot, daemons: startupRef.current, eventQueue };
 }
 
 export async function stopDaemons(daemons: StartedDaemon[]): Promise<void> {

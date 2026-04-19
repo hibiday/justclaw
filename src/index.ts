@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
-import { resolveCharacterDir } from "./agent-context";
+import path from "node:path";
+import { loadHomeAgentsFile, resolveCharacterDir } from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
@@ -31,7 +32,7 @@ function createShutdownSignal(): {
 }
 
 async function main(): Promise<void> {
-	const daemons: StartedDaemon[] = [];
+	const daemonsRef: { current: StartedDaemon[] } = { current: [] };
 	let eventQueue:
 		| Awaited<ReturnType<typeof bootstrapRuntime>>["eventQueue"]
 		| undefined;
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
 	const shutdownTask = shutdown.promise.then(async () => {
 		abortController.abort();
 		eventQueue?.close();
-		await stopDaemons(daemons);
+		await stopDaemons(daemonsRef.current);
 	});
 
 	try {
@@ -50,22 +51,25 @@ async function main(): Promise<void> {
 		const characterDir = resolveCharacterDir();
 		mkdirSync(workspaceDir, { recursive: true });
 		mkdirSync(characterDir, { recursive: true });
+		const sessionStore = new SessionStore(historyDir);
+		await sessionStore.ensureDefaultSessionIfEmpty();
+		const result = await bootstrapRuntime({
+			abortSignal: abortController.signal,
+			startedDaemons: daemonsRef.current,
+			sessionStore,
+		});
+		eventQueue = result.eventQueue;
+		const homeDir = path.dirname(result.modulesRoot);
+		const operatorContext = await loadHomeAgentsFile(homeDir);
 		const workspaceTools = createWorkspaceTools(
 			workspaceDir,
 			historyDir,
 			process.platform,
 			characterDir,
+			result.modulesRoot,
 		);
-		const sessionStore = new SessionStore(historyDir);
-		await sessionStore.ensureDefaultSessionIfEmpty();
-		const result = await bootstrapRuntime({
-			abortSignal: abortController.signal,
-			startedDaemons: daemons,
-			sessionStore,
-		});
-		eventQueue = result.eventQueue;
 		console.error(
-			`Loaded ${daemons.length} daemon module(s) from ${result.modulesRoot}`,
+			`Loaded ${daemonsRef.current.length} daemon module(s) from ${result.modulesRoot}`,
 		);
 
 		// If shutdown wins the race, we do not await runLlmLoop afterward. Main
@@ -74,19 +78,22 @@ async function main(): Promise<void> {
 		// The event row can stay `running` until the next start, when stale
 		// recovery emits event.dropped.v1. Acceptable by design.
 		await Promise.race([
-			runLlmLoop(eventQueue, daemons, model, {
+			runLlmLoop(eventQueue, daemonsRef, model, {
 				sessionStore,
 				workspaceTools,
 				workspaceDir,
 				historyDir,
 				characterDir,
+				operatorContext: operatorContext || undefined,
+				modulesRoot: result.modulesRoot,
+				abortSignal: abortController.signal,
 			}),
 			shutdownTask,
 		]);
 	} catch (error) {
 		abortController.abort();
 		eventQueue?.close();
-		await stopDaemons(daemons);
+		await stopDaemons(daemonsRef.current);
 		throw error;
 	} finally {
 		shutdown.dispose();
