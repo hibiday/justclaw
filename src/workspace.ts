@@ -58,17 +58,20 @@ export class WorkspaceShell implements Shell {
 	readonly #historyDir: string;
 	readonly #platform: NodeJS.Platform;
 	readonly #characterDir?: string;
+	readonly #modulesDir?: string;
 
 	constructor(
 		workspaceDir: string,
 		historyDir: string,
 		platform: NodeJS.Platform = process.platform,
 		characterDir?: string,
+		modulesDir?: string,
 	) {
 		this.#workspaceDir = workspaceDir;
 		this.#historyDir = historyDir;
 		this.#platform = platform;
 		this.#characterDir = characterDir;
+		this.#modulesDir = modulesDir;
 	}
 
 	async run(action: ShellAction): Promise<ShellResult> {
@@ -81,7 +84,11 @@ export class WorkspaceShell implements Shell {
 			const spec = await createWorkspaceSandboxBaseCommand(
 				this.#workspaceDir,
 				this.#historyDir,
-				{ platform: this.#platform, characterDir: this.#characterDir },
+				{
+					platform: this.#platform,
+					characterDir: this.#characterDir,
+					modulesDir: this.#modulesDir,
+				},
 			);
 			const cmd = [...spec.cmdPrefix, "sh", "-c", command];
 			const proc = Bun.spawn({
@@ -158,7 +165,7 @@ export class WorkspaceShell implements Shell {
 }
 
 // Path boundary enforcement is delegated to the platform sandbox (bwrap / sandbox-exec).
-// The sandbox grants rw access to the workspace and character directories, and the kernel
+// The sandbox grants rw access to the workspace, character, and modules directories, and the kernel
 // enforces it. createFile and deleteFile run inside the sandbox for the same reason as
 // editFile (string replace then runCreateFile): host-side Bun.write / Bun.file().delete() bypass that enforcement.
 
@@ -169,11 +176,12 @@ async function runCreateFile(
 	absPath: string,
 	content: string,
 	characterDir?: string,
+	modulesDir?: string,
 ): Promise<{ ok: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir },
+		{ platform, characterDir, modulesDir },
 	);
 	// Pass dirname and path as positional args to avoid shell-quoting the values.
 	const proc = Bun.spawn({
@@ -203,11 +211,12 @@ async function runDeleteFile(
 	platform: NodeJS.Platform,
 	absPath: string,
 	characterDir?: string,
+	modulesDir?: string,
 ): Promise<{ ok: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir },
+		{ platform, characterDir, modulesDir },
 	);
 	const proc = Bun.spawn({
 		cmd: [...spec.cmdPrefix, "rm", absPath],
@@ -228,11 +237,12 @@ async function runReadFile(
 	platform: NodeJS.Platform,
 	absPath: string,
 	characterDir?: string,
+	modulesDir?: string,
 ): Promise<{ ok: boolean; content: string; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir },
+		{ platform, characterDir, modulesDir },
 	);
 	const proc = Bun.spawn({
 		cmd: [...spec.cmdPrefix, "cat", absPath],
@@ -258,6 +268,7 @@ async function runEditFile(
 	old: string,
 	new_: string,
 	characterDir?: string,
+	modulesDir?: string,
 ): Promise<ApplyPatchResult> {
 	if (old.length === 0) {
 		return { status: "failed", output: "old string must not be empty" };
@@ -268,6 +279,7 @@ async function runEditFile(
 		platform,
 		absPath,
 		characterDir,
+		modulesDir,
 	);
 	if (!read.ok) {
 		return { status: "failed", output: "file not found" };
@@ -291,6 +303,7 @@ async function runEditFile(
 		absPath,
 		updated,
 		characterDir,
+		modulesDir,
 	);
 	if (!w.ok) {
 		return {
@@ -306,17 +319,20 @@ export class WorkspaceEditor {
 	readonly #historyDir: string;
 	readonly #platform: NodeJS.Platform;
 	readonly #characterDir?: string;
+	readonly #modulesDir?: string;
 
 	constructor(
 		workspaceDir: string,
 		historyDir: string,
 		platform: NodeJS.Platform = process.platform,
 		characterDir?: string,
+		modulesDir?: string,
 	) {
 		this.#workspaceDir = workspaceDir;
 		this.#historyDir = historyDir;
 		this.#platform = platform;
 		this.#characterDir = characterDir;
+		this.#modulesDir = modulesDir;
 	}
 
 	async createFile(
@@ -332,6 +348,7 @@ export class WorkspaceEditor {
 			resolved,
 			op.diff,
 			this.#characterDir,
+			this.#modulesDir,
 		);
 		if (!result.ok) {
 			return {
@@ -357,6 +374,7 @@ export class WorkspaceEditor {
 			op.old,
 			op.new,
 			this.#characterDir,
+			this.#modulesDir,
 		);
 	}
 
@@ -370,6 +388,7 @@ export class WorkspaceEditor {
 			this.#platform,
 			resolved,
 			this.#characterDir,
+			this.#modulesDir,
 		);
 		if (!result.ok) {
 			return {
@@ -386,18 +405,21 @@ export function createWorkspaceTools(
 	historyDir: string,
 	platform: NodeJS.Platform = process.platform,
 	characterDir?: string,
+	modulesDir?: string,
 ): Tool[] {
 	const shell = new WorkspaceShell(
 		workspaceDir,
 		historyDir,
 		platform,
 		characterDir,
+		modulesDir,
 	);
 	const editor = new WorkspaceEditor(
 		workspaceDir,
 		historyDir,
 		platform,
 		characterDir,
+		modulesDir,
 	);
 
 	const shellFunctionTool = tool({

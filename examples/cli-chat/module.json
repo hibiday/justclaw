@@ -1,5 +1,6 @@
 {
 	"name": "cli-chat",
 	"mode": "daemon",
-	"exec": "main.ts"
+	"exec": "main.ts",
+	"replyable": true
 }

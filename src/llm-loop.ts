@@ -1,6 +1,7 @@
 import {
 	Agent,
 	type AgentInputItem,
+	type FunctionToolResult,
 	Runner,
 	setDefaultOpenAIClient,
 	setOpenAIAPI,
@@ -17,7 +18,11 @@ import {
 	type QueuedEvent,
 	timestampFromUUIDv7,
 } from "./event-queue";
-import type { StartedDaemon } from "./runtime";
+import {
+	type BootstrapRuntimeOptions,
+	reloadDaemons,
+	type StartedDaemon,
+} from "./runtime";
 import type { SessionStore } from "./session-store";
 import { buildSystemPrompt } from "./system-prompt";
 
@@ -94,7 +99,7 @@ export function eventToXml(event: QueuedEvent): string {
 function wrapWithNotification(
 	t: Tool,
 	getTarget: () => string,
-	daemons: StartedDaemon[],
+	daemonsRef: { current: StartedDaemon[] },
 ): Tool {
 	if (t.type !== "function") {
 		return t;
@@ -112,7 +117,9 @@ function wrapWithNotification(
 			}
 			const outputStr =
 				typeof output === "string" ? output : JSON.stringify(output);
-			const daemon = daemons.find((d) => d.manifest.name === getTarget());
+			const daemon = daemonsRef.current.find(
+				(d) => d.manifest.name === getTarget(),
+			);
 			daemon?.peer.notify("event", {
 				type: "tool_call.v1",
 				tool: t.name,
@@ -146,13 +153,13 @@ function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 }
 
 function buildSendMessageTool(
-	daemons: StartedDaemon[],
+	daemonsRef: { current: StartedDaemon[] },
 	onSend: (moduleName: string) => void,
 ): Tool {
 	return tool({
 		name: "send_message",
 		description:
-			"Send a message to a module. Use this to reply to the user or deliver a message to a specific module.",
+			"Send a message to a replyable module. Use this to reply to the user or deliver a message to a specific module.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -168,9 +175,14 @@ function buildSendMessageTool(
 				module: string;
 				text: string;
 			};
-			const daemon = daemons.find((d) => d.manifest.name === moduleName);
+			const daemon = daemonsRef.current.find(
+				(d) => d.manifest.name === moduleName,
+			);
 			if (!daemon) {
 				return `error: module "${moduleName}" not found`;
+			}
+			if (daemon.manifest.replyable !== true) {
+				return `error: module "${moduleName}" is not replyable`;
 			}
 			daemon.peer.notify("event", { type: "message.send.v1", text });
 			onSend(moduleName);
@@ -187,6 +199,11 @@ export type LlmLoopOptions = {
 	historyDir?: string;
 	characterDir?: string;
 	contextInstructions?: string;
+	operatorContext?: string;
+	modulesRoot?: string;
+	sandboxFactory?: BootstrapRuntimeOptions["sandboxFactory"];
+	initializeTimeoutMs?: BootstrapRuntimeOptions["initializeTimeoutMs"];
+	abortSignal?: BootstrapRuntimeOptions["abortSignal"];
 };
 
 function resetSessionState(state: {
@@ -313,7 +330,7 @@ function isSessionsSwitchV1(
 
 export async function runLlmLoop(
 	eventQueue: EventQueue,
-	daemons: StartedDaemon[],
+	daemonsRef: { current: StartedDaemon[] },
 	model: string,
 	options?: LlmLoopOptions,
 ): Promise<void> {
@@ -348,7 +365,7 @@ export async function runLlmLoop(
 				console.warn(
 					`[core] sessions.switch.v1 requires a configured session store; dropping switch for "${event.params.id}"`,
 				);
-				notifyEventDropped(daemons, event);
+				notifyEventDropped(daemonsRef.current, event);
 				eventQueue.complete(event.id);
 				continue;
 			}
@@ -368,7 +385,7 @@ export async function runLlmLoop(
 				);
 			}
 			if (!applied) {
-				notifyEventDropped(daemons, event);
+				notifyEventDropped(daemonsRef.current, event);
 			}
 			eventQueue.complete(event.id);
 			continue;
@@ -392,7 +409,7 @@ export async function runLlmLoop(
 						error instanceof Error ? error.message : String(error)
 					}`,
 				);
-				notifyEventDropped(daemons, event);
+				notifyEventDropped(daemonsRef.current, event);
 				eventQueue.complete(event.id);
 				continue;
 			}
@@ -401,35 +418,113 @@ export async function runLlmLoop(
 			console.error(
 				`[core] no active session for event from ${event.source} (id=${event.id}); add a session history file or call sessions.switch.v1 — dropping`,
 			);
-			notifyEventDropped(daemons, event);
+			notifyEventDropped(daemonsRef.current, event);
 			eventQueue.complete(event.id);
 			continue;
 		}
 
 		let currentTarget = event.source;
 
+		const restartModulesTool = tool({
+			name: "restart_modules",
+			description:
+				"Reload daemon modules from the modules directory (reflects adds/removes and manifest changes). Discovery runs first; on failure existing processes stay up and the tool returns an error. On success, processes update immediately and the current LLM run ends after this tool call; pass non-empty continuation to enqueue a follow-up event.v1 (source fixed to current event source) so the next event runs with the reloaded module set. Pass an empty string when no follow-up is needed.",
+			parameters: {
+				type: "object",
+				properties: {
+					continuation: {
+						type: "string",
+						description:
+							'After a successful reload, non-whitespace continuation enqueues one event.v1 (source = current event source, params = { type: "event.v1", text: continuation }). Pass empty string when no follow-up is needed.',
+					},
+				},
+				required: ["continuation"],
+				additionalProperties: false,
+			},
+			strict: true,
+			execute: async (input: unknown) => {
+				if (options?.modulesRoot === undefined || options.modulesRoot === "") {
+					return "error: modules root not configured";
+				}
+				if (!sessionStore) {
+					return "error: session store not configured";
+				}
+				try {
+					await reloadDaemons(daemonsRef, options.modulesRoot, eventQueue, {
+						sessionStore,
+						sandboxFactory: options.sandboxFactory,
+						initializeTimeoutMs: options.initializeTimeoutMs,
+						abortSignal: options.abortSignal,
+					});
+					const rawContinuation =
+						(input as { continuation: string }).continuation ?? "";
+					if (rawContinuation.trim() !== "") {
+						eventQueue.enqueue(event.source, {
+							type: "event.v1",
+							text: rawContinuation.trim(),
+						});
+					}
+					return `ok: loaded ${daemonsRef.current.length} module(s)`;
+				} catch (e) {
+					return `error: ${e instanceof Error ? e.message : String(e)}`;
+				}
+			},
+		});
+
 		const tools: Tool[] = [
 			...(options?.workspaceTools ?? []).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemons),
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
-			...buildModuleTools(daemons).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemons),
+			...buildModuleTools(daemonsRef.current).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
-			buildSendMessageTool(daemons, (name) => {
+			buildSendMessageTool(daemonsRef, (name) => {
 				currentTarget = name;
 			}),
+			restartModulesTool,
 		];
 
-		const contextInstructions = options?.characterDir
+		const characterContext = options?.characterDir
 			? await loadAgentContext(options.characterDir)
 			: options?.contextInstructions;
+		const contextInstructions =
+			[options?.operatorContext, characterContext]
+				.filter(Boolean)
+				.join("\n\n") || undefined;
+		const modules = daemonsRef.current.map((d) => ({
+			name: d.manifest.name,
+			replyable: d.manifest.replyable,
+			tools: d.tools.map((t) => t.name),
+		}));
 		const instructions = buildSystemPrompt({
 			contextInstructions,
 			workspaceDir: options?.workspaceDir,
 			historyDir: options?.historyDir,
 			characterDir: options?.characterDir,
+			modulesRoot: options?.modulesRoot,
+			modules,
 		});
-		const agent = baseAgent.clone({ tools, instructions });
+		const agent = baseAgent.clone({
+			tools,
+			instructions,
+			toolUseBehavior: (_context, toolResults: FunctionToolResult[]) => {
+				const restartResult = toolResults.find(
+					(result) =>
+						result.type === "function_output" &&
+						result.tool.name === "restart_modules" &&
+						typeof result.output === "string" &&
+						result.output.startsWith("ok:"),
+				);
+				if (restartResult) {
+					return {
+						isFinalOutput: true,
+						isInterrupted: undefined,
+						finalOutput: "",
+					};
+				}
+				return { isFinalOutput: false, isInterrupted: undefined };
+			},
+		});
 		const xml = eventToXml(event);
 
 		try {
@@ -444,10 +539,15 @@ export async function runLlmLoop(
 			);
 			const text = result.finalOutput;
 			if (text?.trim()) {
-				const targetDaemon = daemons.find(
+				const targetDaemon = daemonsRef.current.find(
 					(d) => d.manifest.name === currentTarget,
 				);
-				targetDaemon?.peer.notify("event", { type: "message.send.v1", text });
+				if (targetDaemon?.manifest.replyable === true) {
+					targetDaemon.peer.notify("event", {
+						type: "message.send.v1",
+						text,
+					});
+				}
 			}
 			session.history = result.history;
 			if (sessionStore && session.currentSessionId !== null) {
@@ -462,7 +562,7 @@ export async function runLlmLoop(
 			console.error(
 				`[core] LLM cycle failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			notifyEventDropped(daemons, event);
+			notifyEventDropped(daemonsRef.current, event);
 			eventQueue.complete(event.id);
 		}
 	}

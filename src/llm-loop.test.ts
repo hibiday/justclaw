@@ -222,7 +222,7 @@ describe("runLlmLoop", () => {
 			run: async () => ({ finalOutput: null, history: [] }),
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -255,19 +255,20 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 			workspaceDir: "/tmp/ws",
 			historyDir: "/tmp/hist",
 			characterDir,
+			modulesRoot: "/tmp/mods",
 		});
 		await delay(80);
 		queue.close();
 		await loopTask;
 
 		expect(capturedAgent?.instructions).toBe(
-			`## AGENTS.md\nCONTEXT_BLOCK\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir)}`,
+			`## AGENTS.md\nCONTEXT_BLOCK\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
 		);
 	});
 
@@ -288,7 +289,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 		});
 		await delay(50);
@@ -312,7 +313,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 		});
 		await delay(50);
@@ -355,7 +356,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -427,7 +428,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -467,7 +468,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -500,7 +501,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -535,7 +536,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -567,7 +568,7 @@ describe("runLlmLoop", () => {
 			run: async () => ({ finalOutput: null, history: [] }),
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -605,7 +606,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -650,7 +651,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -690,7 +691,7 @@ describe("runLlmLoop", () => {
 			run: async () => ({ finalOutput: null, history: [] }),
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -729,7 +730,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, [], "test-model", {
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -781,7 +782,7 @@ describe("runLlmLoop", () => {
 			run: async () => ({ finalOutput: null, history: [] }),
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -845,7 +846,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -904,7 +905,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 			sessionStore,
 		});
@@ -966,7 +967,7 @@ describe("runLlmLoop", () => {
 			},
 		} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, daemons, "test-model", {
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
 		});
 

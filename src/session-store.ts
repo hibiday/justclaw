@@ -118,7 +118,7 @@ export class SessionStore {
 	}
 
 	async save(id: string, history: AgentInputItem[]): Promise<void> {
-		await Bun.write(this.#filePath(id), JSON.stringify(history));
+		await Bun.write(this.#filePath(id), JSON.stringify(history, null, 2));
 	}
 
 	async delete(id: string): Promise<void> {

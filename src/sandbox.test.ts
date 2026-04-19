@@ -39,6 +39,23 @@ describe("workspace sandbox profiles", () => {
 		expect(writeSection).toContain(`(subpath ${JSON.stringify(ch)})`);
 	});
 
+	test("darwin workspace profile grants read-write on optional modules dir", () => {
+		const ws = "/Users/dev/justclaw/workspace";
+		const hist = "/Users/dev/justclaw/history";
+		const mods = "/Users/dev/justclaw/modules";
+		const profile = createDarwinWorkspaceSandboxProfile(
+			ws,
+			hist,
+			process.env,
+			true,
+			undefined,
+			mods,
+		);
+		expect(profile).toContain(`(subpath ${JSON.stringify(mods)})`);
+		const writeSection = profile.slice(profile.indexOf("(allow file-write*"));
+		expect(writeSection).toContain(`(subpath ${JSON.stringify(mods)})`);
+	});
+
 	test("darwin workspace profile omits history when includeHistoryDir is false", () => {
 		const ws = "/tmp/ws";
 		const hist = "/tmp/hist";
@@ -96,6 +113,27 @@ describe("workspace sandbox profiles", () => {
 			},
 		);
 		expect(cmd.join(" ")).toContain("--bind /char /char");
+	});
+
+	test("linux workspace bwrap command rw-binds modules dir when present", async () => {
+		const pathExists = async (p: string) =>
+			p === "/bin" ||
+			p === "/tmp" ||
+			p === "/ws" ||
+			p === "/hist" ||
+			p === "/mods";
+		const cmd = await createLinuxWorkspaceBwrapCommand(
+			"/usr/bin/bwrap",
+			"/ws",
+			"/hist",
+			{
+				pathExists,
+				realPath: async (p) => p,
+				bindHistoryDir: true,
+				modulesDir: "/mods",
+			},
+		);
+		expect(cmd.join(" ")).toContain("--bind /mods /mods");
 	});
 
 	test("linux workspace bwrap command skips history ro-bind when bindHistoryDir is false", async () => {

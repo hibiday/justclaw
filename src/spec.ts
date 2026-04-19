@@ -2,7 +2,16 @@ export function buildRuntimeInstructions(
 	workspaceDir: string,
 	historyDir: string,
 	characterDir: string,
+	modulesRoot: string,
+	modules: Array<{ name: string; replyable: boolean; tools: string[] }>,
 ): string {
+	const moduleRows = modules
+		.map(
+			(m) =>
+				`| ${m.name} | ${m.replyable ? "yes" : "no"} | ${m.tools.length > 0 ? m.tools.join(", ") : "—"} |`,
+		)
+		.join("\n");
+
 	return `## Workspace
 
 Path: ${workspaceDir}
@@ -54,6 +63,13 @@ Files that define your identity and memory. You have read-write access. These fi
 
 ## Modules
 
-Loaded modules expose tools as {module}__{tool}. Call them to interact with a module.
-send_message(module, text) sends text to a module and routes all subsequent output in this cycle to that module.`;
+Modules directory: ${modulesRoot}
+
+| Module | Replyable | Tools |
+|---|---|---|
+${moduleRows}
+
+Module tools are called as {module}__{tool}.
+send_message(module, text) delivers a message to a replyable module and routes subsequent output in this cycle to that module.
+restart_modules({ continuation }) reloads the modules directory: discovery runs first; if discovery, manifest parsing, or an empty result fails, running modules are left unchanged and the tool reports an error. A **successful** reload ends the current LLM run immediately, so the reloaded module set is first visible on the **next** event. \`continuation\` is required: pass a non-empty string to enqueue one \`event.v1\` handoff (source fixed to current event source); pass empty string when no follow-up is needed.`;
 }
