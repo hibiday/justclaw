@@ -4,10 +4,16 @@ import { buildSystemPrompt } from "./system-prompt";
 
 describe("buildRuntimeInstructions", () => {
 	test("embeds workspace, history, character, and modules paths", () => {
-		const text = buildRuntimeInstructions("/tmp/ws", "/tmp/hist", "/tmp/ch", "/tmp/mods", [
-			{ name: "cli-chat", replyable: true, tools: ["send"] },
-			{ name: "watcher", replyable: false, tools: [] },
-		]);
+		const text = buildRuntimeInstructions(
+			"/tmp/ws",
+			"/tmp/hist",
+			"/tmp/ch",
+			"/tmp/mods",
+			[
+				{ name: "cli-chat", replyable: true, tools: ["send"] },
+				{ name: "watcher", replyable: false, tools: [] },
+			],
+		);
 		expect(text).toContain("Path: /tmp/ws");
 		expect(text).toContain("Path: /tmp/hist");
 		expect(text).toContain("Path: /tmp/ch");
@@ -32,8 +38,11 @@ describe("buildSystemPrompt", () => {
 	});
 
 	test("joins context and runtime with a blank line when all path options are set", () => {
-		const modules: Array<{ name: string; replyable: boolean; tools: string[] }> =
-			[];
+		const modules: Array<{
+			name: string;
+			replyable: boolean;
+			tools: string[];
+		}> = [];
 		expect(
 			buildSystemPrompt({
 				contextInstructions: "alpha",
@@ -43,7 +52,9 @@ describe("buildSystemPrompt", () => {
 				modulesRoot: "/m",
 				modules,
 			}),
-		).toBe(`alpha\n\n${buildRuntimeInstructions("/w", "/h", "/c", "/m", modules)}`);
+		).toBe(
+			`alpha\n\n${buildRuntimeInstructions("/w", "/h", "/c", "/m", modules)}`,
+		);
 	});
 
 	test("omits runtime block when any required path or module metadata is missing", () => {

@@ -12,8 +12,8 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Agent, AgentInputItem, Runner } from "@openai/agents";
-import { RunContext } from "@openai/agents-core";
 import type { FunctionTool } from "@openai/agents-core";
+import { RunContext } from "@openai/agents-core";
 import { EventQueue } from "./event-queue";
 import { JsonRpcPeer } from "./jsonrpc";
 import { runLlmLoop } from "./llm-loop";
@@ -3323,7 +3323,9 @@ describe("runLlmLoop restart_modules integration", () => {
 		let runCount = 0;
 		const mockRunner = {
 			run: async (agent: Agent) => {
-				instructions.push(typeof agent.instructions === "string" ? agent.instructions : "");
+				instructions.push(
+					typeof agent.instructions === "string" ? agent.instructions : "",
+				);
 				runCount++;
 				const restart = findRestartModulesTool(agent);
 				if (runCount === 1) {
@@ -3387,7 +3389,10 @@ describe("runLlmLoop restart_modules integration", () => {
 		const rc = new RunContext();
 		const mockRunner = {
 			run: async (agent: Agent) => {
-				await findRestartModulesTool(agent).invoke(rc, JSON.stringify({ continuation: "" }));
+				await findRestartModulesTool(agent).invoke(
+					rc,
+					JSON.stringify({ continuation: "" }),
+				);
 				const out = await findFunctionTool(agent, "send_message").invoke(
 					rc,
 					JSON.stringify({ module: "mod", text: "hi" }),
@@ -3446,7 +3451,10 @@ describe("runLlmLoop restart_modules integration", () => {
 		const sends: unknown[] = [];
 		const mockRunner = {
 			run: async (agent: Agent) => {
-				await findRestartModulesTool(agent).invoke(rc, JSON.stringify({ continuation: "" }));
+				await findRestartModulesTool(agent).invoke(
+					rc,
+					JSON.stringify({ continuation: "" }),
+				);
 				for (const d of daemonsRef.current) {
 					const orig = d.peer.notify.bind(d.peer);
 					d.peer.notify = (method: string, params: unknown) => {
@@ -3509,7 +3517,10 @@ describe("runLlmLoop restart_modules integration", () => {
 		const rc = new RunContext();
 		const mockRunner = {
 			run: async (agent: Agent) => {
-				await findRestartModulesTool(agent).invoke(rc, JSON.stringify({ continuation: "" }));
+				await findRestartModulesTool(agent).invoke(
+					rc,
+					JSON.stringify({ continuation: "" }),
+				);
 				// Simulates a parallel tool call to the now-stopped old module.
 				const out = await findFunctionTool(agent, "mod__ping").invoke(rc, "{}");
 				expect(String(out)).toMatch(/stdout closed unexpectedly/);

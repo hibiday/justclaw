@@ -767,10 +767,7 @@ export async function reloadDaemons(
 	eventQueue: EventQueue,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		| "abortSignal"
-		| "sandboxFactory"
-		| "initializeTimeoutMs"
-		| "sessionStore"
+		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
 	>,
 ): Promise<void> {
 	// Discover and parse before stopping anything so failures leave running daemons untouched.

@@ -19,8 +19,8 @@ import {
 	timestampFromUUIDv7,
 } from "./event-queue";
 import {
-	reloadDaemons,
 	type BootstrapRuntimeOptions,
+	reloadDaemons,
 	type StartedDaemon,
 } from "./runtime";
 import type { SessionStore } from "./session-store";
@@ -131,9 +131,7 @@ function wrapWithNotification(
 	};
 }
 
-function buildModuleTools(
-	daemons: StartedDaemon[],
-): Tool[] {
+function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 	return daemons.flatMap((daemon) =>
 		daemon.tools.map((toolDef) =>
 			tool({
@@ -437,7 +435,7 @@ export async function runLlmLoop(
 					continuation: {
 						type: "string",
 						description:
-							"After a successful reload, non-whitespace continuation enqueues one event.v1 (source = current event source, params = { type: \"event.v1\", text: continuation }). Pass empty string when no follow-up is needed.",
+							'After a successful reload, non-whitespace continuation enqueues one event.v1 (source = current event source, params = { type: "event.v1", text: continuation }). Pass empty string when no follow-up is needed.',
 					},
 				},
 				required: ["continuation"],
@@ -489,9 +487,10 @@ export async function runLlmLoop(
 		const characterContext = options?.characterDir
 			? await loadAgentContext(options.characterDir)
 			: options?.contextInstructions;
-		const contextInstructions = [options?.operatorContext, characterContext]
-			.filter(Boolean)
-			.join("\n\n") || undefined;
+		const contextInstructions =
+			[options?.operatorContext, characterContext]
+				.filter(Boolean)
+				.join("\n\n") || undefined;
 		const modules = daemonsRef.current.map((d) => ({
 			name: d.manifest.name,
 			replyable: d.manifest.replyable,
@@ -508,10 +507,7 @@ export async function runLlmLoop(
 		const agent = baseAgent.clone({
 			tools,
 			instructions,
-			toolUseBehavior: (
-				_context,
-				toolResults: FunctionToolResult[],
-			) => {
+			toolUseBehavior: (_context, toolResults: FunctionToolResult[]) => {
 				const restartResult = toolResults.find(
 					(result) =>
 						result.type === "function_output" &&

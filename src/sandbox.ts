@@ -308,9 +308,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...(characterDir
 			? [`  (subpath ${quoteSandboxString(characterDir)})`]
 			: []),
-		...(modulesDir
-			? [`  (subpath ${quoteSandboxString(modulesDir)})`]
-			: []),
+		...(modulesDir ? [`  (subpath ${quoteSandboxString(modulesDir)})`] : []),
 		allowedTempSubpaths,
 		")",
 		"(allow network*)",
