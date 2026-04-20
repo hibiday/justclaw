@@ -41,7 +41,9 @@ async function main(): Promise<void> {
 			if (typeof record.id === "number" && record.method === "initialize") {
 				writeLine({ jsonrpc: "2.0", id: record.id, result: { tools: [] } });
 
-				const today = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+				const today = new Date(Date.now() + 9 * 60 * 60 * 1000)
+					.toISOString()
+					.slice(0, 10);
 				writeLine({
 					jsonrpc: "2.0",
 					method: "event",
