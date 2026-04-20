@@ -22,7 +22,9 @@ Functionality beyond the built-ins can be added through modules.
 
 Because LLM inference is processed through a single serial queue, the most recently consumed received message is always uniquely defined. This invariant is the canonical basis for routing:
 
-> **The canonical delivery target is the source of the most recently consumed received message.**
+> **The canonical delivery target is the source of the most recently consumed message from a replyable module.**
+
+The core persists this value across cycles so that events from non-replyable sources (for example, a module that delivers an image) still route LLM output to the last replyable module rather than being silently dropped.
 
 When the LLM calls the built-in `send_message` tool, it creates a transient override of the delivery target that lasts only for the current processing cycle. Subsequent free-form text output is delivered to the overridden target. When the cycle ends, the override is discarded, and the next cycle starts fresh from the canonical state.
 

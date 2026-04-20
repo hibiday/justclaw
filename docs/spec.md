@@ -503,9 +503,16 @@ If the source module is not available (for example, not loaded after restart or 
 
 Because the LLM inference queue is single and serial, the most recently consumed received message is always uniquely defined. This is the canonical basis for routing:
 
-> **The canonical delivery target is the source of the most recently consumed received message.**
+> **The canonical delivery target is the source of the most recently consumed message from a replyable module.**
 
-The canonical state is derived purely from the queue's consumption position. The core does not maintain additional persistent state for routing.
+The core persists this as the `last_replyable_target` key in `events.db` metadata. Delivery target resolution at the start of each cycle:
+
+| Event source | Delivery target | `last_replyable_target` update |
+|---|---|---|
+| `replyable: true` | `event.source` | Written with `event.source` |
+| `replyable: false` | `last_replyable_target` if set; otherwise `event.source` | Not written |
+
+**Rationale:** Non-replyable modules (for example, those that deliver images via `image.send.v1`) trigger LLM cycles but have no inbox for replies. Without a fallback, LLM output generated in response to their events would be silently dropped. Using the most recently persisted replyable source as the fallback target routes that output to the module most likely to handle it — the one the user was just interacting with.
 
 #### Transient override
 
@@ -521,26 +528,29 @@ When the LLM calls the built-in `send_message` tool during a processing cycle, i
 #### Example
 
 ```
-Queue: [Event A from X, Event B from Y]
+Queue: [Event A from X (replyable), Event B from Y (replyable), Event C from NR (not replyable)]
 
 [Cycle for A starts]
-  canonical = X
-  override = none
+  source = X (replyable) -> last_replyable_target = X
   default target = X
-
   LLM emits text          -> delivered to X
   LLM calls send_message(module=Z, ...)
                           -> delivered to Z
                           -> override = Z
-  default target = Z
   LLM emits text          -> delivered to Z
 [Cycle for A ends, override discarded]
 
 [Cycle for B starts]
-  canonical = Y
-  override = none
+  source = Y (replyable) -> last_replyable_target = Y
   default target = Y
-  ...
+  LLM emits text          -> delivered to Y
+[Cycle for B ends]
+
+[Cycle for C starts]
+  source = NR (not replyable)
+  last_replyable_target = Y -> default target = Y
+  LLM emits text          -> delivered to Y
+[Cycle for C ends]
 ```
 
 ### Built-in Tool: `send_message`

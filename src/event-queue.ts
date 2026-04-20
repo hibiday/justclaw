@@ -9,6 +9,7 @@ export type QueuedEvent = {
 };
 
 export const ACTIVE_SESSION_META_KEY = "active_session_id";
+export const LAST_REPLYABLE_TARGET_META_KEY = "last_replyable_target";
 
 export function timestampFromUUIDv7(uuid: string): string {
 	return new Date(
