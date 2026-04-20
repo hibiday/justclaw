@@ -59,6 +59,7 @@ export class WorkspaceShell implements Shell {
 	readonly #platform: NodeJS.Platform;
 	readonly #characterDir?: string;
 	readonly #modulesRoot?: string;
+	readonly #skillsDir?: string;
 
 	constructor(
 		workspaceDir: string,
@@ -66,12 +67,14 @@ export class WorkspaceShell implements Shell {
 		platform: NodeJS.Platform = process.platform,
 		characterDir?: string,
 		modulesRoot?: string,
+		skillsDir?: string,
 	) {
 		this.#workspaceDir = workspaceDir;
 		this.#historyDir = historyDir;
 		this.#platform = platform;
 		this.#characterDir = characterDir;
 		this.#modulesRoot = modulesRoot;
+		this.#skillsDir = skillsDir;
 	}
 
 	async run(action: ShellAction): Promise<ShellResult> {
@@ -88,6 +91,7 @@ export class WorkspaceShell implements Shell {
 					platform: this.#platform,
 					characterDir: this.#characterDir,
 					modulesRoot: this.#modulesRoot,
+					skillsDir: this.#skillsDir,
 				},
 			);
 			const cmd = [...spec.cmdPrefix, "sh", "-c", command];
@@ -177,11 +181,12 @@ async function runCreateFile(
 	content: string,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Promise<{ ok: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir, modulesRoot },
+		{ platform, characterDir, modulesRoot, skillsDir },
 	);
 	// Pass dirname and path as positional args to avoid shell-quoting the values.
 	const proc = Bun.spawn({
@@ -212,11 +217,12 @@ async function runDeleteFile(
 	absPath: string,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Promise<{ ok: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir, modulesRoot },
+		{ platform, characterDir, modulesRoot, skillsDir },
 	);
 	const proc = Bun.spawn({
 		cmd: [...spec.cmdPrefix, "rm", absPath],
@@ -238,11 +244,12 @@ async function runReadFile(
 	absPath: string,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Promise<{ ok: boolean; content: string; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir, modulesRoot },
+		{ platform, characterDir, modulesRoot, skillsDir },
 	);
 	const proc = Bun.spawn({
 		cmd: [...spec.cmdPrefix, "cat", absPath],
@@ -268,11 +275,12 @@ export async function runReadFileBase64(
 	absPath: string,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Promise<{ ok: boolean; content: string; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
-		{ platform, characterDir, modulesRoot },
+		{ platform, characterDir, modulesRoot, skillsDir },
 	);
 	const proc = Bun.spawn({
 		cmd: [
@@ -306,6 +314,7 @@ async function runEditFile(
 	new_: string,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Promise<ApplyPatchResult> {
 	if (old.length === 0) {
 		return { status: "failed", output: "old string must not be empty" };
@@ -317,6 +326,7 @@ async function runEditFile(
 		absPath,
 		characterDir,
 		modulesRoot,
+		skillsDir,
 	);
 	if (!read.ok) {
 		return { status: "failed", output: "file not found" };
@@ -341,6 +351,7 @@ async function runEditFile(
 		updated,
 		characterDir,
 		modulesRoot,
+		skillsDir,
 	);
 	if (!w.ok) {
 		return {
@@ -357,6 +368,7 @@ export class WorkspaceEditor {
 	readonly #platform: NodeJS.Platform;
 	readonly #characterDir?: string;
 	readonly #modulesRoot?: string;
+	readonly #skillsDir?: string;
 
 	constructor(
 		workspaceDir: string,
@@ -364,12 +376,14 @@ export class WorkspaceEditor {
 		platform: NodeJS.Platform = process.platform,
 		characterDir?: string,
 		modulesRoot?: string,
+		skillsDir?: string,
 	) {
 		this.#workspaceDir = workspaceDir;
 		this.#historyDir = historyDir;
 		this.#platform = platform;
 		this.#characterDir = characterDir;
 		this.#modulesRoot = modulesRoot;
+		this.#skillsDir = skillsDir;
 	}
 
 	async createFile(
@@ -386,6 +400,7 @@ export class WorkspaceEditor {
 			op.diff,
 			this.#characterDir,
 			this.#modulesRoot,
+			this.#skillsDir,
 		);
 		if (!result.ok) {
 			return {
@@ -412,6 +427,7 @@ export class WorkspaceEditor {
 			op.new,
 			this.#characterDir,
 			this.#modulesRoot,
+			this.#skillsDir,
 		);
 	}
 
@@ -426,6 +442,7 @@ export class WorkspaceEditor {
 			resolved,
 			this.#characterDir,
 			this.#modulesRoot,
+			this.#skillsDir,
 		);
 		if (!result.ok) {
 			return {
@@ -443,6 +460,7 @@ export function createWorkspaceTools(
 	platform: NodeJS.Platform = process.platform,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): Tool[] {
 	const shell = new WorkspaceShell(
 		workspaceDir,
@@ -450,6 +468,7 @@ export function createWorkspaceTools(
 		platform,
 		characterDir,
 		modulesRoot,
+		skillsDir,
 	);
 	const editor = new WorkspaceEditor(
 		workspaceDir,
@@ -457,6 +476,7 @@ export function createWorkspaceTools(
 		platform,
 		characterDir,
 		modulesRoot,
+		skillsDir,
 	);
 
 	const shellFunctionTool = tool({

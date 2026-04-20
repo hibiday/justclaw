@@ -47,6 +47,8 @@ export type LinuxWorkspaceBwrapOptions = {
 	characterDir?: string;
 	/** Runtime modules root; rw-mounted when present on the host (same visibility as characterDir). */
 	modulesRoot?: string;
+	/** Skills directory; rw-mounted when present on the host (same visibility as characterDir). */
+	skillsDir?: string;
 };
 
 export type WorkspaceSandboxBaseOptions = {
@@ -62,6 +64,8 @@ export type WorkspaceSandboxBaseOptions = {
 	characterDir?: string;
 	/** Runtime modules root; rw-mounted in the workspace sandbox when set. */
 	modulesRoot?: string;
+	/** Skills directory; rw-mounted in the workspace sandbox when set. */
+	skillsDir?: string;
 };
 
 type ResolvedShebangInterpreter = {
@@ -267,6 +271,7 @@ export function createDarwinWorkspaceSandboxProfile(
 	includeHistoryDir = true,
 	characterDir?: string,
 	modulesRoot?: string,
+	skillsDir?: string,
 ): string {
 	const workspaceAncestors = collectDarwinAncestorLiterals(workspaceDir);
 	const historyAncestors = includeHistoryDir
@@ -278,12 +283,16 @@ export function createDarwinWorkspaceSandboxProfile(
 	const modulesAncestors = modulesRoot
 		? collectDarwinAncestorLiterals(modulesRoot)
 		: [];
+	const skillsAncestors = skillsDir
+		? collectDarwinAncestorLiterals(skillsDir)
+		: [];
 
 	const readonlySubpathEntries = [
 		workspaceDir,
 		...(includeHistoryDir ? [historyDir] : []),
 		...(characterDir ? [characterDir] : []),
 		...(modulesRoot ? [modulesRoot] : []),
+		...(skillsDir ? [skillsDir] : []),
 		...DARWIN_READONLY_PATHS,
 		...getDarwinTempPaths(env),
 	]
@@ -305,6 +314,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...historyAncestors,
 		...characterAncestors,
 		...modulesAncestors,
+		...skillsAncestors,
 		")",
 		"(allow file-write*",
 		`  (subpath ${quoteSandboxString(workspaceDir)})`,
@@ -312,6 +322,7 @@ export function createDarwinWorkspaceSandboxProfile(
 			? [`  (subpath ${quoteSandboxString(characterDir)})`]
 			: []),
 		...(modulesRoot ? [`  (subpath ${quoteSandboxString(modulesRoot)})`] : []),
+		...(skillsDir ? [`  (subpath ${quoteSandboxString(skillsDir)})`] : []),
 		allowedTempSubpaths,
 		")",
 		"(allow network*)",
@@ -648,6 +659,16 @@ export async function createLinuxWorkspaceBwrapCommand(
 		mountedRoots.add(modulesRoot);
 	}
 
+	const skillsDir = options.skillsDir;
+	if (
+		skillsDir !== undefined &&
+		skillsDir !== "" &&
+		(await pathExists(skillsDir))
+	) {
+		appendWritableMount(cmd, skillsDir);
+		mountedRoots.add(skillsDir);
+	}
+
 	if (bindHistoryDir) {
 		if (await pathExists(historyDir)) {
 			appendReadonlyMount(cmd, historyDir);
@@ -685,6 +706,7 @@ export async function createWorkspaceSandboxBaseCommand(
 	const realPath = options.realPath ?? defaultRealPath;
 	const characterDir = options.characterDir;
 	const modulesRoot = options.modulesRoot;
+	const skillsDir = options.skillsDir;
 
 	const historyExists = await pathExists(historyDir);
 
@@ -701,6 +723,7 @@ export async function createWorkspaceSandboxBaseCommand(
 			historyExists,
 			characterDir,
 			modulesRoot,
+			skillsDir,
 		);
 		return {
 			backend: "sandbox-exec",
@@ -725,6 +748,7 @@ export async function createWorkspaceSandboxBaseCommand(
 				bindHistoryDir: historyExists,
 				characterDir,
 				modulesRoot,
+				skillsDir,
 			},
 		);
 		return {
