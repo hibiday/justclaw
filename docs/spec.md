@@ -403,7 +403,56 @@ The bundled LLM loop re-reads these files from disk immediately before each `eve
 
 ### Workspace sandbox
 
-Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, and read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+
+## Skills directory
+
+The core resolves an optional **skills** directory for agent skill definitions.
+
+| Resolution | Path |
+|---|---|
+| `JUSTCLAW_SKILLS` set | Absolute path from this env var |
+| else `JUSTCLAW_HOME` set | `$JUSTCLAW_HOME/skills` |
+| else | `$HOME/justclaw/skills` |
+
+The bundled entrypoint creates the directory if missing (recursive mkdir), same as the workspace and character directories.
+
+### Skill format
+
+Each skill is a subdirectory containing a `SKILL.md` file:
+
+```
+skills/
+  {skill-name}/
+    SKILL.md        # required: YAML frontmatter + Markdown instructions
+    ...             # optional: scripts, templates, reference files
+```
+
+`SKILL.md` must begin with YAML frontmatter followed by Markdown:
+
+```markdown
+---
+name: {skill-name}
+description: {one-line description of when to use this skill}
+---
+
+# {Skill title}
+
+...instructions...
+```
+
+Required frontmatter fields:
+
+| Field | Description |
+|---|---|
+| `name` | Short identifier. Should match the directory name. |
+| `description` | One sentence describing when the skill applies. Shown to the LLM in the skill index. |
+
+### Skill discovery
+
+Before each LLM turn, the bundled loop scans `skills/*/SKILL.md`, parses frontmatter, and injects a skill index (name + description table) into the runtime instructions. Full skill content is not loaded automatically; the LLM reads it on demand via `shell`.
+
+Because the skills directory is rw-mounted in the workspace sandbox, the LLM can create, edit, and delete skills using `shell` and `edit`.
 
 ## Agent system prompt
 
@@ -412,7 +461,7 @@ The bundled LLM loop rebuilds the agent `instructions` string immediately before
 | Part | Source | Content |
 |---|---|---|
 | Context instructions | Character files on disk (`AGENTS.md`, `SOUL.md`, etc.) | Sections per file, as described under [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
-| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, and a table of loaded modules with replyable flag and tool names). |
+| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, and skill index when a skills directory is configured). |
 
 The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
 
@@ -605,9 +654,9 @@ send_image({ path: string })
 
 | Parameter | Description |
 |---|---|
-| `path` | Path to a local image file on the host |
+| `path` | Path to an image file accessible within the workspace sandbox |
 
-The core reads the file, infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
 
 ### Built-in Tool: `send_file`
 
@@ -617,9 +666,9 @@ send_file({ path: string })
 
 | Parameter | Description |
 |---|---|
-| `path` | Path to a local file on the host |
+| `path` | Path to a file accessible within the workspace sandbox |
 
-The core reads the file, infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `send_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `send_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
 
 ### Built-in Tool: `shell`
 

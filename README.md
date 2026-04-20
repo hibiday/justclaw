@@ -1,110 +1,73 @@
-# justclaw - AI Agent Architecture
+# justclaw
 
-## Overview
+An autonomous agent framework that is just right.
 
-justclaw is an event-driven AI agent framework.
-The core provides reasoning, memory, and identity, along with a minimal set of built-in capabilities. Additional functionality can be added through modules.
+justclaw is inspired by [OpenClaw](https://github.com/openclaw/openclaw) — a street tree, grown in fixed soil. justclaw is the soil itself.
+
+The goal is not to be smaller. The goal is to be right.
+
+The core processes events through a single LLM queue, providing reasoning, session memory, and identity. Modules connect external systems — messaging, timers, APIs — by communicating with the core over NDJSON (JSON-RPC 2.0) on stdin/stdout.
 
 Runtime: **Bun**
 
-## Core
+## Requirements
 
-The core provides:
+- [Bun](https://bun.sh)
+- macOS (`sandbox-exec`, included in the OS) or Linux (`bwrap`)
 
-- **Reasoning** — LLM-based inference and planning
-- **Memory** — Persistent context management across sessions
-- **Identity** — Agent personality, values, and behavioral boundaries
-- **Built-in tools** — A minimal set of built-in capabilities for common operations: `send_message` for explicit message delivery, `shell` for running commands in the workspace sandbox, and `edit` for creating, editing, and deleting files in the workspace
+## Quickstart
 
-Functionality beyond the built-ins can be added through modules.
+**1. Set environment variables**
 
-### Message Routing
-
-Because LLM inference is processed through a single serial queue, the most recently consumed received message is always uniquely defined. This invariant is the canonical basis for routing:
-
-> **The canonical delivery target is the source of the most recently consumed message from a replyable module.**
-
-The core persists this value across cycles so that events from non-replyable sources (for example, a module that delivers an image) still route LLM output to the last replyable module rather than being silently dropped.
-
-When the LLM calls the built-in `send_message` tool, it creates a transient override of the delivery target that lasts only for the current processing cycle. Subsequent free-form text output is delivered to the overridden target. When the cycle ends, the override is discarded, and the next cycle starts fresh from the canonical state.
-
-The override exists because LLMs commonly emit free-form text immediately after a tool call without re-invoking the tool. Without the override, that trailing text would be misrouted back to the canonical target instead of the module the LLM just explicitly addressed.
-
-The LLM does not need to know about destinations within a module (channels, users, etc.). Modules manage their own conversational context and decide where to actually deliver messages.
-
-## Module
-
-A module is a standalone executable that communicates with the core via NDJSON (JSON-RPC 2.0) over stdin/stdout.
-Modules can be written in any language.
-
-For the wire protocol, lifecycle, and message formats, see [docs/spec.md](docs/spec.md).
-
-### Directory Structure
-
-```
-$HOME/justclaw/
-  modules/
-    {module-name}/
-      module.json      # manifest
-      {entrypoint}     # executable
-      ...              # module-specific data and state
-  workspace/           # LLM workspace (rw); available via shell and edit tools
-  history/             # session history files (ro inside workspace sandbox)
-  character/           # agent identity files (rw inside workspace sandbox); see Character files in spec
+```sh
+export JUSTCLAW_OPENAI_API_KEY=your-api-key
+export JUSTCLAW_OPENAI_MODEL=gpt-5
+export JUSTCLAW_HOME=$HOME/justclaw
 ```
 
-If `JUSTCLAW_HOME` is set, the runtime uses that directory instead of `$HOME/justclaw/`. Each module directory is writable inside the platform sandbox via `bwrap` or `sandbox-exec`. State management is the module's own responsibility.
+**2. Install dependencies**
 
-### Manifest (module.json)
-
-**daemon module:**
-
-```json
-{
-  "name": "{module-name}",
-  "exec": "./{entrypoint}",
-  "mode": "daemon"
-}
+```sh
+bun install
 ```
 
-**timer module:**
+**3. Add a module**
 
-```json
-{
-  "name": "{module-name}",
-  "exec": "./{entrypoint}",
-  "mode": "timer",
-  "cron": "0 9 * * 1-5"
-}
+Copy the `cli-chat` example module, which lets you chat from a local terminal:
+
+```sh
+mkdir -p $JUSTCLAW_HOME/modules/cli-chat
+cp examples/cli-chat/module.json examples/cli-chat/main.ts $JUSTCLAW_HOME/modules/cli-chat/
 ```
 
-### Mode Comparison
+**4. Start the core**
 
-| | daemon | timer |
-|---|---|---|
-| Lifecycle | Long-running | One-shot (spawn, process, exit) |
-| Startup | When core starts or `restart_modules` | Core spawns on cron match; schedules reload on `restart_modules` |
-| Event emission | Write to stdout at any time | Write to stdout before exit |
-| Process count per module | Always 1 | One per firing |
-
-## Event Processing
-
-### Event Flow
-
-Canonical module event envelope:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "event",
-  "params": {
-    "type": "event.v1",
-    "kind": "{event.kind}"
-  }
-}
+```sh
+bun run src/index.ts
 ```
 
-`type` is the reserved envelope discriminator. Ordinary event semantics should go in another payload field such as `kind`.
+**5. Connect in a second terminal**
+
+```sh
+bun run examples/cli-chat/client.ts
+```
+
+Type a message and press Enter. The LLM response is printed to the same terminal.
+
+## Configuration
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `JUSTCLAW_OPENAI_API_KEY` | yes | — | API key passed to the OpenAI-compatible client |
+| `JUSTCLAW_OPENAI_MODEL` | yes | — | Model name, e.g. `gpt-5` |
+| `JUSTCLAW_OPENAI_BASE_URL` | no | OpenAI default | Base URL for the API endpoint; set to use a compatible provider |
+| `JUSTCLAW_HOME` | no | `$HOME/justclaw` | Root directory for modules, workspace, history, character, and skills |
+| `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |
+| `JUSTCLAW_SKILLS` | no | `$JUSTCLAW_HOME/skills` | Override path for the skills directory |
+
+## Architecture
+
+The core runs a single LLM inference queue. Modules communicate with the core over NDJSON (JSON-RPC 2.0) on stdin/stdout. Events from modules are enqueued and processed serially; the LLM may call back into modules via tool calls.
 
 ```
 Module (source)                    Core                         Module (target)
@@ -113,23 +76,94 @@ Module (source)                    Core                         Module (target)
  |                                  |-- enqueue to LLM queue      |
  |                                  |   (single queue, serial)    |
  |                                  |                              |
- |                                  |-- tool/{name} (request) -->|
- |                                  |<-- result ----------------- |
+ |                                  |-- tool/{name} (request) --> |
+ |                                  |<-- result ------------------ |
 ```
 
-### LLM Event Queue
+### Core capabilities
 
-- **Single global queue**, processed serially
-- Only events requiring LLM reasoning are emitted as notifications from modules
-- Processing that doesn't need LLM is handled entirely within the module
+- **Reasoning** — LLM-based inference via a single serial queue
+- **Memory** — Per-session conversation history, persisted to disk
+- **Identity** — Agent personality and instructions loaded from the character directory
+- **Built-in tools** — `send_message`, `shell`, `edit`, `send_image`, `send_file`, `restart_modules`
 
-### Timer Execution
+### Message routing
 
-- Cron expressions are evaluated in UTC.
-- Timer modules run **in parallel** (each timer spawned independently)
-- Independent of the LLM queue
-- If a cron tick fires while the previous run is still active, the core kills the previous process before spawning a new one
+The canonical delivery target is the source of the most recently consumed message from a replyable module. The core persists this as `last_replyable_target` so that events from non-replyable sources (for example, a timer module) still route LLM output to the last replyable module.
 
-## Security
+When the LLM calls `send_message`, it creates a transient override for the current processing cycle only. Subsequent free-form text in that cycle goes to the override target. When the cycle ends the override is discarded.
 
-- Each module has rw access only to `modules/{name}/` and temp paths (via `bwrap` or `sandbox-exec`)
+## Modules
+
+A module is a standalone executable placed under `$JUSTCLAW_HOME/modules/{name}/`. Each module directory contains a `module.json` manifest and an entrypoint.
+
+```
+$JUSTCLAW_HOME/
+  modules/
+    {module-name}/
+      module.json      # manifest
+      {entrypoint}     # executable
+      ...              # module-specific data and state
+  skills/
+    {skill-name}/
+      SKILL.md         # YAML frontmatter (name, description) + Markdown instructions
+      ...              # optional scripts, templates, reference files
+  workspace/           # LLM workspace (rw); available via shell and edit tools
+  history/             # session history files (ro inside workspace sandbox)
+  character/           # agent identity files (rw inside workspace sandbox)
+```
+
+Modules can be written in any language. The wire protocol is NDJSON over stdin/stdout. See [docs/spec.md](docs/spec.md) for the full protocol reference.
+
+### Manifest (module.json)
+
+**daemon** — long-running process started when the core starts:
+
+```json
+{
+  "name": "{module-name}",
+  "exec": "{entrypoint}",
+  "mode": "daemon",
+  "replyable": true
+}
+```
+
+**timer** — one-shot process spawned on a cron schedule:
+
+```json
+{
+  "name": "{module-name}",
+  "exec": "{entrypoint}",
+  "mode": "timer",
+  "cron": "0 9 * * 1-5"
+}
+```
+
+| | daemon | timer |
+|---|---|---|
+| Lifecycle | Long-running | One-shot (spawn, emit, exit) |
+| Startup | When core starts or `restart_modules` | Core spawns on cron match |
+| Event emission | Any time | Before exit |
+| Tool calls | Supported | Not supported (process does not stay running) |
+| `replyable` field | Optional (default `false`) | Not applicable |
+
+`replyable: true` allows the core to deliver `message.send.v1` notifications to the module and makes it eligible as the default routing target for LLM output.
+
+### Cron expressions
+
+Cron expressions are 5-field and evaluated in UTC.
+
+### Sandbox
+
+Each module runs inside a platform sandbox (`bwrap` on Linux, `sandbox-exec` on macOS). The sandbox grants read-write access to the module's own directory (`modules/{name}/`) and temp paths. Modules cannot access each other's directories or the workspace directly.
+
+The `shell` and `edit` built-in tools run in a separate workspace sandbox that grants read-write access to the workspace, character, and modules directories, and read-only access to the history directory.
+
+## Examples
+
+- **[cli-chat](examples/cli-chat/)** — daemon module; local terminal chat via a Unix socket
+- **[daily](examples/daily/)** — timer module; fires on a cron schedule and asks the LLM to write a daily log entry
+
+## Protocol
+
+The full wire protocol — methods, message formats, lifecycle diagrams, event types, session management, built-in tools, and routing rules — is in [docs/spec.md](docs/spec.md).
