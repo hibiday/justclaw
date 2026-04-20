@@ -4,6 +4,8 @@ export function buildRuntimeInstructions(
 	characterDir: string,
 	modulesRoot: string,
 	modules: Array<{ name: string; replyable: boolean; tools: string[] }>,
+	skillsDir?: string,
+	skills?: Array<{ name: string; description: string }>,
 ): string {
 	const moduleRows = modules
 		.map(
@@ -11,6 +13,8 @@ export function buildRuntimeInstructions(
 				`| ${m.name} | ${m.replyable ? "yes" : "no"} | ${m.tools.length > 0 ? m.tools.join(", ") : "—"} |`,
 		)
 		.join("\n");
+
+	const skillsSection = buildSkillsSection(skillsDir, skills);
 
 	return `## Workspace
 
@@ -73,7 +77,35 @@ Module tools are called as {module}__{tool}.
 send_message(module, text) delivers a message to a replyable module and routes subsequent output in this cycle to that module.
 restart_modules({ continuation }) reloads the modules directory: discovery runs first; if discovery, manifest parsing, or an empty result fails, running modules are left unchanged and the tool reports an error. A **successful** reload ends the current LLM run immediately, so the reloaded module set is first visible on the **next** event. \`continuation\` is required: pass a non-empty string to enqueue one \`event.v1\` handoff (source fixed to current event source); pass empty string when no follow-up is needed.
 
-send_image(path) reads a local image file and enqueues an image.send.v1 event.
-The image is injected into the LLM input on the next cycle, not the current one.
-send_file(path) does the same for documents (PDFs, etc.) via file.send.v1.`;
+send_image(path) reads an image file and enqueues an image.send.v1 event. The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths). The image is injected into the LLM input on the next cycle, not the current one.
+send_file(path) does the same for documents (PDFs, etc.) via file.send.v1. Same path restrictions apply.
+
+${skillsSection}
+
+## Output routing
+
+Free-form text you emit goes to the current delivery target: the source of the most recently consumed event from a replyable module. Use send_message(module, text) to override the target for the remainder of the current cycle; subsequent free-form text in that cycle also goes to the overridden target.`;
+}
+
+function buildSkillsSection(
+	skillsDir: string | undefined,
+	skills: Array<{ name: string; description: string }> | undefined,
+): string {
+	if (!skillsDir) {
+		return "## Skills\n\nNo skills directory configured.";
+	}
+
+	const index =
+		skills && skills.length > 0
+			? `| Skill | Description |\n|---|---|\n${skills.map((s) => `| ${s.name} | ${s.description} |`).join("\n")}`
+			: "No skills installed.";
+
+	return `## Skills
+
+Skills directory: ${skillsDir}
+
+${index}
+
+To use a skill, read its full instructions: shell(["cat ${skillsDir}/<name>/SKILL.md"]).
+To create a skill, create a directory under the skills directory containing a SKILL.md with YAML frontmatter (name, description) and Markdown instructions. The skill appears in this index on the next turn.`;
 }

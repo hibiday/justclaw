@@ -1,32 +1,43 @@
-# cli-chat example module
+# cli-chat
 
-`cli-chat` is a local CLI messaging module for `justclaw`.
+A daemon module for `justclaw` that provides a local terminal chat interface over a Unix socket.
 
-- daemon: `examples/cli-chat/main.ts`
-- client: `examples/cli-chat/client.ts`
+## Files
 
-The daemon receives input from the client over a Unix socket and forwards normal lines to the core as `event.v1` (`kind: "message.received"`).
+| File | Description |
+|---|---|
+| `module.json` | Module manifest (`mode: "daemon"`, `replyable: true`) |
+| `main.ts` | Daemon process; listens on a Unix socket and forwards input to the core |
+| `client.ts` | CLI client; connects to the socket and reads/writes lines |
 
-## Session commands
+## Setup
 
-Lines starting with `/` are treated as local commands and are not emitted as chat events.
+Copy the module files to the modules directory:
 
-- `/sessions`
-  - Calls `sessions.list.v1` and `sessions.active.v1`
-  - Prints all known session IDs in oldest-first order with numbers (`[1]`, `[2]`, ...)
-  - Marks the active session with `*`
-- `/session <id|number>`
-  - Calls `sessions.switch.v1`
-  - Queues a switch to an existing session by explicit ID or by the number from `/sessions`
-- `/new`
-  - Calls `sessions.new.v1` then `sessions.switch.v1`
-  - Creates a new session and queues a switch to it
-- `/log [id|number]`
-  - Calls `sessions.get.v1`
-  - Prints the selected session history in a readable one-line format (last 20 items)
-  - If omitted, uses the active session
+```sh
+mkdir -p $JUSTCLAW_HOME/modules/cli-chat
+cp module.json main.ts $JUSTCLAW_HOME/modules/cli-chat/
+```
 
-## Notes
+Start the core, then connect in a second terminal:
 
-- `sessions.switch.v1` returns when the switch is enqueued. The actual active session is applied asynchronously by the LLM loop.
-- Unknown slash commands print a short usage hint.
+```sh
+bun run client.ts
+```
+
+The socket path is `$JUSTCLAW_HOME/modules/cli-chat/cli-chat.sock`. The daemon creates it on startup; the client exits with an error if it does not exist.
+
+## Usage
+
+Type a message and press Enter. The agent's response is printed to the terminal.
+
+Lines starting with `/` are local session commands and are not forwarded to the core as events.
+
+| Command | Description |
+|---|---|
+| `/sessions` | List all sessions; marks the active session with `*` |
+| `/session <id\|number>` | Switch to an existing session by ID or by the number shown in `/sessions` |
+| `/new` | Create a new session and switch to it |
+| `/log [id\|number]` | Print the last 20 history entries for a session (defaults to active session) |
+
+`sessions.switch.v1` enqueues the switch and returns immediately. The new session becomes active before the next event is processed by the LLM loop, but `sessions.active.v1` called immediately after may still return the previous ID.
