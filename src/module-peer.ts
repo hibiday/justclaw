@@ -1,7 +1,4 @@
-import {
-	ACTIVE_SESSION_META_KEY,
-	type EventQueue,
-} from "./event-queue";
+import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
 export type EventParams = Record<string, unknown> & {
@@ -113,9 +110,7 @@ export function createSessionRequestHandler(
 				return { id: activeId };
 			}
 
-			throw new Error(
-				`${manifestName}: sessions.active.v1: no active session`,
-			);
+			throw new Error(`${manifestName}: sessions.active.v1: no active session`);
 		}
 
 		if (method === "sessions.list.v1") {

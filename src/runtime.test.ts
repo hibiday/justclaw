@@ -317,11 +317,11 @@ function findFunctionTool(agent: Agent, name: string): FunctionTool {
 
 describe("parseDaemonManifest", () => {
 	test("accepts a valid daemon manifest", () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		expect(manifest.name).toBe("example");
 		expect(manifest.execPath).toBe(path.resolve("/tmp/example", "./run"));
@@ -329,116 +329,103 @@ describe("parseDaemonManifest", () => {
 	});
 
 	test("accepts replyable true", () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{
-				name: "example",
-				exec: "./run",
-				mode: "daemon",
-				replyable: true,
-			},
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+			replyable: true,
+		});
 		expect(manifest.replyable).toBe(true);
 	});
 
 	test("rejects timer mode", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", exec: "./run", mode: "timer" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "timer",
+			}),
 		).toThrow('must declare mode "daemon"');
 	});
 
 	test("rejects directory/name mismatch", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "other", exec: "./run", mode: "daemon" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "other",
+				exec: "./run",
+				mode: "daemon",
+			}),
 		).toThrow('name must match directory "example"');
 	});
 
 	test("rejects missing exec", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", mode: "daemon" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "example",
+				mode: "daemon",
+			}),
 		).toThrow('must contain a non-empty string "exec"');
 	});
 
 	test("rejects absolute exec paths", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{
-					name: "example",
-					exec: "/usr/bin/python",
-					mode: "daemon",
-				},
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "/usr/bin/python",
+				mode: "daemon",
+			}),
 		).toThrow('"exec" must be relative to the module directory');
 	});
 
 	test("rejects exec paths that escape the module directory", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", exec: "../run", mode: "daemon" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "../run",
+				mode: "daemon",
+			}),
 		).toThrow('"exec" must stay inside the module directory');
 	});
 
 	test("accepts exec paths that start with dots but stay inside the module directory", () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./..bin/run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./..bin/run",
+			mode: "daemon",
+		});
 
 		expect(manifest.execPath).toBe(path.resolve("/tmp/example/..bin/run"));
 	});
 
 	test("rejects empty name", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "", exec: "./run", mode: "daemon" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "",
+				exec: "./run",
+				mode: "daemon",
+			}),
 		).toThrow('must contain a non-empty string "name"');
 	});
 
 	test("rejects unsupported mode", () => {
 		expect(() =>
-			parseDaemonManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", exec: "./run", mode: "other" },
-			),
+			parseDaemonManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "other",
+			}),
 		).toThrow('must declare mode "daemon"');
 	});
 });
 
 describe("parseTimerManifest", () => {
 	test("accepts a valid timer manifest", () => {
-		const manifest = parseTimerManifest(
-			"/tmp/tick",
-			"tick",
-			{
-				name: "tick",
-				exec: "./run",
-				mode: "timer",
-				cron: "0 9 * * 1-5",
-			},
-		);
+		const manifest = parseTimerManifest("/tmp/tick", "tick", {
+			name: "tick",
+			exec: "./run",
+			mode: "timer",
+			cron: "0 9 * * 1-5",
+		});
 
 		expect(manifest.name).toBe("tick");
 		expect(manifest.mode).toBe("timer");
@@ -448,51 +435,43 @@ describe("parseTimerManifest", () => {
 
 	test("rejects daemon mode", () => {
 		expect(() =>
-			parseTimerManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", exec: "./run", mode: "daemon" },
-			),
+			parseTimerManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "daemon",
+			}),
 		).toThrow('must declare mode "timer"');
 	});
 
 	test("rejects missing cron", () => {
 		expect(() =>
-			parseTimerManifest(
-				"/tmp/example",
-				"example",
-				{ name: "example", exec: "./run", mode: "timer" },
-			),
+			parseTimerManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "timer",
+			}),
 		).toThrow('must contain a non-empty string "cron"');
 	});
 
 	test("rejects empty cron string", () => {
 		expect(() =>
-			parseTimerManifest(
-				"/tmp/example",
-				"example",
-				{
-					name: "example",
-					exec: "./run",
-					mode: "timer",
-					cron: "",
-				},
-			),
+			parseTimerManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "timer",
+				cron: "",
+			}),
 		).toThrow('must contain a non-empty string "cron"');
 	});
 
 	test("rejects invalid cron expression", () => {
 		expect(() =>
-			parseTimerManifest(
-				"/tmp/example",
-				"example",
-				{
-					name: "example",
-					exec: "./run",
-					mode: "timer",
-					cron: "not-a-cron",
-				},
-			),
+			parseTimerManifest("/tmp/example", "example", {
+				name: "example",
+				exec: "./run",
+				mode: "timer",
+				cron: "not-a-cron",
+			}),
 		).toThrow('"cron" is not a valid cron expression');
 	});
 });
@@ -848,11 +827,11 @@ describe("sandbox", () => {
 	});
 
 	test("allows a darwin shebang interpreter installed under HOME for reads only", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
@@ -877,11 +856,11 @@ describe("sandbox", () => {
 	});
 
 	test("allows both lookup and real target paths for a symlinked darwin shebang interpreter", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
@@ -908,11 +887,11 @@ describe("sandbox", () => {
 	});
 
 	test("allows a root-level darwin shebang interpreter without exposing root", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
@@ -929,11 +908,11 @@ describe("sandbox", () => {
 	test("allows a darwin shebang interpreter as a file when its parent contains the module directory", async () => {
 		const moduleDir = "/Users/alice/justclaw/modules/example";
 		const interpreterPath = "/Users/alice/justclaw/bun";
-		const manifest = parseDaemonManifest(
-			moduleDir,
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest(moduleDir, "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
@@ -949,11 +928,11 @@ describe("sandbox", () => {
 	});
 
 	test("builds a linux bwrap command from the readonly allowlist", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 		const existingPaths = new Set([
 			"/bin",
 			"/usr",
@@ -988,11 +967,11 @@ describe("sandbox", () => {
 
 	test("creates bwrap mountpoints for home module directories", async () => {
 		const moduleDir = "/home/test/justclaw/modules/example";
-		const manifest = parseDaemonManifest(
-			moduleDir,
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest(moduleDir, "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1008,11 +987,11 @@ describe("sandbox", () => {
 	});
 
 	test("adds a mount for a shebang interpreter resolved via env", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
@@ -1035,11 +1014,11 @@ describe("sandbox", () => {
 	});
 
 	test("mounts both lookup and real target paths for a symlinked linux shebang interpreter", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
@@ -1064,11 +1043,11 @@ describe("sandbox", () => {
 	});
 
 	test("skips env assignments when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
@@ -1092,11 +1071,11 @@ describe("sandbox", () => {
 	});
 
 	test("applies PATH assignments when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			env: { ...process.env, PATH: "/usr/bin" },
@@ -1116,11 +1095,11 @@ describe("sandbox", () => {
 	});
 
 	test("skips env options that consume the next token when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
@@ -1138,11 +1117,11 @@ describe("sandbox", () => {
 	});
 
 	test("adds a mount for an absolute shebang interpreter outside the allowlist", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1159,11 +1138,11 @@ describe("sandbox", () => {
 	});
 
 	test("mounts a root-level linux shebang interpreter as a file", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1194,11 +1173,11 @@ describe("sandbox", () => {
 	test("mounts a linux shebang interpreter as a file when its parent contains the module directory", async () => {
 		const moduleDir = "/home/alice/justclaw/modules/example";
 		const interpreterPath = "/home/alice/justclaw/bun";
-		const manifest = parseDaemonManifest(
-			moduleDir,
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest(moduleDir, "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1227,11 +1206,11 @@ describe("sandbox", () => {
 	});
 
 	test("does not add an extra interpreter mount when the shebang is already covered", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
 				candidatePath === "/tmp/example" ||
@@ -1250,11 +1229,11 @@ describe("sandbox", () => {
 	});
 
 	test("omits missing optional linux readonly mounts", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1270,11 +1249,11 @@ describe("sandbox", () => {
 	});
 
 	test("mounts the linux resolver symlink target without exposing /run wholesale", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1300,11 +1279,11 @@ describe("sandbox", () => {
 	});
 
 	test("ignores a shebang interpreter path when its directory does not exist", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1316,11 +1295,11 @@ describe("sandbox", () => {
 	});
 
 	test("fails when a required writable linux sandbox path is unavailable", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		await expect(
 			createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1330,11 +1309,11 @@ describe("sandbox", () => {
 	});
 
 	test("fails closed when the darwin backend is missing", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		await expect(
 			createSandboxLaunchSpec(manifest, {
@@ -1345,11 +1324,11 @@ describe("sandbox", () => {
 	});
 
 	test("fails closed when the linux backend is missing", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 
 		await expect(
 			createSandboxLaunchSpec(manifest, {
@@ -1360,11 +1339,11 @@ describe("sandbox", () => {
 	});
 
 	test("preserves environment variables in the launch spec", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 		const env = { ...process.env, OPENAI_API_KEY: "test-key" };
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -1378,11 +1357,11 @@ describe("sandbox", () => {
 	});
 
 	test("normalizes TMPDIR to /tmp in the linux launch spec", async () => {
-		const manifest = parseDaemonManifest(
-			"/tmp/example",
-			"example",
-			{ name: "example", exec: "./run", mode: "daemon" },
-		);
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
 		const env = { ...process.env, TMPDIR: "/var/tmp/custom" };
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -1445,12 +1424,7 @@ describe("reloadModules", () => {
 		const daemonsRef = { current: runtime.daemons };
 		const before = daemonsRef.current.map((d) => d.manifest.name).sort();
 		try {
-			await writeRawModule(
-				homeDir,
-				"bad",
-				"{not json",
-				createModuleScript(),
-			);
+			await writeRawModule(homeDir, "bad", "{not json", createModuleScript());
 			await expect(
 				reloadModules(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
 					sessionStore: ctx.sessionStore,
@@ -1655,7 +1629,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		runtime.eventQueue.close();
 	});
 
-	test("fails when a daemon exits before initialize responds", async () => {
+	test("skips a daemon that exits before initialize responds", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1663,18 +1637,18 @@ for await (const chunk of Bun.stdin.stream()) {
 			createModuleScript({ exitImmediately: true }),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("stdout closed unexpectedly");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("fails immediately when stdout closes before initialize responds", async () => {
+	test("skips a daemon when stdout closes before initialize responds", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1682,18 +1656,18 @@ for await (const chunk of Bun.stdin.stream()) {
 			createStdoutClosingShellScript(),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("stdout closed unexpectedly");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("fails when initialize returns a JSON-RPC error", async () => {
+	test("skips a daemon when initialize returns a JSON-RPC error", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1706,18 +1680,18 @@ for await (const chunk of Bun.stdin.stream()) {
 			),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("init failed");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("fails when initialize does not respond before the configured timeout", async () => {
+	test("skips a daemon when initialize does not respond before the configured timeout", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1725,16 +1699,16 @@ for await (const chunk of Bun.stdin.stream()) {
 			createModuleScript({ ignoreInitialize: true }),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				initializeTimeoutMs: 50,
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("initialize timed out");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			initializeTimeoutMs: 50,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
 	test("registers spawned daemons before initialize completes", async () => {
@@ -1758,7 +1732,9 @@ for await (const chunk of Bun.stdin.stream()) {
 		await waitUntil(() => startedDaemons.length === 1);
 		await stopDaemons(startedDaemons);
 
-		await expect(bootstrap).rejects.toThrow();
+		const runtime = await bootstrap;
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
 	test("marks a daemon failed when initialize fails", async () => {
@@ -1800,7 +1776,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		await expect(daemon?.process.exited).resolves.toBeNumber();
 	});
 
-	test('fails when initialize result "tools" is not an array', async () => {
+	test('skips a daemon when initialize result "tools" is not an array', async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const cleanupMarker = path.join(homeDir, "bad-tools-cleanup.txt");
 		await writeDaemonModule(
@@ -1812,21 +1788,21 @@ for await (const chunk of Bun.stdin.stream()) {
 			}),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow('initialize result "tools" must be an array');
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 		await expect(readFile(cleanupMarker, "utf8")).resolves.toContain(
 			"shutdown",
 		);
 	});
 
-	test("fails when a tool entry has a non-string name", async () => {
+	test("skips a daemon when a tool entry has a non-string name", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1837,18 +1813,18 @@ for await (const chunk of Bun.stdin.stream()) {
 			}),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("bad-tool-name: tool[0].name must be a string");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("rejects array initialize results", async () => {
+	test("skips a daemon when initialize result is an array", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1858,18 +1834,18 @@ for await (const chunk of Bun.stdin.stream()) {
 			}),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("initialize result must be an object");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("fails when stdout emits malformed JSON", async () => {
+	test("skips a daemon when stdout emits malformed JSON", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1877,15 +1853,15 @@ for await (const chunk of Bun.stdin.stream()) {
 			createModuleScript({ malformedStdout: true }),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("received invalid JSON-RPC line");
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		runtime.eventQueue.close();
+		expect(runtime.daemons).toHaveLength(0);
 	});
 
 	test("terminates a started daemon after stdout closes", async () => {
@@ -2090,34 +2066,29 @@ sleep 10
 		expect(daemon.state).toBe("failed");
 	});
 
-	test("shuts down already-started daemons when a later daemon fails", async () => {
+	test("keeps good daemons running when a later daemon fails to start", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
-		const cleanupMarker = path.join(homeDir, "cleanup-marker.txt");
-		await writeDaemonModule(
-			homeDir,
-			"a-good",
-			createModuleScript({
-				shutdownSideEffectPath: cleanupMarker,
-			}),
-		);
+		await writeDaemonModule(homeDir, "a-good", createModuleScript());
 		await writeDaemonModule(
 			homeDir,
 			"z-bad",
 			createModuleScript({ exitImmediately: true }),
 		);
 
-		await expect(
-			bootstrapRuntime({
-				homeDir,
-				eventQueuePath: path.join(homeDir, "events.db"),
-				...createSessionContext(homeDir),
-				sandboxFactory: async (manifest) =>
-					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-			}),
-		).rejects.toThrow("stdout closed unexpectedly");
-		await expect(readFile(cleanupMarker, "utf8")).resolves.toContain(
-			"shutdown",
-		);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		try {
+			expect(runtime.daemons).toHaveLength(1);
+			expect(runtime.daemons[0]?.manifest.name).toBe("a-good");
+		} finally {
+			await stopDaemons(runtime.daemons);
+			runtime.eventQueue.close();
+		}
 	});
 
 	test("kills a daemon when shutdown does not return", async () => {

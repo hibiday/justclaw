@@ -583,7 +583,7 @@ Trailing free-form assistant text after the LLM run is delivered the same way: o
 
 ### Built-in Tool: `restart_modules`
 
-Reloads all modules (daemon and timer) from the modules directory (same discovery path as startup). Manifest discovery and parsing run **before** any running module is stopped. If discovery or parsing fails, or if the directory contains no valid daemon modules, existing processes stay up and the tool returns an error string. If discovery succeeds but a daemon fails to start, all daemons and all timer schedulers are stopped and the tool returns an error string; timer modules will not fire until the next successful reload.
+Reloads all modules (daemon and timer) from the modules directory (same discovery path as startup). Manifest discovery and parsing run **before** any running module is stopped. If discovery or parsing fails, or if the directory contains no valid daemon modules, existing processes stay up and the tool returns an error string. If discovery succeeds, modules that fail to start are skipped (a warning is logged) and the remaining modules continue starting normally.
 
 ```
 restart_modules({ continuation: string })

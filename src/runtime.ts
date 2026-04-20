@@ -664,27 +664,44 @@ export async function reloadModules(
 	try {
 		for (const manifest of manifests) {
 			throwIfAborted(options.abortSignal);
-			await startDaemon(manifest, {
-				abortSignal: options.abortSignal,
-				initializeTimeoutMs: options.initializeTimeoutMs,
-				sandboxFactory: options.sandboxFactory,
-				queue: eventQueue,
-				sessionStore: options.sessionStore,
-				onFailure: (daemon, error) => {
-					handleDaemonFailure(
-						daemon,
-						error,
-						options,
-						daemonsRef.current,
-						eventQueue,
-					);
-				},
-				onSpawned: (daemon) => {
-					daemonsRef.current.push(daemon);
-				},
-			}).then((daemon) => {
-				superviseDaemon(daemon, options, daemonsRef.current, eventQueue);
-			});
+			let spawnedDaemon: StartedDaemon | undefined;
+			try {
+				await startDaemon(manifest, {
+					abortSignal: options.abortSignal,
+					initializeTimeoutMs: options.initializeTimeoutMs,
+					sandboxFactory: options.sandboxFactory,
+					queue: eventQueue,
+					sessionStore: options.sessionStore,
+					onFailure: (daemon, error) => {
+						handleDaemonFailure(
+							daemon,
+							error,
+							options,
+							daemonsRef.current,
+							eventQueue,
+						);
+					},
+					onSpawned: (daemon) => {
+						spawnedDaemon = daemon;
+						daemonsRef.current.push(daemon);
+					},
+				}).then((daemon) => {
+					superviseDaemon(daemon, options, daemonsRef.current, eventQueue);
+				});
+			} catch (error) {
+				if (options.abortSignal?.aborted) {
+					throw error;
+				}
+				if (spawnedDaemon !== undefined) {
+					const idx = daemonsRef.current.indexOf(spawnedDaemon);
+					if (idx !== -1) {
+						daemonsRef.current.splice(idx, 1);
+					}
+				}
+				console.error(
+					`[${manifest.name}] failed to start, skipping: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		}
 	} catch (error) {
 		await stopDaemons(daemonsRef.current);

@@ -1,10 +1,10 @@
 import type { EventQueue } from "./event-queue";
 import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
+import type { TimerModuleManifest } from "./module-manifest";
 import {
 	createSessionRequestHandler,
 	parseEventNotificationParams,
 } from "./module-peer";
-import type { TimerModuleManifest } from "./module-manifest";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
 import type { SessionStore } from "./session-store";
 
@@ -115,7 +115,9 @@ async function fireTimer(
 	queue: EventQueue,
 	sessionStore: SessionStore,
 	options: {
-		sandboxFactory?: (manifest: TimerModuleManifest) => Promise<SandboxLaunchSpec>;
+		sandboxFactory?: (
+			manifest: TimerModuleManifest,
+		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
 	},
 ): Promise<void> {
@@ -185,9 +187,7 @@ async function fireTimer(
 			clearTimeout(timeoutHandle);
 		}
 		await stdoutTask.catch(() => {});
-		peer.close(
-			new Error(`${manifest.name}: timer module process ended`),
-		);
+		peer.close(new Error(`${manifest.name}: timer module process ended`));
 		if (state.process === proc) {
 			state.process = null;
 		}
@@ -201,7 +201,9 @@ export function startTimerSchedulers(
 	queue: EventQueue,
 	sessionStore: SessionStore,
 	options: {
-		sandboxFactory?: (manifest: TimerModuleManifest) => Promise<SandboxLaunchSpec>;
+		sandboxFactory?: (
+			manifest: TimerModuleManifest,
+		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
 	} = {},
 ): TimerScheduler {

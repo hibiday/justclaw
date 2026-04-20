@@ -300,9 +300,7 @@ export async function discoverTimerManifests(
 			try {
 				parsed = JSON.parse(manifestText);
 			} catch {
-				throw new Error(
-					`Manifest ${manifestPath} is not valid JSON`,
-				);
+				throw new Error(`Manifest ${manifestPath} is not valid JSON`);
 			}
 
 			if (!isRecord(parsed) || parsed.mode !== "timer") {

@@ -476,7 +476,7 @@ export async function runLlmLoop(
 		const restartModulesTool = tool({
 			name: "restart_modules",
 			description:
-				"Reload all modules (daemon and timer) from the modules directory (reflects adds/removes and manifest changes). Discovery runs first; on failure existing processes stay up and the tool returns an error. On success, processes update immediately and the current LLM run ends after this tool call; pass non-empty continuation to enqueue a follow-up event.v1 (source fixed to current event source) so the next event runs with the reloaded module set. Pass an empty string when no follow-up is needed.",
+				"Reload all modules (daemon and timer) from the modules directory (reflects adds/removes and manifest changes). Discovery runs first; on failure existing processes stay up and the tool returns an error. On success, processes update immediately (modules that fail to start are skipped with a warning) and the current LLM run ends after this tool call; pass non-empty continuation to enqueue a follow-up event.v1 (source fixed to current event source) so the next event runs with the reloaded module set. Pass an empty string when no follow-up is needed.",
 			parameters: {
 				type: "object",
 				properties: {

@@ -1,7 +1,10 @@
 import { constants } from "node:fs";
 import { access, open, realpath } from "node:fs/promises";
 import path from "node:path";
-import type { DaemonModuleManifest, TimerModuleManifest } from "./module-manifest";
+import type {
+	DaemonModuleManifest,
+	TimerModuleManifest,
+} from "./module-manifest";
 
 export type SandboxBackend = "bwrap" | "sandbox-exec";
 

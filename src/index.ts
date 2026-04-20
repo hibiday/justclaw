@@ -5,8 +5,8 @@ import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import {
 	bootstrapRuntime,
 	type StartedDaemon,
-	type TimerScheduler,
 	stopDaemons,
+	type TimerScheduler,
 } from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
 import { createWorkspaceTools, resolveWorkspaceDir } from "./workspace";
