@@ -2,7 +2,12 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { loadHomeAgentsFile, resolveCharacterDir } from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
-import { bootstrapRuntime, type StartedDaemon, stopDaemons } from "./runtime";
+import {
+	bootstrapRuntime,
+	type StartedDaemon,
+	stopDaemons,
+	type TimerScheduler,
+} from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
 import { createWorkspaceTools, resolveWorkspaceDir } from "./workspace";
 
@@ -36,10 +41,14 @@ async function main(): Promise<void> {
 	let eventQueue:
 		| Awaited<ReturnType<typeof bootstrapRuntime>>["eventQueue"]
 		| undefined;
+	const timerSchedulerRef: { current: TimerScheduler | undefined } = {
+		current: undefined,
+	};
 	const shutdown = createShutdownSignal();
 	const abortController = new AbortController();
 	const shutdownTask = shutdown.promise.then(async () => {
 		abortController.abort();
+		await timerSchedulerRef.current?.stop();
 		eventQueue?.close();
 		await stopDaemons(daemonsRef.current);
 	});
@@ -59,6 +68,7 @@ async function main(): Promise<void> {
 			sessionStore,
 		});
 		eventQueue = result.eventQueue;
+		timerSchedulerRef.current = result.timerScheduler;
 		const homeDir = path.dirname(result.modulesRoot);
 		const operatorContext = await loadHomeAgentsFile(homeDir);
 		const workspaceTools = createWorkspaceTools(
@@ -67,9 +77,6 @@ async function main(): Promise<void> {
 			process.platform,
 			characterDir,
 			result.modulesRoot,
-		);
-		console.error(
-			`Loaded ${daemonsRef.current.length} daemon module(s) from ${result.modulesRoot}`,
 		);
 
 		// If shutdown wins the race, we do not await runLlmLoop afterward. Main
@@ -87,11 +94,13 @@ async function main(): Promise<void> {
 				operatorContext: operatorContext || undefined,
 				modulesRoot: result.modulesRoot,
 				abortSignal: abortController.signal,
+				timerSchedulerRef: timerSchedulerRef as { current: TimerScheduler },
 			}),
 			shutdownTask,
 		]);
 	} catch (error) {
 		abortController.abort();
+		await timerSchedulerRef.current?.stop();
 		eventQueue?.close();
 		await stopDaemons(daemonsRef.current);
 		throw error;

@@ -22,8 +22,9 @@ import {
 } from "./event-queue";
 import {
 	type BootstrapRuntimeOptions,
-	reloadDaemons,
+	reloadModules,
 	type StartedDaemon,
+	type TimerScheduler,
 } from "./runtime";
 import type { SessionStore } from "./session-store";
 import { buildSystemPrompt } from "./system-prompt";
@@ -236,6 +237,7 @@ export type LlmLoopOptions = {
 	sandboxFactory?: BootstrapRuntimeOptions["sandboxFactory"];
 	initializeTimeoutMs?: BootstrapRuntimeOptions["initializeTimeoutMs"];
 	abortSignal?: BootstrapRuntimeOptions["abortSignal"];
+	timerSchedulerRef?: { current: TimerScheduler };
 };
 
 function resetSessionState(state: {
@@ -474,7 +476,7 @@ export async function runLlmLoop(
 		const restartModulesTool = tool({
 			name: "restart_modules",
 			description:
-				"Reload daemon modules from the modules directory (reflects adds/removes and manifest changes). Discovery runs first; on failure existing processes stay up and the tool returns an error. On success, processes update immediately and the current LLM run ends after this tool call; pass non-empty continuation to enqueue a follow-up event.v1 (source fixed to current event source) so the next event runs with the reloaded module set. Pass an empty string when no follow-up is needed.",
+				"Reload all modules (daemon and timer) from the modules directory (reflects adds/removes and manifest changes). Discovery runs first; on failure existing processes stay up and the tool returns an error. On success, processes update immediately (modules that fail to start are skipped with a warning) and the current LLM run ends after this tool call; pass non-empty continuation to enqueue a follow-up event.v1 (source fixed to current event source) so the next event runs with the reloaded module set. Pass an empty string when no follow-up is needed.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -496,11 +498,12 @@ export async function runLlmLoop(
 					return "error: session store not configured";
 				}
 				try {
-					await reloadDaemons(daemonsRef, options.modulesRoot, eventQueue, {
+					await reloadModules(daemonsRef, options.modulesRoot, eventQueue, {
 						sessionStore,
 						sandboxFactory: options.sandboxFactory,
 						initializeTimeoutMs: options.initializeTimeoutMs,
 						abortSignal: options.abortSignal,
+						timerSchedulerRef: options.timerSchedulerRef,
 					});
 					const rawContinuation =
 						(input as { continuation: string }).continuation ?? "";
