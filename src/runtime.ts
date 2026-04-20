@@ -9,10 +9,16 @@ import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import {
 	type DaemonModuleManifest,
 	discoverDaemonManifests,
+	discoverTimerManifests,
 	resolveModulesRoot,
 } from "./module-manifest";
+import {
+	createSessionRequestHandler,
+	parseEventNotificationParams,
+} from "./module-peer";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
 import type { SessionStore } from "./session-store";
+import { startTimerSchedulers, type TimerScheduler } from "./timer-runner";
 
 type DaemonState = "starting" | "running" | "stopping" | "stopped" | "failed";
 
@@ -122,32 +128,6 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
-}
-
-type EventParams = Record<string, unknown> & {
-	type: "event.v1" | "image.send.v1" | "file.send.v1";
-};
-
-function parseEventNotificationParams(
-	moduleName: string,
-	params: unknown,
-): EventParams {
-	if (typeof params !== "object" || params === null || Array.isArray(params)) {
-		throw new Error(`${moduleName}: event params must be an object`);
-	}
-
-	const record = params as Record<string, unknown>;
-	if (
-		record.type !== "event.v1" &&
-		record.type !== "image.send.v1" &&
-		record.type !== "file.send.v1"
-	) {
-		throw new Error(
-			`${moduleName}: event type must be "event.v1", "image.send.v1", or "file.send.v1"`,
-		);
-	}
-
-	return record as EventParams;
 }
 
 function parseInitializeResult(
@@ -315,24 +295,6 @@ async function pipeStdout(
 	}
 }
 
-function requireSessionParamsId(
-	manifestName: string,
-	params: unknown,
-	method: string,
-): string {
-	if (
-		typeof params !== "object" ||
-		params === null ||
-		typeof (params as Record<string, unknown>).id !== "string" ||
-		(params as Record<string, unknown>).id === ""
-	) {
-		throw new Error(
-			`${manifestName}: ${method} requires a non-empty string "id"`,
-		);
-	}
-	return (params as Record<string, unknown>).id as string;
-}
-
 async function pipeStderr(daemon: StartedDaemon): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stderr, (line) => {
@@ -370,106 +332,8 @@ function createPeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
-		onRequest: async (method, params) => {
-			if (method === "sessions.new.v1") {
-				const id = Bun.randomUUIDv7();
-				await sessionStore.create(id);
-				return { id };
-			}
-
-			if (method === "sessions.switch.v1") {
-				const id = requireSessionParamsId(
-					manifest.name,
-					params,
-					"sessions.switch.v1",
-				);
-				// Pre-check: reject the request immediately if the session does not exist,
-				// so the module gets a synchronous error rather than a later event.dropped.v1.
-				// The LLM loop loads the file again at apply time because the file may be
-				// removed or become unreadable between this check and the queue drain.
-				if ((await sessionStore.load(id)) === null) {
-					throw new Error(
-						`${manifest.name}: sessions.switch.v1: session "${id}" is unreadable or does not exist`,
-					);
-				}
-				queue.enqueue(manifest.name, { type: "sessions.switch.v1", id });
-				return "ok";
-			}
-
-			if (method === "sessions.active.v1") {
-				const activeId = await resolveReadableOrFallbackActiveSessionId(
-					queue,
-					sessionStore,
-				);
-				if (activeId !== null) {
-					return { id: activeId };
-				}
-
-				throw new Error(
-					`${manifest.name}: sessions.active.v1: no active session`,
-				);
-			}
-
-			if (method === "sessions.list.v1") {
-				return { ids: sessionStore.list() };
-			}
-
-			if (method === "sessions.delete.v1") {
-				const id = requireSessionParamsId(
-					manifest.name,
-					params,
-					"sessions.delete.v1",
-				);
-				await sessionStore.delete(id);
-				if (id === queue.getMeta(ACTIVE_SESSION_META_KEY)) {
-					queue.deleteMeta(ACTIVE_SESSION_META_KEY);
-				}
-				return "ok";
-			}
-
-			if (method === "sessions.get.v1") {
-				const id = requireSessionParamsId(
-					manifest.name,
-					params,
-					"sessions.get.v1",
-				);
-				const history = await sessionStore.load(id);
-				if (history === null) {
-					throw new Error(
-						`${manifest.name}: sessions.get.v1: session "${id}" does not exist or could not be read`,
-					);
-				}
-				return { history };
-			}
-
-			throw new Error(`${manifest.name}: unsupported method "${method}"`);
-		},
+		onRequest: createSessionRequestHandler(manifest.name, queue, sessionStore),
 	});
-}
-
-async function resolveReadableOrFallbackActiveSessionId(
-	queue: EventQueue,
-	sessionStore: SessionStore,
-): Promise<string | null> {
-	const metaId = queue.getMeta(ACTIVE_SESSION_META_KEY);
-	if (metaId !== null) {
-		try {
-			const history = await sessionStore.load(metaId);
-			if (history !== null) {
-				return metaId;
-			}
-			console.warn(
-				`[core] active_session_id "${metaId}" is missing, unreadable, or invalid; falling back to newest readable session`,
-			);
-		} catch (error) {
-			console.warn(
-				`[core] active_session_id metadata lookup: session "${metaId}" is invalid or unreadable (${error instanceof Error ? error.message : String(error)})`,
-			);
-		}
-	}
-
-	const fallbackId = sessionStore.newestReadableSessionId();
-	return fallbackId;
 }
 
 function seedActiveSessionMetadata(
@@ -771,23 +635,31 @@ async function restartFailedDaemon(
 	}
 }
 
-export async function reloadDaemons(
+export async function reloadModules(
 	daemonsRef: { current: StartedDaemon[] },
 	modulesRoot: string,
 	eventQueue: EventQueue,
 	options: Pick<
 		BootstrapRuntimeOptions,
 		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
-	>,
+	> & {
+		timerSchedulerRef?: { current: TimerScheduler };
+	},
 ): Promise<void> {
-	// Discover and parse before stopping anything so failures leave running daemons untouched.
+	// Discover and parse before stopping anything so failures leave running modules untouched.
 	const manifests = await discoverDaemonManifests(modulesRoot);
 	if (manifests.length === 0) {
 		throw new Error(`No modules available in ${modulesRoot}`);
 	}
+	const timerManifests = options.timerSchedulerRef
+		? await discoverTimerManifests(modulesRoot)
+		: [];
 
 	await stopDaemons(daemonsRef.current);
 	daemonsRef.current.length = 0;
+	if (options.timerSchedulerRef) {
+		await options.timerSchedulerRef.current.stop();
+	}
 
 	try {
 		for (const manifest of manifests) {
@@ -819,6 +691,15 @@ export async function reloadDaemons(
 		daemonsRef.current.length = 0;
 		throw error;
 	}
+
+	if (options.timerSchedulerRef) {
+		options.timerSchedulerRef.current = startTimerSchedulers(
+			timerManifests,
+			eventQueue,
+			options.sessionStore,
+			{ initializeTimeoutMs: options.initializeTimeoutMs },
+		);
+	}
 }
 
 export async function bootstrapRuntime(
@@ -827,6 +708,7 @@ export async function bootstrapRuntime(
 	modulesRoot: string;
 	daemons: StartedDaemon[];
 	eventQueue: EventQueue;
+	timerScheduler: TimerScheduler;
 }> {
 	const modulesRoot = resolveModulesRoot(
 		process.env.JUSTCLAW_HOME,
@@ -845,7 +727,7 @@ export async function bootstrapRuntime(
 	const startupRef = { current: options.startedDaemons ?? [] };
 
 	try {
-		await reloadDaemons(startupRef, modulesRoot, eventQueue, {
+		await reloadModules(startupRef, modulesRoot, eventQueue, {
 			abortSignal: options.abortSignal,
 			sandboxFactory: options.sandboxFactory,
 			initializeTimeoutMs: options.initializeTimeoutMs,
@@ -863,7 +745,27 @@ export async function bootstrapRuntime(
 		throw error;
 	}
 
-	return { modulesRoot, daemons: startupRef.current, eventQueue };
+	let timerScheduler: TimerScheduler;
+	try {
+		const timerManifests = await discoverTimerManifests(modulesRoot);
+		timerScheduler = startTimerSchedulers(
+			timerManifests,
+			eventQueue,
+			options.sessionStore,
+		);
+	} catch (error) {
+		eventQueue.close();
+		await stopDaemons(startupRef.current);
+		startupRef.current.length = 0;
+		throw error;
+	}
+
+	return {
+		modulesRoot,
+		daemons: startupRef.current,
+		eventQueue,
+		timerScheduler,
+	};
 }
 
 export async function stopDaemons(daemons: StartedDaemon[]): Promise<void> {
@@ -874,4 +776,4 @@ export async function stopDaemons(daemons: StartedDaemon[]): Promise<void> {
 	);
 }
 
-export type { DaemonState, StartedDaemon };
+export type { DaemonState, StartedDaemon, TimerScheduler };

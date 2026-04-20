@@ -74,8 +74,7 @@ If `JUSTCLAW_HOME` is set, the runtime uses that directory instead of `$HOME/jus
   "name": "{module-name}",
   "exec": "./{entrypoint}",
   "mode": "timer",
-  "cron": "0 9 * * 1-5",
-  "timezone": "Asia/Tokyo"
+  "cron": "0 9 * * 1-5"
 }
 ```
 
@@ -84,8 +83,8 @@ If `JUSTCLAW_HOME` is set, the runtime uses that directory instead of `$HOME/jus
 | | daemon | timer |
 |---|---|---|
 | Lifecycle | Long-running | One-shot (spawn, process, exit) |
-| Startup | When core starts | Core spawns on cron match |
-| Event emission | Write to stdout at any time | Return in handle response |
+| Startup | When core starts or `restart_modules` | Core spawns on cron match; schedules reload on `restart_modules` |
+| Event emission | Write to stdout at any time | Write to stdout before exit |
 | Process count per module | Always 1 | One per firing |
 
 ## Event Processing
@@ -126,8 +125,10 @@ Module (source)                    Core                         Module (target)
 
 ### Timer Execution
 
+- Cron expressions are evaluated in UTC.
 - Timer modules run **in parallel** (each timer spawned independently)
 - Independent of the LLM queue
+- If a cron tick fires while the previous run is still active, the core kills the previous process before spawning a new one
 
 ## Security
 

@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access, open, realpath } from "node:fs/promises";
 import path from "node:path";
-import type { DaemonModuleManifest } from "./module-manifest";
+import type { DaemonModuleManifest, TimerModuleManifest } from "./module-manifest";
 
 export type SandboxBackend = "bwrap" | "sandbox-exec";
 
@@ -401,7 +401,7 @@ function splitEnvAssignmentToken(token: string): [string, string] {
 }
 
 async function resolveShebangInterpreterPath(
-	manifest: DaemonModuleManifest,
+	manifest: DaemonModuleManifest | TimerModuleManifest,
 	env: NodeJS.ProcessEnv,
 	lookupExecutable: (
 		command: string,
@@ -498,7 +498,7 @@ function appendDestinationAncestors(
 
 export async function createLinuxBubblewrapCommand(
 	bwrapPath: string,
-	manifest: DaemonModuleManifest,
+	manifest: DaemonModuleManifest | TimerModuleManifest,
 	options: LinuxBubblewrapOptions = {},
 ): Promise<string[]> {
 	const env = options.env ?? process.env;
@@ -735,7 +735,7 @@ export async function createWorkspaceSandboxBaseCommand(
 }
 
 export async function createSandboxLaunchSpec(
-	manifest: DaemonModuleManifest,
+	manifest: DaemonModuleManifest | TimerModuleManifest,
 	options: SandboxOptions = {},
 ): Promise<SandboxLaunchSpec> {
 	const platform = options.platform ?? process.platform;

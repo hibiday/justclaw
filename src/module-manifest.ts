@@ -7,6 +7,7 @@ type RawManifest = {
 	exec?: unknown;
 	mode?: unknown;
 	replyable?: unknown;
+	cron?: unknown;
 };
 
 export type DaemonModuleManifest = {
@@ -16,6 +17,15 @@ export type DaemonModuleManifest = {
 	moduleDir: string;
 	execPath: string;
 	replyable: boolean;
+};
+
+export type TimerModuleManifest = {
+	name: string;
+	mode: "timer";
+	exec: string;
+	moduleDir: string;
+	execPath: string;
+	cron: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -102,7 +112,26 @@ export async function discoverDaemonManifests(
 				return null;
 			}
 
-			return parseDaemonManifest(moduleDir, entry.name, manifestText);
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(manifestText);
+			} catch {
+				throw new Error(
+					`Manifest ${path.join(moduleDir, "module.json")} is not valid JSON`,
+				);
+			}
+
+			if (!isRecord(parsed)) {
+				throw new Error(
+					`Manifest ${path.join(moduleDir, "module.json")} must be a JSON object`,
+				);
+			}
+
+			if (parsed.mode === "timer") {
+				return null;
+			}
+
+			return parseDaemonManifest(moduleDir, entry.name, parsed);
 		}),
 	);
 
@@ -114,17 +143,8 @@ export async function discoverDaemonManifests(
 export function parseDaemonManifest(
 	moduleDir: string,
 	directoryName: string,
-	manifestText: string,
+	parsed: unknown,
 ): DaemonModuleManifest {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(manifestText);
-	} catch {
-		throw new Error(
-			`Manifest ${path.join(moduleDir, "module.json")} is not valid JSON`,
-		);
-	}
-
 	if (!isRecord(parsed)) {
 		throw new Error(
 			`Manifest ${path.join(moduleDir, "module.json")} must be a JSON object`,
@@ -154,9 +174,6 @@ export function parseDaemonManifest(
 	const execPath = resolveModuleExecPath(moduleDir, exec);
 
 	if (mode !== "daemon") {
-		if (mode === "timer") {
-			throw new Error(`Timer modules are not implemented yet: ${name}`);
-		}
 		throw new Error(
 			`Manifest ${path.join(moduleDir, "module.json")} must declare mode "daemon"`,
 		);
@@ -170,4 +187,133 @@ export function parseDaemonManifest(
 		execPath,
 		replyable: replyable === true,
 	};
+}
+
+export function parseTimerManifest(
+	moduleDir: string,
+	directoryName: string,
+	parsed: unknown,
+): TimerModuleManifest {
+	if (!isRecord(parsed)) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} must be a JSON object`,
+		);
+	}
+
+	const { name, exec, mode, cron } = parsed satisfies RawManifest;
+
+	if (typeof name !== "string" || name.length === 0) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} must contain a non-empty string "name"`,
+		);
+	}
+
+	if (name !== directoryName) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} name must match directory "${directoryName}"`,
+		);
+	}
+
+	if (typeof exec !== "string" || exec.length === 0) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} must contain a non-empty string "exec"`,
+		);
+	}
+
+	const execPath = resolveModuleExecPath(moduleDir, exec);
+
+	if (mode !== "timer") {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} must declare mode "timer"`,
+		);
+	}
+
+	if (typeof cron !== "string" || cron.length === 0) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} must contain a non-empty string "cron"`,
+		);
+	}
+
+	let cronValid: boolean;
+	try {
+		cronValid = Bun.cron.parse(cron, new Date()) !== null;
+	} catch {
+		cronValid = false;
+	}
+	if (!cronValid) {
+		throw new Error(
+			`Manifest ${path.join(moduleDir, "module.json")} "cron" is not a valid cron expression or has no upcoming occurrences: "${cron}"`,
+		);
+	}
+
+	return {
+		name,
+		mode: "timer",
+		exec,
+		moduleDir,
+		execPath,
+		cron,
+	};
+}
+
+export async function discoverTimerManifests(
+	modulesRoot: string,
+): Promise<TimerModuleManifest[]> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(modulesRoot, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			throw new Error(`No modules directory found at ${modulesRoot}`);
+		}
+
+		throw new Error(
+			`Failed to read runtime modules directory ${modulesRoot}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
+	const manifests = await Promise.all(
+		entries.map(async (entry) => {
+			if (!entry.isDirectory()) {
+				return null;
+			}
+
+			const moduleDir = path.join(modulesRoot, entry.name);
+			const manifestPath = path.join(moduleDir, "module.json");
+			const manifestText = await readFile(manifestPath, "utf8").catch(
+				(error) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+						return null;
+					}
+
+					throw new Error(
+						`Failed to read manifest ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				},
+			);
+
+			if (manifestText === null) {
+				return null;
+			}
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(manifestText);
+			} catch {
+				throw new Error(
+					`Manifest ${manifestPath} is not valid JSON`,
+				);
+			}
+
+			if (!isRecord(parsed) || parsed.mode !== "timer") {
+				return null;
+			}
+
+			return parseTimerManifest(moduleDir, entry.name, parsed);
+		}),
+	);
+
+	return manifests
+		.filter((manifest) => manifest !== null)
+		.sort((left, right) => left.name.localeCompare(right.name));
 }

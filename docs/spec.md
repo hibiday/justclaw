@@ -33,7 +33,7 @@ A module may expose **tools** — request/response handlers the core can call. T
 
 Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without inspecting their schema.
 
-A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls).
+A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls). Both module types may send `sessions.*` requests to the core.
 
 ### Tool Definition Format
 
@@ -320,9 +320,14 @@ Core                            Module
  |-- initialize ----------------->|
  |<-- result -------------------- |
  |<-- event (notification) ------ |
- |-- shutdown ------------------->|
  |                            exit(0)
+ |  (core reaps process)          |
 ```
+
+## Timer Execution
+
+- Cron expressions are evaluated in UTC.
+- If a cron tick fires while the previous run for that module is still active, the core kills the previous process (SIGTERM, then SIGKILL after 1 second) before spawning a new one.
 
 ## Module Execution
 
@@ -331,6 +336,12 @@ Each daemon module directory contains a `module.json` manifest. Required fields:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `replyable` | boolean | `false` | When `true`, the core may deliver `message.send.v1` to this module and the LLM may use `send_message` / final text routing to this module. Non-replyable modules still receive tool calls and emit events; outbound user messaging is not routed to them. |
+
+Each timer module directory contains a `module.json` manifest. Required fields: `name` (must match the directory name), `mode` (`"timer"`), `exec` (path to the entrypoint, relative to the module directory), `cron` (schedule). Optional fields: none.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cron` | string | required | Cron expression (5-field, UTC) |
 
 When the core starts a module, it executes the manifest's `exec` path inside the platform sandbox. Linux uses `bwrap`; macOS uses `sandbox-exec`.
 
@@ -572,7 +583,7 @@ Trailing free-form assistant text after the LLM run is delivered the same way: o
 
 ### Built-in Tool: `restart_modules`
 
-Reloads daemon modules from the modules directory (same discovery path as startup). Manifest discovery and parsing run **before** any running module is stopped. If discovery or parsing fails, or if the directory contains no valid modules, existing processes stay up and the tool returns an error string.
+Reloads all modules (daemon and timer) from the modules directory (same discovery path as startup). Manifest discovery and parsing run **before** any running module is stopped. If discovery or parsing fails, or if the directory contains no valid daemon modules, existing processes stay up and the tool returns an error string. If discovery succeeds but a daemon fails to start, all daemons and all timer schedulers are stopped and the tool returns an error string; timer modules will not fire until the next successful reload.
 
 ```
 restart_modules({ continuation: string })

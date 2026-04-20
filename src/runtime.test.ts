@@ -19,12 +19,14 @@ import { JsonRpcPeer } from "./jsonrpc";
 import { runLlmLoop } from "./llm-loop";
 import {
 	discoverDaemonManifests,
+	discoverTimerManifests,
 	parseDaemonManifest,
+	parseTimerManifest,
 	resolveModulesRoot,
 } from "./module-manifest";
 import {
 	bootstrapRuntime,
-	reloadDaemons,
+	reloadModules,
 	type StartedDaemon,
 	startDaemon,
 	stopDaemons,
@@ -191,7 +193,7 @@ async function writeDaemonModule(
 	moduleName: string,
 	script: string,
 ): Promise<void> {
-	await writeRawDaemonModule(
+	await writeRawModule(
 		homeDir,
 		moduleName,
 		JSON.stringify({
@@ -203,7 +205,7 @@ async function writeDaemonModule(
 	);
 }
 
-async function writeRawDaemonModule(
+async function writeRawModule(
 	homeDir: string,
 	moduleName: string,
 	manifestText: string,
@@ -318,7 +320,7 @@ describe("parseDaemonManifest", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		expect(manifest.name).toBe("example");
@@ -330,12 +332,12 @@ describe("parseDaemonManifest", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({
+			{
 				name: "example",
 				exec: "./run",
 				mode: "daemon",
 				replyable: true,
-			}),
+			},
 		);
 		expect(manifest.replyable).toBe(true);
 	});
@@ -345,9 +347,9 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "example", exec: "./run", mode: "timer" }),
+				{ name: "example", exec: "./run", mode: "timer" },
 			),
-		).toThrow("Timer modules are not implemented yet");
+		).toThrow('must declare mode "daemon"');
 	});
 
 	test("rejects directory/name mismatch", () => {
@@ -355,7 +357,7 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "other", exec: "./run", mode: "daemon" }),
+				{ name: "other", exec: "./run", mode: "daemon" },
 			),
 		).toThrow('name must match directory "example"');
 	});
@@ -365,7 +367,7 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "example", mode: "daemon" }),
+				{ name: "example", mode: "daemon" },
 			),
 		).toThrow('must contain a non-empty string "exec"');
 	});
@@ -375,11 +377,11 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({
+				{
 					name: "example",
 					exec: "/usr/bin/python",
 					mode: "daemon",
-				}),
+				},
 			),
 		).toThrow('"exec" must be relative to the module directory');
 	});
@@ -389,7 +391,7 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "example", exec: "../run", mode: "daemon" }),
+				{ name: "example", exec: "../run", mode: "daemon" },
 			),
 		).toThrow('"exec" must stay inside the module directory');
 	});
@@ -398,7 +400,7 @@ describe("parseDaemonManifest", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./..bin/run", mode: "daemon" }),
+			{ name: "example", exec: "./..bin/run", mode: "daemon" },
 		);
 
 		expect(manifest.execPath).toBe(path.resolve("/tmp/example/..bin/run"));
@@ -409,7 +411,7 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "", exec: "./run", mode: "daemon" }),
+				{ name: "", exec: "./run", mode: "daemon" },
 			),
 		).toThrow('must contain a non-empty string "name"');
 	});
@@ -419,9 +421,141 @@ describe("parseDaemonManifest", () => {
 			parseDaemonManifest(
 				"/tmp/example",
 				"example",
-				JSON.stringify({ name: "example", exec: "./run", mode: "other" }),
+				{ name: "example", exec: "./run", mode: "other" },
 			),
 		).toThrow('must declare mode "daemon"');
+	});
+});
+
+describe("parseTimerManifest", () => {
+	test("accepts a valid timer manifest", () => {
+		const manifest = parseTimerManifest(
+			"/tmp/tick",
+			"tick",
+			{
+				name: "tick",
+				exec: "./run",
+				mode: "timer",
+				cron: "0 9 * * 1-5",
+			},
+		);
+
+		expect(manifest.name).toBe("tick");
+		expect(manifest.mode).toBe("timer");
+		expect(manifest.cron).toBe("0 9 * * 1-5");
+		expect(manifest.execPath).toBe(path.resolve("/tmp/tick", "./run"));
+	});
+
+	test("rejects daemon mode", () => {
+		expect(() =>
+			parseTimerManifest(
+				"/tmp/example",
+				"example",
+				{ name: "example", exec: "./run", mode: "daemon" },
+			),
+		).toThrow('must declare mode "timer"');
+	});
+
+	test("rejects missing cron", () => {
+		expect(() =>
+			parseTimerManifest(
+				"/tmp/example",
+				"example",
+				{ name: "example", exec: "./run", mode: "timer" },
+			),
+		).toThrow('must contain a non-empty string "cron"');
+	});
+
+	test("rejects empty cron string", () => {
+		expect(() =>
+			parseTimerManifest(
+				"/tmp/example",
+				"example",
+				{
+					name: "example",
+					exec: "./run",
+					mode: "timer",
+					cron: "",
+				},
+			),
+		).toThrow('must contain a non-empty string "cron"');
+	});
+
+	test("rejects invalid cron expression", () => {
+		expect(() =>
+			parseTimerManifest(
+				"/tmp/example",
+				"example",
+				{
+					name: "example",
+					exec: "./run",
+					mode: "timer",
+					cron: "not-a-cron",
+				},
+			),
+		).toThrow('"cron" is not a valid cron expression');
+	});
+});
+
+describe("discoverTimerManifests", () => {
+	test("discovers timer modules and skips daemon directories", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const modulesRoot = resolveModulesRoot(undefined, homeDir);
+		await writeDaemonModule(homeDir, "echo", createModuleScript());
+		await writeRawModule(
+			homeDir,
+			"ticker",
+			JSON.stringify({
+				name: "ticker",
+				exec: "./module.ts",
+				mode: "timer",
+				cron: "0 0 * * *",
+			}),
+			"#!/usr/bin/env bun\nconsole.log('noop');\n",
+		);
+
+		const manifests = await discoverTimerManifests(modulesRoot);
+
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.name).toBe("ticker");
+		expect(manifests[0]?.cron).toBe("0 0 * * *");
+	});
+
+	test("fails when manifest JSON is invalid", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		await writeRawModule(
+			homeDir,
+			"bad-timer",
+			"{oops",
+			"#!/usr/bin/env bun\nconsole.log('noop');\n",
+		);
+		const modulesRoot = resolveModulesRoot(undefined, homeDir);
+
+		await expect(discoverTimerManifests(modulesRoot)).rejects.toThrow(
+			"is not valid JSON",
+		);
+	});
+});
+
+describe("discoverDaemonManifests", () => {
+	test("skips timer-only module directories", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const modulesRoot = resolveModulesRoot(undefined, homeDir);
+		await writeRawModule(
+			homeDir,
+			"only-timer",
+			JSON.stringify({
+				name: "only-timer",
+				exec: "./module.ts",
+				mode: "timer",
+				cron: "0 0 * * *",
+			}),
+			"#!/usr/bin/env bun\nconsole.log('noop');\n",
+		);
+
+		const manifests = await discoverDaemonManifests(modulesRoot);
+
+		expect(manifests).toHaveLength(0);
 	});
 });
 
@@ -717,7 +851,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -746,7 +880,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -777,7 +911,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -798,7 +932,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			moduleDir,
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const spec = await createSandboxLaunchSpec(manifest, {
@@ -818,7 +952,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 		const existingPaths = new Set([
 			"/bin",
@@ -857,7 +991,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			moduleDir,
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -877,7 +1011,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -904,7 +1038,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -933,7 +1067,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -961,7 +1095,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -985,7 +1119,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1007,7 +1141,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1028,7 +1162,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1063,7 +1197,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			moduleDir,
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1096,7 +1230,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
@@ -1119,7 +1253,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1139,7 +1273,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1169,7 +1303,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
@@ -1185,7 +1319,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		await expect(
@@ -1199,7 +1333,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		await expect(
@@ -1214,7 +1348,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 
 		await expect(
@@ -1229,7 +1363,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 		const env = { ...process.env, OPENAI_API_KEY: "test-key" };
 
@@ -1247,7 +1381,7 @@ describe("sandbox", () => {
 		const manifest = parseDaemonManifest(
 			"/tmp/example",
 			"example",
-			JSON.stringify({ name: "example", exec: "./run", mode: "daemon" }),
+			{ name: "example", exec: "./run", mode: "daemon" },
 		);
 		const env = { ...process.env, TMPDIR: "/var/tmp/custom" };
 
@@ -1265,7 +1399,7 @@ describe("sandbox", () => {
 	});
 });
 
-describe("reloadDaemons", () => {
+describe("reloadModules", () => {
 	test("rejects empty modules directory and leaves running daemons untouched", async () => {
 		const homeDir = await createTempDir("justclaw-reload-empty-");
 		await writeDaemonModule(homeDir, "solo", createModuleScript());
@@ -1282,7 +1416,7 @@ describe("reloadDaemons", () => {
 		try {
 			await rm(path.join(runtime.modulesRoot, "solo"), { recursive: true });
 			await expect(
-				reloadDaemons(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
+				reloadModules(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
 					sessionStore: ctx.sessionStore,
 					sandboxFactory: async (manifest) =>
 						createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1311,14 +1445,14 @@ describe("reloadDaemons", () => {
 		const daemonsRef = { current: runtime.daemons };
 		const before = daemonsRef.current.map((d) => d.manifest.name).sort();
 		try {
-			await writeRawDaemonModule(
+			await writeRawModule(
 				homeDir,
 				"bad",
 				"{not json",
 				createModuleScript(),
 			);
 			await expect(
-				reloadDaemons(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
+				reloadModules(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
 					sessionStore: ctx.sessionStore,
 					sandboxFactory: async (manifest) =>
 						createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1348,7 +1482,7 @@ describe("reloadDaemons", () => {
 		const daemonsRef = { current: runtime.daemons };
 		try {
 			await rm(path.join(runtime.modulesRoot, "gone"), { recursive: true });
-			await reloadDaemons(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
+			await reloadModules(daemonsRef, runtime.modulesRoot, runtime.eventQueue, {
 				sessionStore: ctx.sessionStore,
 				sandboxFactory: async (manifest) =>
 					createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -1433,7 +1567,7 @@ describe("bootstrapRuntime", () => {
 
 	test("fails when manifest JSON is invalid", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
-		await writeRawDaemonModule(
+		await writeRawModule(
 			homeDir,
 			"bad-manifest",
 			"{oops",
@@ -3360,7 +3494,7 @@ describe("runLlmLoop restart_modules integration", () => {
 
 	test("after restart_modules, send_message still reaches replyable module", async () => {
 		const homeDir = await createTempDir("justclaw-llm-rst-stale-send-");
-		await writeRawDaemonModule(
+		await writeRawModule(
 			homeDir,
 			"mod",
 			JSON.stringify({
@@ -3421,7 +3555,7 @@ describe("runLlmLoop restart_modules integration", () => {
 
 	test("after restart_modules, empty finalOutput matches a terminated LLM turn", async () => {
 		const homeDir = await createTempDir("justclaw-llm-rst-no-final-");
-		await writeRawDaemonModule(
+		await writeRawModule(
 			homeDir,
 			"mod",
 			JSON.stringify({
@@ -3598,7 +3732,7 @@ describe("send_message replyable enforcement", () => {
 
 	test("succeeds when target module is replyable", async () => {
 		const homeDir = await createTempDir("justclaw-llm-send-replyable-");
-		await writeRawDaemonModule(
+		await writeRawModule(
 			homeDir,
 			"mod",
 			JSON.stringify({
