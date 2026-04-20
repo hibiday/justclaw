@@ -23,6 +23,7 @@ import {
 	parseDaemonManifest,
 	parseTimerManifest,
 	resolveModulesRoot,
+	type TimerModuleManifest,
 } from "./module-manifest";
 import {
 	bootstrapRuntime,
@@ -39,6 +40,7 @@ import {
 	type SandboxLaunchSpec,
 } from "./sandbox";
 import { SessionStore } from "./session-store";
+import { fireTimer } from "./timer-runner";
 
 const tempDirs: string[] = [];
 const originalJustclawHome = process.env.JUSTCLAW_HOME;
@@ -3758,5 +3760,188 @@ describe("send_message replyable enforcement", () => {
 		await stopDaemons(daemonsRef.current);
 
 		expect(sendResult).toBe("ok");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// fireTimer
+// ---------------------------------------------------------------------------
+
+function createTimerScript(
+	event: Record<string, unknown> = { kind: "tick", text: "fired" },
+): string {
+	return `#!/usr/bin/env bun
+const event = ${JSON.stringify(event)};
+const lines = [];
+for await (const chunk of Bun.stdin.stream()) {
+  lines.push(chunk);
+  const text = Buffer.concat(lines).toString("utf8");
+  const inputLines = text.split(/\\r?\\n/);
+  while (inputLines.length > 1) {
+    const line = inputLines.shift();
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }) + "\\n");
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", ...event } }) + "\\n");
+      process.exit(0);
+    }
+  }
+  lines.length = 0;
+  if (inputLines[0]) lines.push(Buffer.from(inputLines[0]));
+}
+`;
+}
+
+function createHangingTimerScript(): string {
+	return `#!/usr/bin/env bun
+const lines = [];
+for await (const chunk of Bun.stdin.stream()) {
+  lines.push(chunk);
+  const text = Buffer.concat(lines).toString("utf8");
+  const inputLines = text.split(/\\r?\\n/);
+  while (inputLines.length > 1) {
+    const line = inputLines.shift();
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }) + "\\n");
+    }
+  }
+  lines.length = 0;
+  if (inputLines[0]) lines.push(Buffer.from(inputLines[0]));
+}
+`;
+}
+
+async function writeTimerModule(
+	homeDir: string,
+	moduleName: string,
+	script: string,
+): Promise<TimerModuleManifest> {
+	const modulesRoot = resolveModulesRoot(undefined, homeDir);
+	const moduleDir = path.join(modulesRoot, moduleName);
+	await mkdir(moduleDir, { recursive: true });
+	await writeFile(
+		path.join(moduleDir, "module.json"),
+		JSON.stringify({
+			name: moduleName,
+			mode: "timer",
+			exec: "./module.ts",
+			cron: "* * * * *",
+		}),
+	);
+	const scriptPath = path.join(moduleDir, "module.ts");
+	await writeFile(scriptPath, script);
+	await chmod(scriptPath, 0o755);
+	return {
+		name: moduleName,
+		mode: "timer",
+		exec: "./module.ts",
+		moduleDir,
+		execPath: scriptPath,
+		cron: "* * * * *",
+	};
+}
+
+describe("fireTimer", () => {
+	test("emits event to queue when module fires and exits", async () => {
+		const homeDir = await createTempDir("justclaw-timer-fire-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createTimerScript({ kind: "tick", text: "hello" }),
+		);
+		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
+			process: null,
+		};
+
+		try {
+			// Register waiter before firing so enqueue() delivers as 'running'
+			const eventPromise = queue.next();
+			await fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory: async (m) =>
+					createUnsandboxedSpec(m.moduleDir, m.execPath),
+			});
+
+			const event = await eventPromise;
+			expect(event?.source).toBe("tick");
+			expect(event?.params.type).toBe("event.v1");
+			expect(event?.params.text).toBe("hello");
+		} finally {
+			queue.close();
+		}
+	});
+
+	test("kills previous process before spawning when fired again", async () => {
+		const homeDir = await createTempDir("justclaw-timer-kill-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createTimerScript(),
+		);
+
+		// Pre-populate state with a hanging process to simulate a previous run still active
+		const prevProc = Bun.spawn({
+			cmd: ["sleep", "30"],
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const state = {
+			process: prevProc as unknown as Bun.Subprocess<
+				"pipe",
+				"pipe",
+				"pipe"
+			> | null,
+		};
+
+		try {
+			const eventPromise = queue.next();
+			await fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory: async (m) =>
+					createUnsandboxedSpec(m.moduleDir, m.execPath),
+			});
+
+			// Previous process must have been killed
+			await expect(prevProc.exited).resolves.toBeNumber();
+			// New run emits its event
+			const event = await eventPromise;
+			expect(event?.source).toBe("tick");
+		} finally {
+			queue.close();
+			if (prevProc.exitCode === null) prevProc.kill("SIGKILL");
+		}
+	});
+
+	test("logs and returns when initialize times out", async () => {
+		const homeDir = await createTempDir("justclaw-timer-timeout-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"slow",
+			createHangingTimerScript(),
+		);
+		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
+			process: null,
+		};
+
+		try {
+			await fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory: async (m) =>
+					createUnsandboxedSpec(m.moduleDir, m.execPath),
+				initializeTimeoutMs: 50,
+			});
+
+			expect(state.process).toBeNull();
+			expect(queue.stale()).toHaveLength(0);
+		} finally {
+			queue.close();
+		}
 	});
 });

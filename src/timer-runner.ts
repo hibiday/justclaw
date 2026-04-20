@@ -109,7 +109,7 @@ function createTimerModulePeer(
 	});
 }
 
-async function fireTimer(
+export async function fireTimer(
 	manifest: TimerModuleManifest,
 	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
 	queue: EventQueue,
