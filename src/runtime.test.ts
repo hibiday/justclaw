@@ -3793,27 +3793,6 @@ for await (const chunk of Bun.stdin.stream()) {
 `;
 }
 
-function createHangingTimerScript(): string {
-	return `#!/usr/bin/env bun
-const lines = [];
-for await (const chunk of Bun.stdin.stream()) {
-  lines.push(chunk);
-  const text = Buffer.concat(lines).toString("utf8");
-  const inputLines = text.split(/\\r?\\n/);
-  while (inputLines.length > 1) {
-    const line = inputLines.shift();
-    if (!line) continue;
-    const message = JSON.parse(line);
-    if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }) + "\\n");
-    }
-  }
-  lines.length = 0;
-  if (inputLines[0]) lines.push(Buffer.from(inputLines[0]));
-}
-`;
-}
-
 async function writeTimerModule(
 	homeDir: string,
 	moduleName: string,
@@ -3922,10 +3901,11 @@ describe("fireTimer", () => {
 		const homeDir = await createTempDir("justclaw-timer-timeout-");
 		const ctx = createSessionContext(homeDir);
 		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		// Script that never responds to initialize (hangs reading stdin)
 		const manifest = await writeTimerModule(
 			homeDir,
 			"slow",
-			createHangingTimerScript(),
+			"#!/usr/bin/env bun\nfor await (const _ of Bun.stdin.stream()) {}\n",
 		);
 		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
 			process: null,
