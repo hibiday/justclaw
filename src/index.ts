@@ -1,6 +1,10 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { loadHomeAgentsFile, resolveCharacterDir } from "./agent-context";
+import {
+	loadHomeAgentsFile,
+	resolveCharacterDir,
+	resolveSkillsDir,
+} from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import {
 	bootstrapRuntime,
@@ -58,8 +62,10 @@ async function main(): Promise<void> {
 		const workspaceDir = resolveWorkspaceDir();
 		const historyDir = resolveHistoryDir();
 		const characterDir = resolveCharacterDir();
+		const skillsDir = resolveSkillsDir();
 		mkdirSync(workspaceDir, { recursive: true });
 		mkdirSync(characterDir, { recursive: true });
+		mkdirSync(skillsDir, { recursive: true });
 		const sessionStore = new SessionStore(historyDir);
 		await sessionStore.ensureDefaultSessionIfEmpty();
 		const result = await bootstrapRuntime({
@@ -77,6 +83,7 @@ async function main(): Promise<void> {
 			process.platform,
 			characterDir,
 			result.modulesRoot,
+			skillsDir,
 		);
 
 		// If shutdown wins the race, we do not await runLlmLoop afterward. Main
@@ -93,6 +100,7 @@ async function main(): Promise<void> {
 				characterDir,
 				operatorContext: operatorContext || undefined,
 				modulesRoot: result.modulesRoot,
+				skillsDir,
 				abortSignal: abortController.signal,
 				timerSchedulerRef: timerSchedulerRef as { current: TimerScheduler },
 			}),

@@ -11,7 +11,7 @@ import {
 	tool,
 } from "@openai/agents";
 import OpenAI from "openai";
-import { loadAgentContext } from "./agent-context";
+import { loadAgentContext, loadSkillsIndex } from "./agent-context";
 import { notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
@@ -234,6 +234,7 @@ export type LlmLoopOptions = {
 	contextInstructions?: string;
 	operatorContext?: string;
 	modulesRoot?: string;
+	skillsDir?: string;
 	sandboxFactory?: BootstrapRuntimeOptions["sandboxFactory"];
 	initializeTimeoutMs?: BootstrapRuntimeOptions["initializeTimeoutMs"];
 	abortSignal?: BootstrapRuntimeOptions["abortSignal"];
@@ -657,6 +658,9 @@ export async function runLlmLoop(
 			replyable: d.manifest.replyable,
 			tools: d.tools.map((t) => t.name),
 		}));
+		const skills = options?.skillsDir
+			? await loadSkillsIndex(options.skillsDir)
+			: undefined;
 		const instructions = buildSystemPrompt({
 			contextInstructions,
 			workspaceDir: options?.workspaceDir,
@@ -664,6 +668,8 @@ export async function runLlmLoop(
 			characterDir: options?.characterDir,
 			modulesRoot: options?.modulesRoot,
 			modules,
+			skillsDir: options?.skillsDir,
+			skills,
 		});
 		const agent = baseAgent.clone({
 			tools,
