@@ -16,6 +16,7 @@ import { notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
 	type EventQueue,
+	LAST_REPLYABLE_TARGET_META_KEY,
 	type QueuedEvent,
 	timestampFromUUIDv7,
 } from "./event-queue";
@@ -459,7 +460,16 @@ export async function runLlmLoop(
 			continue;
 		}
 
-		let currentTarget = event.source;
+		const sourceDaemon = daemonsRef.current.find(
+			(d) => d.manifest.name === event.source,
+		);
+		if (sourceDaemon?.manifest.replyable === true) {
+			eventQueue.setMeta(LAST_REPLYABLE_TARGET_META_KEY, event.source);
+		}
+		const fallbackTarget =
+			eventQueue.getMeta(LAST_REPLYABLE_TARGET_META_KEY) ?? event.source;
+		let currentTarget =
+			sourceDaemon?.manifest.replyable === true ? event.source : fallbackTarget;
 
 		const restartModulesTool = tool({
 			name: "restart_modules",
