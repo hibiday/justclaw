@@ -78,9 +78,6 @@ async function main(): Promise<void> {
 			characterDir,
 			result.modulesRoot,
 		);
-		console.error(
-			`Loaded ${daemonsRef.current.length} daemon module(s) from ${result.modulesRoot}`,
-		);
 
 		// If shutdown wins the race, we do not await runLlmLoop afterward. Main
 		// returns once shutdownTask finishes; runLlmLoop may still be blocked on

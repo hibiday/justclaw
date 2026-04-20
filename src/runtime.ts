@@ -716,6 +716,9 @@ export async function reloadModules(
 			options.sessionStore,
 			{ initializeTimeoutMs: options.initializeTimeoutMs },
 		);
+		console.error(
+			`[core] reloaded: ${daemonsRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,
+		);
 	}
 }
 
@@ -769,6 +772,9 @@ export async function bootstrapRuntime(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
+		);
+		console.error(
+			`[core] started: ${startupRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,
 		);
 	} catch (error) {
 		eventQueue.close();
