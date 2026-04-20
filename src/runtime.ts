@@ -124,20 +124,30 @@ function sleep(ms: number): Promise<void> {
 	});
 }
 
+type EventParams = Record<string, unknown> & {
+	type: "event.v1" | "image.send.v1" | "file.send.v1";
+};
+
 function parseEventNotificationParams(
 	moduleName: string,
 	params: unknown,
-): Record<string, unknown> & { type: "event.v1" } {
+): EventParams {
 	if (typeof params !== "object" || params === null || Array.isArray(params)) {
 		throw new Error(`${moduleName}: event params must be an object`);
 	}
 
 	const record = params as Record<string, unknown>;
-	if (record.type !== "event.v1") {
-		throw new Error(`${moduleName}: event type must be "event.v1"`);
+	if (
+		record.type !== "event.v1" &&
+		record.type !== "image.send.v1" &&
+		record.type !== "file.send.v1"
+	) {
+		throw new Error(
+			`${moduleName}: event type must be "event.v1", "image.send.v1", or "file.send.v1"`,
+		);
 	}
 
-	return record as Record<string, unknown> & { type: "event.v1" };
+	return record as EventParams;
 }
 
 function parseInitializeResult(

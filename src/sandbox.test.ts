@@ -130,7 +130,7 @@ describe("workspace sandbox profiles", () => {
 				pathExists,
 				realPath: async (p) => p,
 				bindHistoryDir: true,
-				modulesDir: "/mods",
+				modulesRoot: "/mods",
 			},
 		);
 		expect(cmd.join(" ")).toContain("--bind /mods /mods");
