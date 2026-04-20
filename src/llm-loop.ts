@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
 	Agent,
 	type AgentInputItem,
@@ -25,6 +26,7 @@ import {
 } from "./runtime";
 import type { SessionStore } from "./session-store";
 import { buildSystemPrompt } from "./system-prompt";
+import { runReadFileBase64 } from "./workspace";
 
 setTracingDisabled(true);
 
@@ -94,6 +96,35 @@ export function eventToXml(event: QueuedEvent): string {
 	return inner
 		? `<event ${attrs}>\n${inner}\n</event>`
 		: `<event ${attrs}></event>`;
+}
+
+function inferImageMediaType(filePath: string): string {
+	switch (path.extname(filePath).toLowerCase()) {
+		case ".png":
+			return "image/png";
+		case ".jpg":
+		case ".jpeg":
+			return "image/jpeg";
+		case ".gif":
+			return "image/gif";
+		case ".webp":
+			return "image/webp";
+		default:
+			return "image/jpeg";
+	}
+}
+
+function inferFileMediaType(filePath: string): string {
+	switch (path.extname(filePath).toLowerCase()) {
+		case ".pdf":
+			return "application/pdf";
+		case ".txt":
+			return "text/plain";
+		case ".csv":
+			return "text/csv";
+		default:
+			return "application/octet-stream";
+	}
 }
 
 function wrapWithNotification(
@@ -391,10 +422,15 @@ export async function runLlmLoop(
 			continue;
 		}
 
-		// QueuedEvent.params is untyped; only event.v1 may reach the LLM.
-		if (event.params.type !== "event.v1") {
+		// QueuedEvent.params is untyped; only LLM-bound envelope types reach the model.
+		const envelopeType = event.params.type;
+		if (
+			envelopeType !== "event.v1" &&
+			envelopeType !== "image.send.v1" &&
+			envelopeType !== "file.send.v1"
+		) {
 			console.warn(
-				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(event.params.type)} (expected event.v1); dropping`,
+				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(envelopeType)} (expected event.v1, image.send.v1, or file.send.v1); dropping`,
 			);
 			eventQueue.complete(event.id);
 			continue;
@@ -482,6 +518,118 @@ export async function runLlmLoop(
 				currentTarget = name;
 			}),
 			restartModulesTool,
+			tool({
+				name: "send_image",
+				description:
+					"Read a local image file and deliver it to the LLM as image input on the next event. " +
+					"The current run continues normally after this call; the image arrives in the next cycle.",
+				parameters: {
+					type: "object",
+					properties: {
+						path: {
+							type: "string",
+							description: "Path to the image file",
+						},
+					},
+					required: ["path"],
+					additionalProperties: false,
+				},
+				strict: true,
+				execute: async (input: unknown) => {
+					if (
+						options === undefined ||
+						options.workspaceDir === undefined ||
+						options.workspaceDir === ""
+					) {
+						return "error: workspace not configured";
+					}
+					const {
+						workspaceDir,
+						historyDir: historyDirOpt,
+						characterDir,
+						modulesRoot,
+					} = options;
+					const historyDir = historyDirOpt ?? workspaceDir;
+					const { path: pathArg } = input as { path: string };
+					const resolved = path.resolve(pathArg);
+					const read = await runReadFileBase64(
+						workspaceDir,
+						historyDir,
+						process.platform,
+						resolved,
+						characterDir,
+						modulesRoot,
+					);
+					if (!read.ok) {
+						return `error: ${read.stderr.trim() || "read failed"}`;
+					}
+					const data = read.content;
+					const mediaType = inferImageMediaType(resolved);
+					eventQueue.enqueue(event.source, {
+						type: "image.send.v1",
+						data,
+						mediaType,
+					});
+					return "ok";
+				},
+			}),
+			tool({
+				name: "send_file",
+				description:
+					"Read a local file and deliver it as file content to the LLM on the next event. " +
+					"Suitable for PDFs and other documents. The file arrives in the next cycle.",
+				parameters: {
+					type: "object",
+					properties: {
+						path: {
+							type: "string",
+							description: "Path to the file",
+						},
+					},
+					required: ["path"],
+					additionalProperties: false,
+				},
+				strict: true,
+				execute: async (input: unknown) => {
+					if (
+						options === undefined ||
+						options.workspaceDir === undefined ||
+						options.workspaceDir === ""
+					) {
+						return "error: workspace not configured";
+					}
+					const {
+						workspaceDir,
+						historyDir: historyDirOpt,
+						characterDir,
+						modulesRoot,
+					} = options;
+					const historyDir = historyDirOpt ?? workspaceDir;
+					const { path: pathArg } = input as { path: string };
+					const resolved = path.resolve(pathArg);
+					const read = await runReadFileBase64(
+						workspaceDir,
+						historyDir,
+						process.platform,
+						resolved,
+						characterDir,
+						modulesRoot,
+					);
+					if (!read.ok) {
+						return `error: ${read.stderr.trim() || "read failed"}`;
+					}
+					const data = read.content;
+					const mediaType = inferFileMediaType(resolved);
+					const filename = path.basename(resolved);
+					eventQueue.enqueue(event.source, {
+						type: "file.send.v1",
+						data,
+						mediaType,
+						filename,
+					});
+					return "ok";
+				},
+			}),
 		];
 
 		const characterContext = options?.characterDir
@@ -526,17 +674,39 @@ export async function runLlmLoop(
 			},
 		});
 		const xml = eventToXml(event);
+		const userInput: AgentInputItem =
+			event.params.type === "image.send.v1"
+				? ({
+						role: "user",
+						content: [
+							{ type: "input_text", text: xml },
+							{
+								type: "input_image",
+								image: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+							},
+						],
+					} as AgentInputItem)
+				: event.params.type === "file.send.v1"
+					? ({
+							role: "user",
+							content: [
+								{ type: "input_text", text: xml },
+								{
+									type: "input_file",
+									file: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+								},
+							],
+						} as AgentInputItem)
+					: ({ role: "user", content: xml } as AgentInputItem);
 
 		try {
-			const result = await runner.run(
-				agent,
+			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
-					? [
-							...session.history,
-							{ role: "user", content: xml } as AgentInputItem,
-						]
-					: xml,
-			);
+					? [...session.history, userInput]
+					: event.params.type === "event.v1"
+						? xml
+						: [userInput];
+			const result = await runner.run(agent, runInput);
 			const text = result.finalOutput;
 			if (text?.trim()) {
 				const targetDaemon = daemonsRef.current.find(

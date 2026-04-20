@@ -75,7 +75,13 @@ For ordinary event semantics, modules should use another payload field such as `
 
 ## Module → Core Notification Types
 
-Modules emit LLM-bound events as notifications with `method: "event"`. The `type` field must be `"event.v1"`.
+Modules emit LLM-bound events as notifications with `method: "event"`. The `type` field selects the envelope. Supported values:
+
+| `type` | Purpose |
+|---|---|
+| `event.v1` | Canonical text-oriented event; payload fields are converted to XML for the LLM (see [Event Format for LLM](#event-format-for-llm)). |
+| `image.send.v1` | Delivers a base64-encoded image on the **next** LLM cycle (see below). |
+| `file.send.v1` | Delivers a base64-encoded file (for example a PDF) on the **next** LLM cycle (see below). |
 
 ```json
 {
@@ -89,7 +95,28 @@ Modules emit LLM-bound events as notifications with `method: "event"`. The `type
 }
 ```
 
-See [Event Format for LLM](#event-format-for-llm) for how the payload reaches the LLM.
+See [Event Format for LLM](#event-format-for-llm) for how each envelope reaches the LLM.
+
+### `image.send.v1`
+
+Emitted by a module (or enqueued by the built-in `send_image` tool) to attach image bytes on the next dequeue. Params:
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `image.send.v1` |
+| `data` | string | Base64-encoded image bytes (no validation; consumer is the LLM) |
+| `mediaType` | string | MIME type (for example `image/png`) |
+
+### `file.send.v1`
+
+Emitted by a module (or enqueued by the built-in `send_file` tool) to attach a document on the next dequeue. Params:
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `file.send.v1` |
+| `data` | string | Base64-encoded file bytes |
+| `mediaType` | string | MIME type (for example `application/pdf`) |
+| `filename` | string | Basename for the file slot |
 
 ## Module → Core Session Requests
 
@@ -549,6 +576,30 @@ The bundled LLM loop implements this as a core tool (not wrapped with `tool_call
 
 **Turn boundary:** After `restart_modules` **succeeds**, processes match disk and the current LLM run ends immediately after that tool call. The agent does not continue with more tool calls or trailing free-form text in the reloaded state. The **next** `event.v1` shows the new module table and runs normally against the reloaded modules. Use a non-empty `continuation` when you want the core to enqueue exactly one handoff event under that new module set.
 
+### Built-in Tool: `send_image`
+
+```
+send_image({ path: string })
+```
+
+| Parameter | Description |
+|---|---|
+| `path` | Path to a local image file on the host |
+
+The core reads the file, infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+
+### Built-in Tool: `send_file`
+
+```
+send_file({ path: string })
+```
+
+| Parameter | Description |
+|---|---|
+| `path` | Path to a local file on the host |
+
+The core reads the file, infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `send_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+
 ### Built-in Tool: `shell`
 
 Executes shell commands sequentially inside the workspace sandbox. Each command runs as `sh -c <command>`. Commands do not share state between calls.
@@ -584,9 +635,11 @@ The path is resolved to an absolute path. After each invocation the core emits a
 
 ## Event Format for LLM
 
-Event payloads are arbitrary JSON objects. The canonical event envelope uses `type: "event.v1"`. The core uses `type` for envelope handling and does not forward it to the LLM. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
+Event payloads are arbitrary JSON objects. The canonical text-oriented envelope is `type: "event.v1"`. The core uses `type` for envelope handling and does not forward that field to the LLM as a literal key in the user string. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
-**Conversion rules:**
+**Multimodal envelopes (`image.send.v1`, `file.send.v1`):** The core still builds the same XML wrapper (`eventToXml`) from the payload (with `type` stripped before serialization). That XML is passed as an `input_text` part. In addition, the core passes a second content part: `input_image` and `input_file` both use a **data URL string** (`data:<mediaType>;base64,<data>`), matching what the Chat Completions path accepts. These rows are processed in the same session-adoption path as `event.v1`.
+
+**Conversion rules (for the XML half):**
 
 - Object keys become XML element names
 - Strings, numbers, and booleans become text content
