@@ -26,17 +26,17 @@ Your primary working area for file operations. Files here persist across session
 
 Execute shell commands sequentially inside the workspace sandbox. Each command runs as \`sh -c <command>\` and does not share state with prior calls.
 
-### edit(type, path, content?, old?, new?)
+### create_file(path, content)
 
-**create_file** — write full content to a new file (content field).
-**edit_file** — replace a string in an existing file. old must match exactly once; if not unique, include more surrounding context.
-**delete_file** — remove a file.
+Write full content to a file. Overwrites the file if it already exists.
 
-\`\`\`
-{ "type": "create_file", "path": "/abs/path/file.txt", "content": "..." }
-{ "type": "edit_file", "path": "/abs/path/file.txt", "old": "...", "new": "..." }
-{ "type": "delete_file", "path": "/abs/path/file.txt" }
-\`\`\`
+### edit_file(path, old, new)
+
+Replace a substring in an existing file. old must match exactly once; if not unique, include more surrounding context.
+
+### delete_file(path)
+
+Delete a file.
 
 ## History
 
@@ -64,6 +64,7 @@ Files that define your identity and memory. You have read-write access. These fi
 | IDENTITY.md | Personality, tone, and style |
 | USER.md | User information and preferences |
 | MEMORY.md | Cross-session memory |
+| INIT.md | Startup tasks — injected as an event when a new empty session begins |
 
 ## Modules
 
@@ -74,17 +75,18 @@ Modules directory: ${modulesRoot}
 ${moduleRows}
 
 Module tools are called as {module}__{tool}.
-send_message(module, text) delivers a message to a replyable module and routes subsequent output in this cycle to that module.
+route_message(module, text) routes a message to a **different** replyable module than the current delivery target. Calling it with the current delivery target returns an error — to reply to the sender of the current event, emit free-form text instead; it is delivered automatically.
 restart_modules({ continuation }) reloads the modules directory: discovery runs first; if discovery, manifest parsing, or an empty result fails, running modules are left unchanged and the tool reports an error. A **successful** reload ends the current LLM run immediately, so the reloaded module set is first visible on the **next** event. \`continuation\` is required: pass a non-empty string to enqueue one \`event.v1\` handoff (source fixed to current event source); pass empty string when no follow-up is needed.
+turn_end() ends the current turn immediately without delivering any message to the user or any module. Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently. Do NOT use this when you have something to say; emit free-form text instead.
 
-send_image(path) reads an image file and enqueues an image.send.v1 event. The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths). The image is injected into the LLM input on the next cycle, not the current one.
-send_file(path) does the same for documents (PDFs, etc.) via file.send.v1. Same path restrictions apply.
+attach_image(path) reads an image file and attaches it to the LLM input on the next cycle via image.send.v1. The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).
+attach_file(path) does the same for documents (PDFs, etc.) via file.send.v1. Same path restrictions apply.
 
 ${skillsSection}
 
 ## Output routing
 
-Free-form text you emit goes to the current delivery target: the source of the most recently consumed event from a replyable module. Use send_message(module, text) to override the target for the remainder of the current cycle; subsequent free-form text in that cycle also goes to the overridden target.`;
+Free-form text you emit goes to the current delivery target: the source of the most recently consumed event from a replyable module. To reply to the current sender, just emit text — do not use route_message. Use route_message(module, text) only when you need to forward output to a module that is not the current target; subsequent free-form text in that cycle also goes to the overridden target.`;
 }
 
 function buildSkillsSection(

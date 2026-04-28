@@ -72,6 +72,7 @@ async function main(): Promise<void> {
 			abortSignal: abortController.signal,
 			startedDaemons: daemonsRef.current,
 			sessionStore,
+			characterDir,
 		});
 		eventQueue = result.eventQueue;
 		timerSchedulerRef.current = result.timerScheduler;
