@@ -3211,6 +3211,204 @@ for await (const chunk of Bun.stdin.stream()) {
 	});
 });
 
+describe("INIT.md startup hook", () => {
+	test("enqueues INIT event before ok when switching to a new empty session", async () => {
+		const homeDir = await createTempDir("justclaw-init-switch-");
+		const resultPath = path.join(homeDir, "result.json");
+		const historyDir = path.join(homeDir, "history");
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await writeFile(path.join(characterDir, "INIT.md"), "run startup tasks");
+		const sessionStore = new SessionStore(historyDir);
+		await sessionStore.ensureDefaultSessionIfEmpty();
+
+		await writeRawModule(
+			homeDir,
+			"mod",
+			JSON.stringify({
+				name: "mod",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const newId = (await sendRequest("sessions.new.v1")).id;',
+				`await sendRequest("sessions.switch.v1", { id: newId });`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
+				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			characterDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+
+		const processedTexts: string[] = [];
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				const text = typeof input === "string" ? input : JSON.stringify(input);
+				processedTexts.push(text);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(
+			runtime.eventQueue,
+			{ current: runtime.daemons },
+			"test-model",
+			{ runner: mockRunner, sessionStore, characterDir },
+		);
+
+		await waitUntil(() => processedTexts.length >= 2);
+		runtime.eventQueue.close();
+		await loopTask;
+		await stopDaemons(runtime.daemons);
+
+		// INIT runs before the user event
+		expect(processedTexts[0]).toContain("run startup tasks");
+		expect(processedTexts[1]).toContain("user-event");
+	});
+
+	test("does not enqueue INIT when switching to a non-empty session", async () => {
+		const homeDir = await createTempDir("justclaw-init-nonempty-");
+		const resultPath = path.join(homeDir, "result.json");
+		const historyDir = path.join(homeDir, "history");
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await writeFile(path.join(characterDir, "INIT.md"), "run startup tasks");
+		const sessionStore = new SessionStore(historyDir);
+		const existingId = "01900000-0000-7000-8000-00000000000c";
+		await sessionStore.save(existingId, [
+			{ role: "user", content: "prior history" } as AgentInputItem,
+		]);
+		await sessionStore.ensureDefaultSessionIfEmpty();
+
+		await writeRawModule(
+			homeDir,
+			"mod",
+			JSON.stringify({
+				name: "mod",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				`await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(existingId)} });`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
+				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			characterDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+
+		const processedTexts: string[] = [];
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				const text = typeof input === "string" ? input : JSON.stringify(input);
+				processedTexts.push(text);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(
+			runtime.eventQueue,
+			{ current: runtime.daemons },
+			"test-model",
+			{ runner: mockRunner, sessionStore, characterDir },
+		);
+
+		await waitUntil(() => processedTexts.length >= 1);
+		await delay(100); // ensure no extra INIT event arrives
+		runtime.eventQueue.close();
+		await loopTask;
+		await stopDaemons(runtime.daemons);
+
+		expect(processedTexts).toHaveLength(1);
+		expect(processedTexts[0]).toContain("user-event");
+		expect(processedTexts[0]).not.toContain("run startup tasks");
+	});
+
+	test("does not enqueue INIT when INIT.md is absent", async () => {
+		const homeDir = await createTempDir("justclaw-init-absent-");
+		const resultPath = path.join(homeDir, "result.json");
+		const historyDir = path.join(homeDir, "history");
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		// No INIT.md written
+		const sessionStore = new SessionStore(historyDir);
+		await sessionStore.ensureDefaultSessionIfEmpty();
+
+		await writeRawModule(
+			homeDir,
+			"mod",
+			JSON.stringify({
+				name: "mod",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createJsonRpcStdinClientModuleScript(resultPath, [
+				'const newId = (await sendRequest("sessions.new.v1")).id;',
+				`await sendRequest("sessions.switch.v1", { id: newId });`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
+				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
+			]),
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			sessionStore,
+			characterDir,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => Bun.file(resultPath).exists());
+
+		const processedTexts: string[] = [];
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				const text = typeof input === "string" ? input : JSON.stringify(input);
+				processedTexts.push(text);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(
+			runtime.eventQueue,
+			{ current: runtime.daemons },
+			"test-model",
+			{ runner: mockRunner, sessionStore, characterDir },
+		);
+
+		await waitUntil(() => processedTexts.length >= 1);
+		await delay(100);
+		runtime.eventQueue.close();
+		await loopTask;
+		await stopDaemons(runtime.daemons);
+
+		expect(processedTexts).toHaveLength(1);
+		expect(processedTexts[0]).toContain("user-event");
+	});
+});
+
 describe("runLlmLoop restart_modules integration", () => {
 	const toolSchema = {
 		type: "object",
@@ -3465,7 +3663,7 @@ describe("runLlmLoop restart_modules integration", () => {
 		expect(instructions[1]).not.toContain("| v1 |");
 	});
 
-	test("after restart_modules, send_message still reaches replyable module", async () => {
+	test("after restart_modules, route_message tool is still available", async () => {
 		const homeDir = await createTempDir("justclaw-llm-rst-stale-send-");
 		await writeRawModule(
 			homeDir,
@@ -3500,11 +3698,12 @@ describe("runLlmLoop restart_modules integration", () => {
 					rc,
 					JSON.stringify({ continuation: "" }),
 				);
-				const out = await findFunctionTool(agent, "send_message").invoke(
+				const out = await findFunctionTool(agent, "route_message").invoke(
 					rc,
 					JSON.stringify({ module: "mod", text: "hi" }),
 				);
-				expect(out).toBe("ok");
+				// "mod" is the current delivery target; guard rejects routing to self
+				expect(String(out)).toContain("already the current delivery target");
 				return { finalOutput: null, history: [] };
 			},
 		} as unknown as Runner;
@@ -3653,58 +3852,9 @@ describe("runLlmLoop restart_modules integration", () => {
 	});
 });
 
-describe("send_message replyable enforcement", () => {
-	test("returns error when target module is not replyable", async () => {
-		const homeDir = await createTempDir("justclaw-llm-send-nonreplyable-");
-		await writeDaemonModule(homeDir, "mod", createModuleScript());
-		const ctx = createSessionContext(homeDir);
-		const runtime = await bootstrapRuntime({
-			homeDir,
-			eventQueuePath: path.join(homeDir, "events.db"),
-			...ctx,
-			sandboxFactory: async (manifest) =>
-				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-		});
-		const daemonsRef = { current: runtime.daemons };
-		const queue = runtime.eventQueue;
-		const characterDir = path.join(homeDir, "character");
-		await mkdir(characterDir, { recursive: true });
-		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
-		queue.enqueue("mod", { type: "event.v1", kind: "k" });
-
-		const rc = new RunContext();
-		let sendResult: unknown;
-		const mockRunner = {
-			run: async (agent: Agent) => {
-				sendResult = await findFunctionTool(agent, "send_message").invoke(
-					rc,
-					JSON.stringify({ module: "mod", text: "hi" }),
-				);
-				return { finalOutput: null, history: [] };
-			},
-		} as unknown as Runner;
-
-		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
-			runner: mockRunner,
-			sessionStore: ctx.sessionStore,
-			workspaceDir: "/tmp/ws",
-			historyDir: path.join(homeDir, "history"),
-			characterDir,
-			modulesRoot: runtime.modulesRoot,
-			sandboxFactory: async (manifest) =>
-				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
-		});
-
-		await delay(120);
-		queue.close();
-		await loopTask;
-		await stopDaemons(daemonsRef.current);
-
-		expect(String(sendResult)).toBe('error: module "mod" is not replyable');
-	});
-
-	test("succeeds when target module is replyable", async () => {
-		const homeDir = await createTempDir("justclaw-llm-send-replyable-");
+describe("route_message", () => {
+	test("returns error when routing to the current delivery target", async () => {
+		const homeDir = await createTempDir("justclaw-llm-route-self-");
 		await writeRawModule(
 			homeDir,
 			"mod",
@@ -3732,10 +3882,10 @@ describe("send_message replyable enforcement", () => {
 		queue.enqueue("mod", { type: "event.v1", kind: "k" });
 
 		const rc = new RunContext();
-		let sendResult: unknown;
+		let result: unknown;
 		const mockRunner = {
 			run: async (agent: Agent) => {
-				sendResult = await findFunctionTool(agent, "send_message").invoke(
+				result = await findFunctionTool(agent, "route_message").invoke(
 					rc,
 					JSON.stringify({ module: "mod", text: "hi" }),
 				);
@@ -3759,7 +3909,188 @@ describe("send_message replyable enforcement", () => {
 		await loopTask;
 		await stopDaemons(daemonsRef.current);
 
-		expect(sendResult).toBe("ok");
+		expect(String(result)).toContain("already the current delivery target");
+	});
+
+	test("returns error when target module is not replyable", async () => {
+		const homeDir = await createTempDir("justclaw-llm-route-nonreplyable-");
+		await writeRawModule(
+			homeDir,
+			"src",
+			JSON.stringify({
+				name: "src",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createModuleScript(),
+		);
+		await writeDaemonModule(homeDir, "sink", createModuleScript());
+		const ctx = createSessionContext(homeDir);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...ctx,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemonsRef = { current: runtime.daemons };
+		const queue = runtime.eventQueue;
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
+		queue.enqueue("src", { type: "event.v1", kind: "k" });
+
+		const rc = new RunContext();
+		let result: unknown;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				result = await findFunctionTool(agent, "route_message").invoke(
+					rc,
+					JSON.stringify({ module: "sink", text: "hi" }),
+				);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore: ctx.sessionStore,
+			workspaceDir: "/tmp/ws",
+			historyDir: path.join(homeDir, "history"),
+			characterDir,
+			modulesRoot: runtime.modulesRoot,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await delay(120);
+		queue.close();
+		await loopTask;
+		await stopDaemons(daemonsRef.current);
+
+		expect(String(result)).toBe('error: module "sink" is not replyable');
+	});
+
+	test("succeeds when routing to a different replyable module", async () => {
+		const homeDir = await createTempDir("justclaw-llm-route-replyable-");
+		await writeRawModule(
+			homeDir,
+			"src",
+			JSON.stringify({
+				name: "src",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createModuleScript(),
+		);
+		await writeRawModule(
+			homeDir,
+			"dst",
+			JSON.stringify({
+				name: "dst",
+				exec: "./module.ts",
+				mode: "daemon",
+				replyable: true,
+			}),
+			createModuleScript(),
+		);
+		const ctx = createSessionContext(homeDir);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...ctx,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemonsRef = { current: runtime.daemons };
+		const queue = runtime.eventQueue;
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
+		queue.enqueue("src", { type: "event.v1", kind: "k" });
+
+		const rc = new RunContext();
+		let result: unknown;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				result = await findFunctionTool(agent, "route_message").invoke(
+					rc,
+					JSON.stringify({ module: "dst", text: "hi" }),
+				);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore: ctx.sessionStore,
+			workspaceDir: "/tmp/ws",
+			historyDir: path.join(homeDir, "history"),
+			characterDir,
+			modulesRoot: runtime.modulesRoot,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await delay(120);
+		queue.close();
+		await loopTask;
+		await stopDaemons(daemonsRef.current);
+
+		expect(result).toBe("ok");
+	});
+});
+
+describe("turn_end", () => {
+	test("tool is available in agent and returns ok", async () => {
+		const homeDir = await createTempDir("justclaw-llm-turn-end-");
+		await writeDaemonModule(homeDir, "mod", createModuleScript());
+		const ctx = createSessionContext(homeDir);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...ctx,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemonsRef = { current: runtime.daemons };
+		const queue = runtime.eventQueue;
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
+		queue.enqueue("mod", { type: "event.v1", kind: "background-task" });
+
+		const rc = new RunContext();
+		let toolResult: unknown;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				toolResult = await findFunctionTool(agent, "turn_end").invoke(
+					rc,
+					JSON.stringify({}),
+				);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore: ctx.sessionStore,
+			workspaceDir: "/tmp/ws",
+			historyDir: path.join(homeDir, "history"),
+			characterDir,
+			modulesRoot: runtime.modulesRoot,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await delay(120);
+		queue.close();
+		await loopTask;
+		await stopDaemons(daemonsRef.current);
+
+		expect(toolResult).toBe("ok");
 	});
 });
 

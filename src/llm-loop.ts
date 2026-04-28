@@ -11,7 +11,11 @@ import {
 	tool,
 } from "@openai/agents";
 import OpenAI from "openai";
-import { loadAgentContext, loadSkillsIndex } from "./agent-context";
+import {
+	loadAgentContext,
+	loadSkillsIndex,
+	readInitContent,
+} from "./agent-context";
 import { notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
@@ -185,18 +189,23 @@ function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 	);
 }
 
-function buildSendMessageTool(
+function buildRouteMessageTool(
 	daemonsRef: { current: StartedDaemon[] },
+	getTarget: () => string,
 	onSend: (moduleName: string) => void,
 ): Tool {
 	return tool({
-		name: "send_message",
+		name: "route_message",
 		description:
-			"Send a message to a replyable module. Use this to reply to the user or deliver a message to a specific module.",
+			"Route a message to a replyable module other than the current delivery target. Use this only when forwarding output to a different module. To reply to the sender of the current event, emit free-form text instead — it is delivered automatically.",
 		parameters: {
 			type: "object",
 			properties: {
-				module: { type: "string", description: "Target module name" },
+				module: {
+					type: "string",
+					description:
+						"Target module name (must differ from the current delivery target)",
+				},
 				text: { type: "string", description: "Message body" },
 			},
 			required: ["module", "text"],
@@ -208,6 +217,9 @@ function buildSendMessageTool(
 				module: string;
 				text: string;
 			};
+			if (moduleName === getTarget()) {
+				return `error: "${moduleName}" is already the current delivery target; emit free-form text to reply to the current sender`;
+			}
 			const daemon = daemonsRef.current.find(
 				(d) => d.manifest.name === moduleName,
 			);
@@ -442,7 +454,22 @@ export async function runLlmLoop(
 
 		if (sessionStore && session.currentSessionId === null) {
 			try {
-				await adoptSessionFromMetadata(session, eventQueue, sessionStore);
+				const adopted = await adoptSessionFromMetadata(
+					session,
+					eventQueue,
+					sessionStore,
+				);
+				// Fires once when a new empty session is first adopted at bootstrap.
+				// Explicit-switch cases are handled in sessions.switch.v1 before "ok" is returned.
+				if (adopted && session.history.length === 0 && options?.characterDir) {
+					const initText = await readInitContent(options.characterDir);
+					if (initText) {
+						eventQueue.enqueue(event.source, {
+							type: "event.v1",
+							text: initText,
+						});
+					}
+				}
 			} catch (error) {
 				console.error(
 					`[core] failed to adopt initial session for event from ${event.source} (id=${event.id}): ${
@@ -528,14 +555,34 @@ export async function runLlmLoop(
 			...buildModuleTools(daemonsRef.current).map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
-			buildSendMessageTool(daemonsRef, (name) => {
-				currentTarget = name;
-			}),
+			buildRouteMessageTool(
+				daemonsRef,
+				() => currentTarget,
+				(name) => {
+					currentTarget = name;
+				},
+			),
 			restartModulesTool,
 			tool({
-				name: "send_image",
+				name: "turn_end",
 				description:
-					"Read a local image file and deliver it to the LLM as image input on the next event. " +
+					"End the current turn immediately without sending any message to the user or any module. " +
+					"Use this when the task is complete and no reply is needed — for example after a background " +
+					"task, a timer event, or any event that requires action but not a user-facing response. " +
+					"Do NOT use this when you have something to say; emit free-form text instead.",
+				parameters: {
+					type: "object",
+					properties: {},
+					required: [],
+					additionalProperties: false,
+				},
+				strict: true,
+				execute: async () => "ok",
+			}),
+			tool({
+				name: "attach_image",
+				description:
+					"Read a local image file and attach it to the LLM input on the next event cycle. " +
 					"The current run continues normally after this call; the image arrives in the next cycle.",
 				parameters: {
 					type: "object",
@@ -588,9 +635,9 @@ export async function runLlmLoop(
 				},
 			}),
 			tool({
-				name: "send_file",
+				name: "attach_file",
 				description:
-					"Read a local file and deliver it as file content to the LLM on the next event. " +
+					"Read a local file and attach it to the LLM input on the next event cycle. " +
 					"Suitable for PDFs and other documents. The file arrives in the next cycle.",
 				parameters: {
 					type: "object",
@@ -683,6 +730,21 @@ export async function runLlmLoop(
 						result.output.startsWith("ok:"),
 				);
 				if (restartResult) {
+					return {
+						isFinalOutput: true,
+						isInterrupted: undefined,
+						finalOutput: "",
+					};
+				}
+				// The SDK loop cannot terminate without text output; turn_end provides
+				// an explicit escape hatch that ends the run silently via isFinalOutput.
+				const turnEndResult = toolResults.find(
+					(result) =>
+						result.type === "function_output" &&
+						result.tool.name === "turn_end" &&
+						result.output === "ok",
+				);
+				if (turnEndResult) {
 					return {
 						isFinalOutput: true,
 						isInterrupted: undefined,

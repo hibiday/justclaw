@@ -52,6 +52,22 @@ export function resolveCharacterDir(
 }
 
 /**
+ * Reads `INIT.md` from the character directory.
+ * Returns trimmed content, or null when the file is absent or empty.
+ * Used to enqueue a startup event when a new empty session becomes active.
+ */
+export async function readInitContent(
+	characterDir: string,
+): Promise<string | null> {
+	const file = Bun.file(path.join(characterDir, "INIT.md"));
+	if (!(await file.exists())) {
+		return null;
+	}
+	const trimmed = (await file.text()).trim();
+	return trimmed || null;
+}
+
+/**
  * Reads `AGENTS.md` from the justclaw home directory (operator-level instructions).
  * Called once at startup so the content is fixed for the lifetime of the process;
  * the agent cannot modify it even if sandbox write paths change in the future.

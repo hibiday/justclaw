@@ -55,6 +55,7 @@ export type BootstrapRuntimeOptions = {
 	) => Promise<SandboxLaunchSpec>;
 	startedDaemons?: StartedDaemon[];
 	sessionStore: SessionStore;
+	characterDir?: string;
 };
 
 type DaemonFailureHandler = (daemon: StartedDaemon, error: Error) => void;
@@ -312,6 +313,7 @@ function createPeer(
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
+	characterDir?: string,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -332,7 +334,12 @@ function createPeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
-		onRequest: createSessionRequestHandler(manifest.name, queue, sessionStore),
+		onRequest: createSessionRequestHandler(
+			manifest.name,
+			queue,
+			sessionStore,
+			characterDir,
+		),
 	});
 }
 
@@ -370,7 +377,11 @@ export async function startDaemon(
 	manifest: DaemonModuleManifest,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+		| "characterDir"
 	> & {
 		onSpawned?: (daemon: StartedDaemon) => void;
 		onFailure?: DaemonFailureHandler;
@@ -398,6 +409,7 @@ export async function startDaemon(
 		process,
 		options.queue,
 		options.sessionStore,
+		options.characterDir,
 	);
 	const daemon: StartedDaemon = {
 		manifest,
@@ -487,7 +499,11 @@ function superviseDaemon(
 	daemon: StartedDaemon,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+		| "characterDir"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -508,7 +524,11 @@ function handleDaemonFailure(
 	error: Error,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+		| "characterDir"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -546,7 +566,11 @@ async function restartFailedDaemon(
 	error: Error,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+		| "characterDir"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -605,6 +629,7 @@ async function restartFailedDaemon(
 			sandboxFactory: options.sandboxFactory,
 			queue: eventQueue,
 			sessionStore: options.sessionStore,
+			characterDir: options.characterDir,
 			onFailure: (failedDaemon, failureError) => {
 				handleDaemonFailure(
 					failedDaemon,
@@ -641,7 +666,11 @@ export async function reloadModules(
 	eventQueue: EventQueue,
 	options: Pick<
 		BootstrapRuntimeOptions,
-		"abortSignal" | "sandboxFactory" | "initializeTimeoutMs" | "sessionStore"
+		| "abortSignal"
+		| "sandboxFactory"
+		| "initializeTimeoutMs"
+		| "sessionStore"
+		| "characterDir"
 	> & {
 		timerSchedulerRef?: { current: TimerScheduler };
 	},
@@ -672,6 +701,7 @@ export async function reloadModules(
 					sandboxFactory: options.sandboxFactory,
 					queue: eventQueue,
 					sessionStore: options.sessionStore,
+					characterDir: options.characterDir,
 					onFailure: (daemon, error) => {
 						handleDaemonFailure(
 							daemon,
@@ -752,6 +782,7 @@ export async function bootstrapRuntime(
 			sandboxFactory: options.sandboxFactory,
 			initializeTimeoutMs: options.initializeTimeoutMs,
 			sessionStore: options.sessionStore,
+			characterDir: options.characterDir,
 		});
 
 		for (const event of eventQueue.stale()) {

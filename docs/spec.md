@@ -99,7 +99,7 @@ See [Event Format for LLM](#event-format-for-llm) for how each envelope reaches 
 
 ### `image.send.v1`
 
-Emitted by a module (or enqueued by the built-in `send_image` tool) to attach image bytes on the next dequeue. Params:
+Emitted by a module (or enqueued by the built-in `attach_image` tool) to attach image bytes on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -109,7 +109,7 @@ Emitted by a module (or enqueued by the built-in `send_image` tool) to attach im
 
 ### `file.send.v1`
 
-Emitted by a module (or enqueued by the built-in `send_file` tool) to attach a document on the next dequeue. Params:
+Emitted by a module (or enqueued by the built-in `attach_file` tool) to attach a document on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -335,7 +335,7 @@ Each daemon module directory contains a `module.json` manifest. Required fields:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `replyable` | boolean | `false` | When `true`, the core may deliver `message.send.v1` to this module and the LLM may use `send_message` / final text routing to this module. Non-replyable modules still receive tool calls and emit events; outbound user messaging is not routed to them. |
+| `replyable` | boolean | `false` | When `true`, the core may deliver `message.send.v1` to this module and the LLM may use `route_message` / final text routing to this module. Non-replyable modules still receive tool calls and emit events; outbound user messaging is not routed to them. |
 
 Each timer module directory contains a `module.json` manifest. Required fields: `name` (must match the directory name), `mode` (`"timer"`), `exec` (path to the entrypoint, relative to the module directory), `cron` (schedule). Optional fields: none.
 
@@ -387,6 +387,7 @@ The core reads the following files from the character directory, in order:
 | `IDENTITY.md` | Personality, tone, and style |
 | `USER.md` | User information and preferences |
 | `MEMORY.md` | Cross-session memory |
+| `INIT.md` | Startup tasks — injected as an `event.v1` when a new empty session becomes active |
 
 Each present file is read as UTF-8, trimmed, and formatted as:
 
@@ -403,7 +404,7 @@ The bundled LLM loop re-reads these files from disk immediately before each `eve
 
 ### Workspace sandbox
 
-Built-in `shell` and `edit` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+Built-in `shell`, `create_file`, `edit_file`, and `delete_file` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
 
 ## Skills directory
 
@@ -452,7 +453,7 @@ Required frontmatter fields:
 
 Before each LLM turn, the bundled loop scans `skills/*/SKILL.md`, parses frontmatter, and injects a skill index (name + description table) into the runtime instructions. Full skill content is not loaded automatically; the LLM reads it on demand via `shell`.
 
-Because the skills directory is rw-mounted in the workspace sandbox, the LLM can create, edit, and delete skills using `shell` and `edit`.
+Because the skills directory is rw-mounted in the workspace sandbox, the LLM can create, edit, and delete skills using `shell`, `create_file`, `edit_file`, and `delete_file`.
 
 ## Agent system prompt
 
@@ -497,7 +498,7 @@ If precise destination control is required (e.g., DM a specific user, send to a 
 
 ### `tool_call.v1`
 
-The core notifies the current message target each time a tool completes — both workspace tools (`shell`, `edit`) and tools exposed by modules. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `send_message` call in the same cycle).
+The core notifies the current message target each time a tool completes — both workspace tools (`shell`, `create_file`, `edit_file`, `delete_file`) and tools exposed by modules. The notification is sent to the same module that is the current delivery target at the time the tool is called (i.e., `event.source`, unless overridden by a prior `route_message` call in the same cycle).
 
 ```json
 {
@@ -515,11 +516,11 @@ The core notifies the current message target each time a tool completes — both
 | Field | Type | Description |
 |---|---|---|
 | `type` | string | Always `tool_call.v1` |
-| `tool` | string | Tool name (`shell` or `edit`) |
+| `tool` | string | Tool name (`shell`, `create_file`, `edit_file`, or `delete_file`) |
 | `input` | object | Arguments passed to the tool by the LLM |
 | `output` | string | JSON-encoded result returned by the tool |
 
-For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `edit`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
+For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `create_file`, `edit_file`, and `delete_file`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
 
 ### `event.dropped.v1`
 
@@ -576,7 +577,7 @@ The core persists this as the `last_replyable_target` key in `events.db` metadat
 
 #### Transient override
 
-When the LLM calls the built-in `send_message` tool during a processing cycle, it creates a transient override of the delivery target:
+When the LLM calls the built-in `route_message` tool during a processing cycle, it creates a transient override of the delivery target:
 
 - The override applies only within the current processing cycle.
 - Free-form text output emitted after the override goes to the overridden target.
@@ -594,7 +595,7 @@ Queue: [Event A from X (replyable), Event B from Y (replyable), Event C from NR 
   source = X (replyable) -> last_replyable_target = X
   default target = X
   LLM emits text          -> delivered to X
-  LLM calls send_message(module=Z, ...)
+  LLM calls route_message(module=Z, ...)
                           -> delivered to Z
                           -> override = Z
   LLM emits text          -> delivered to Z
@@ -613,20 +614,20 @@ Queue: [Event A from X (replyable), Event B from Y (replyable), Event C from NR 
 [Cycle for C ends]
 ```
 
-### Built-in Tool: `send_message`
+### Built-in Tool: `route_message`
 
-The core provides `send_message` as a built-in tool, available to the LLM regardless of which modules are loaded.
+The core provides `route_message` as a built-in tool, available to the LLM regardless of which modules are loaded. Use this only to forward output to a module other than the current delivery target. To reply to the sender of the current event, emit free-form text instead — it is delivered automatically. Calling `route_message` with the current delivery target as the destination returns an error.
 
 ```
-send_message(module: string, text: string)
+route_message(module: string, text: string)
 ```
 
 | Parameter | Description |
 |---|---|
-| `module` | Target module name |
+| `module` | Target module name (must differ from the current delivery target) |
 | `text` | Message body |
 
-The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true`; otherwise the tool returns an error. On success, the core updates the default delivery target.
+The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true` and differs from the current delivery target; otherwise the tool returns an error. On success, the core updates the default delivery target.
 
 Trailing free-form assistant text after the LLM run is delivered the same way: only when the current delivery target module is replyable.
 
@@ -646,10 +647,10 @@ The bundled LLM loop implements this as a core tool (not wrapped with `tool_call
 
 **Turn boundary:** After `restart_modules` **succeeds**, processes match disk and the current LLM run ends immediately after that tool call. The agent does not continue with more tool calls or trailing free-form text in the reloaded state. The **next** `event.v1` shows the new module table and runs normally against the reloaded modules. Use a non-empty `continuation` when you want the core to enqueue exactly one handoff event under that new module set.
 
-### Built-in Tool: `send_image`
+### Built-in Tool: `attach_image`
 
 ```
-send_image({ path: string })
+attach_image({ path: string })
 ```
 
 | Parameter | Description |
@@ -658,17 +659,17 @@ send_image({ path: string })
 
 The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
 
-### Built-in Tool: `send_file`
+### Built-in Tool: `attach_file`
 
 ```
-send_file({ path: string })
+attach_file({ path: string })
 ```
 
 | Parameter | Description |
 |---|---|
 | `path` | Path to a file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `send_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `attach_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
 
 ### Built-in Tool: `shell`
 
@@ -683,25 +684,64 @@ shell(commands: string[], timeout_ms?: number)
 | `commands` | Shell commands to execute in order |
 | `timeout_ms` | Per-command timeout in milliseconds (default: 30000) |
 
-The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory (see [Character directory](#character-directory)), read-write access to the runtime modules directory, and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory, read-write access to the runtime modules directory, read-write access to the skills directory (when configured), and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 
-### Built-in Tool: `edit`
+### Built-in Tool: `create_file`
 
-Creates, edits, or deletes a file inside the workspace sandbox. Allowed paths are the workspace directory and the character directory.
+Write full content to a file inside the workspace sandbox. Overwrites the file if it already exists. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
 
 ```
-edit(type: "create_file" | "edit_file" | "delete_file", path: string, content?: string, old?: string, new?: string)
+create_file(path: string, content: string)
 ```
 
 | Parameter | Description |
 |---|---|
-| `type` | Operation type |
-| `path` | Absolute path to the file, inside the sandbox (workspace or character directory) |
-| `content` | Full file content (required for `create_file`) |
-| `old` | Exact substring to replace (required for `edit_file`; must appear exactly once in the file) |
-| `new` | Replacement text (required for `edit_file`) |
+| `path` | Absolute path to the file |
+| `content` | Full file content |
 
-The path is resolved to an absolute path. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+
+### Built-in Tool: `edit_file`
+
+Replace an exact substring in an existing file inside the workspace sandbox. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+
+```
+edit_file(path: string, old: string, new: string)
+```
+
+| Parameter | Description |
+|---|---|
+| `path` | Absolute path to the file |
+| `old` | Exact substring to replace (must appear exactly once in the file) |
+| `new` | Replacement text |
+
+After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+
+### Built-in Tool: `delete_file`
+
+Delete a file inside the workspace sandbox. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+
+```
+delete_file(path: string)
+```
+
+| Parameter | Description |
+|---|---|
+| `path` | Absolute path to the file |
+
+After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
+
+### Built-in Tool: `turn_end`
+
+End the current LLM turn immediately without delivering any message. The SDK's agent loop cannot terminate without text output from the model; `turn_end` provides an explicit escape hatch via `toolUseBehavior`.
+
+```
+turn_end()
+```
+
+No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered and no `tool_call.v1` notification is emitted.
+
+Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently.
 
 ## Event Format for LLM
 

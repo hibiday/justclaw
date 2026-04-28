@@ -1,3 +1,4 @@
+import { readInitContent } from "./agent-context";
 import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
@@ -74,6 +75,7 @@ export function createSessionRequestHandler(
 	manifestName: string,
 	queue: EventQueue,
 	sessionStore: SessionStore,
+	characterDir?: string,
 ): (method: string, params: unknown) => Promise<unknown> {
 	return async (method, params) => {
 		if (method === "sessions.new.v1") {
@@ -88,16 +90,25 @@ export function createSessionRequestHandler(
 				params,
 				"sessions.switch.v1",
 			);
-			// Pre-check: reject the request immediately if the session does not exist,
-			// so the module gets a synchronous error rather than a later event.dropped.v1.
+			// Pre-check: reject immediately if the session does not exist, so the module
+			// gets a synchronous error rather than a later event.dropped.v1.
 			// The LLM loop loads the file again at apply time because the file may be
 			// removed or become unreadable between this check and the queue drain.
-			if ((await sessionStore.load(id)) === null) {
+			const history = await sessionStore.load(id);
+			if (history === null) {
 				throw new Error(
 					`${manifestName}: sessions.switch.v1: session "${id}" is unreadable or does not exist`,
 				);
 			}
 			queue.enqueue(manifestName, { type: "sessions.switch.v1", id });
+			// Enqueue INIT before returning "ok" so it is ahead of any event the caller
+			// sends after receiving the response. Only fires for empty (new) sessions.
+			if (history.length === 0 && characterDir) {
+				const initText = await readInitContent(characterDir);
+				if (initText) {
+					queue.enqueue(manifestName, { type: "event.v1", text: initText });
+				}
+			}
 			return "ok";
 		}
 

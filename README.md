@@ -85,13 +85,13 @@ Module (source)                    Core                         Module (target)
 - **Reasoning** — LLM-based inference via a single serial queue
 - **Memory** — Per-session conversation history, persisted to disk
 - **Identity** — Agent personality and instructions loaded from the character directory
-- **Built-in tools** — `send_message`, `shell`, `edit`, `send_image`, `send_file`, `restart_modules`
+- **Built-in tools** — `shell`, `create_file`, `edit_file`, `delete_file`, `route_message`, `attach_image`, `attach_file`, `restart_modules`, `turn_end`
 
 ### Message routing
 
 The canonical delivery target is the source of the most recently consumed message from a replyable module. The core persists this as `last_replyable_target` so that events from non-replyable sources (for example, a timer module) still route LLM output to the last replyable module.
 
-When the LLM calls `send_message`, it creates a transient override for the current processing cycle only. Subsequent free-form text in that cycle goes to the override target. When the cycle ends the override is discarded.
+When the LLM calls `route_message`, it creates a transient override for the current processing cycle only. Subsequent free-form text in that cycle goes to the override target. When the cycle ends the override is discarded.
 
 ## Modules
 
@@ -157,7 +157,7 @@ Cron expressions are 5-field and evaluated in UTC.
 
 Each module runs inside a platform sandbox (`bwrap` on Linux, `sandbox-exec` on macOS). The sandbox grants read-write access to the module's own directory (`modules/{name}/`) and temp paths. Modules cannot access each other's directories or the workspace directly.
 
-The `shell` and `edit` built-in tools run in a separate workspace sandbox that grants read-write access to the workspace, character, and modules directories, and read-only access to the history directory.
+The `shell`, `create_file`, `edit_file`, and `delete_file` built-in tools run in a separate workspace sandbox that grants read-write access to the workspace, character, and modules directories, and read-only access to the history directory.
 
 ## Examples
 

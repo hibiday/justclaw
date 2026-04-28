@@ -515,85 +515,100 @@ export function createWorkspaceTools(
 		},
 	});
 
-	const editFunctionTool = tool({
-		name: "edit",
+	const createFileTool = tool({
+		name: "create_file",
 		description:
-			"Create, edit, or delete a file inside the workspace sandbox. " +
+			"Write a new file at an absolute path inside the workspace sandbox. " +
 			"Use absolute host paths (e.g. the path you see in the shell). " +
-			"For edit_file, old must match exactly once in the file; expand the context if not unique.",
+			"Overwrites the file if it already exists.",
 		parameters: {
 			type: "object",
 			properties: {
-				type: {
-					type: "string",
-					enum: ["create_file", "edit_file", "delete_file"],
-				},
-				path: {
-					type: "string",
-					description: "Absolute path to the file",
-				},
-				content: {
-					type: "string",
-					description: "Full file content (required for create_file)",
-				},
-				old: {
-					type: "string",
-					description:
-						"Exact substring to replace (required for edit_file; must appear exactly once)",
-				},
-				new: {
-					type: "string",
-					description: "Replacement text (required for edit_file)",
-				},
+				path: { type: "string", description: "Absolute path to the file" },
+				content: { type: "string", description: "Full file content" },
 			},
-			required: ["type", "path"],
+			required: ["path", "content"],
 			additionalProperties: false,
-			// biome-ignore lint/suspicious/noExplicitAny: avoid @openai/agents-core subpath types for parameters
-		} as any,
-		strict: false as false,
+		},
+		strict: true,
 		execute: async (input: unknown) => {
-			const {
-				type,
-				path: filePath,
-				content,
-				old,
-				new: newText,
-			} = input as {
-				type: string;
+			const { path: filePath, content } = input as {
 				path: string;
-				content?: string;
-				old?: string;
-				new?: string;
+				content: string;
 			};
-			let result: ApplyPatchResult | undefined;
-			if (type === "create_file") {
-				// Reuse ApplyPatchOperation shape: pass content via the diff field.
-				result = await editor.createFile({
-					type: "create_file",
-					path: filePath,
-					diff: content ?? "",
-				});
-			} else if (type === "edit_file") {
-				result = await editor.editFile({
-					type: "edit_file",
-					path: filePath,
-					old: old ?? "",
-					new: newText ?? "",
-				});
-			} else if (type === "delete_file") {
-				result = await editor.deleteFile({
-					type: "delete_file",
-					path: filePath,
-				});
-			} else {
-				return JSON.stringify({
-					status: "failed",
-					output: "unsupported operation type",
-				});
-			}
-			return JSON.stringify(result ?? { status: "completed" });
+			// Reuse ApplyPatchOperation shape: pass content via the diff field.
+			const result = await editor.createFile({
+				type: "create_file",
+				path: filePath,
+				diff: content,
+			});
+			return JSON.stringify(result);
 		},
 	});
 
-	return [shellFunctionTool, editFunctionTool];
+	const editFileTool = tool({
+		name: "edit_file",
+		description:
+			"Replace an exact substring in an existing file inside the workspace sandbox. " +
+			"old must appear exactly once in the file; if it is not unique, include more surrounding context. " +
+			"Use absolute host paths (e.g. the path you see in the shell).",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Absolute path to the file" },
+				old: {
+					type: "string",
+					description: "Exact substring to replace (must appear exactly once)",
+				},
+				new: { type: "string", description: "Replacement text" },
+			},
+			required: ["path", "old", "new"],
+			additionalProperties: false,
+		},
+		strict: true,
+		execute: async (input: unknown) => {
+			const {
+				path: filePath,
+				old,
+				new: newText,
+			} = input as {
+				path: string;
+				old: string;
+				new: string;
+			};
+			const result = await editor.editFile({
+				type: "edit_file",
+				path: filePath,
+				old,
+				new: newText,
+			});
+			return JSON.stringify(result);
+		},
+	});
+
+	const deleteFileTool = tool({
+		name: "delete_file",
+		description:
+			"Delete a file at an absolute path inside the workspace sandbox. " +
+			"Use absolute host paths (e.g. the path you see in the shell).",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Absolute path to the file" },
+			},
+			required: ["path"],
+			additionalProperties: false,
+		},
+		strict: true,
+		execute: async (input: unknown) => {
+			const { path: filePath } = input as { path: string };
+			const result = await editor.deleteFile({
+				type: "delete_file",
+				path: filePath,
+			});
+			return JSON.stringify(result);
+		},
+	});
+
+	return [shellFunctionTool, createFileTool, editFileTool, deleteFileTool];
 }
