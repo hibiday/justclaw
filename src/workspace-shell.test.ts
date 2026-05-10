@@ -3,8 +3,10 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+const hasBwrap = Boolean(Bun.which("bwrap"));
+
 describe("WorkspaceShell", () => {
-	test("runs sh -c commands and returns output", async () => {
+	test.skipIf(!hasBwrap)("runs sh -c commands and returns output", async () => {
 		const { WorkspaceShell } = await import("./workspace");
 		const root = await mkdtemp(path.join(os.tmpdir(), "justclaw-sh-"));
 		const hist = path.join(root, "h");
@@ -14,7 +16,10 @@ describe("WorkspaceShell", () => {
 			const result = await shell.run({ commands: ["echo marker"] });
 			expect(result.output).toHaveLength(1);
 			expect(result.output[0]?.stdout.trim()).toBe("marker");
-			expect(result.output[0]?.outcome).toEqual({ type: "exit", exitCode: 0 });
+			expect(result.output[0]?.outcome).toEqual({
+				type: "exit",
+				exitCode: 0,
+			});
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { resolveWorkspaceDir, WorkspaceEditor } from "./workspace";
 
+const hasBwrap = Boolean(Bun.which("bwrap"));
+
 const tempDirs: string[] = [];
 
 afterEach(async () => {
@@ -54,7 +56,7 @@ function historyDirForWorkspace(root: string): string {
 }
 
 describe("WorkspaceEditor", () => {
-	test("createFile writes file content", async () => {
+	test.skipIf(!hasBwrap)("createFile writes file content", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
 		const filePath = path.join(root, "hello.txt");
@@ -67,7 +69,7 @@ describe("WorkspaceEditor", () => {
 		expect(await Bun.file(filePath).text()).toBe("hello\n");
 	});
 
-	test("deleteFile fails for missing files", async () => {
+	test.skipIf(!hasBwrap)("deleteFile fails for missing files", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
 		const r = await editor.deleteFile({
@@ -77,7 +79,7 @@ describe("WorkspaceEditor", () => {
 		expect(r.status).toBe("failed");
 	});
 
-	test("editFile fails when target is missing", async () => {
+	test.skipIf(!hasBwrap)("editFile fails when target is missing", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
 		const r = await editor.editFile({
@@ -90,7 +92,7 @@ describe("WorkspaceEditor", () => {
 		expect(r.output).toMatch(/not found/);
 	});
 
-	test("editFile replaces a unique old string", async () => {
+	test.skipIf(!hasBwrap)("editFile replaces a unique old string", async () => {
 		const root = await createTempDir("justclaw-ws-");
 		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
 		const filePath = path.join(root, "doc.txt");
@@ -109,41 +111,47 @@ describe("WorkspaceEditor", () => {
 		expect(await Bun.file(filePath).text()).toBe("alpha\nBETA\ngamma\n");
 	});
 
-	test("editFile fails when old string is absent", async () => {
-		const root = await createTempDir("justclaw-ws-");
-		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
-		const filePath = path.join(root, "doc.txt");
-		await editor.createFile({
-			type: "create_file",
-			path: filePath,
-			diff: "only one line\n",
-		});
-		const r = await editor.editFile({
-			type: "edit_file",
-			path: filePath,
-			old: "missing",
-			new: "x",
-		});
-		expect(r.status).toBe("failed");
-		expect(r.output).toMatch(/old string not found/);
-	});
+	test.skipIf(!hasBwrap)(
+		"editFile fails when old string is absent",
+		async () => {
+			const root = await createTempDir("justclaw-ws-");
+			const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+			const filePath = path.join(root, "doc.txt");
+			await editor.createFile({
+				type: "create_file",
+				path: filePath,
+				diff: "only one line\n",
+			});
+			const r = await editor.editFile({
+				type: "edit_file",
+				path: filePath,
+				old: "missing",
+				new: "x",
+			});
+			expect(r.status).toBe("failed");
+			expect(r.output).toMatch(/old string not found/);
+		},
+	);
 
-	test("editFile fails when old string is not unique", async () => {
-		const root = await createTempDir("justclaw-ws-");
-		const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
-		const filePath = path.join(root, "doc.txt");
-		await editor.createFile({
-			type: "create_file",
-			path: filePath,
-			diff: "foo foo foo\n",
-		});
-		const r = await editor.editFile({
-			type: "edit_file",
-			path: filePath,
-			old: "foo",
-			new: "bar",
-		});
-		expect(r.status).toBe("failed");
-		expect(r.output).toMatch(/not unique \(3 occurrences\)/);
-	});
+	test.skipIf(!hasBwrap)(
+		"editFile fails when old string is not unique",
+		async () => {
+			const root = await createTempDir("justclaw-ws-");
+			const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+			const filePath = path.join(root, "doc.txt");
+			await editor.createFile({
+				type: "create_file",
+				path: filePath,
+				diff: "foo foo foo\n",
+			});
+			const r = await editor.editFile({
+				type: "edit_file",
+				path: filePath,
+				old: "foo",
+				new: "bar",
+			});
+			expect(r.status).toBe("failed");
+			expect(r.output).toMatch(/not unique \(3 occurrences\)/);
+		},
+	);
 });
