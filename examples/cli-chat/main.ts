@@ -218,13 +218,13 @@ function formatToolCall(
 
 async function resolveSessionId(selector?: string): Promise<string | null> {
 	if (!selector) {
-		const active = await rpcRequest("sessions.active.v1");
+		const active = await rpcRequest("sessions", { type: "sessions.active.v1" });
 		return isRecord(active) && typeof active.id === "string" ? active.id : null;
 	}
 	if (!/^\d+$/.test(selector)) {
 		return selector;
 	}
-	const list = await rpcRequest("sessions.list.v1");
+	const list = await rpcRequest("sessions", { type: "sessions.list.v1" });
 	const listIds =
 		isRecord(list) && Array.isArray(list.ids)
 			? list.ids.filter((value): value is string => typeof value === "string")
@@ -242,8 +242,10 @@ async function handleSlashCommand(input: string): Promise<void> {
 
 	if (command === "/sessions") {
 		try {
-			const list = await rpcRequest("sessions.list.v1");
-			const active = await rpcRequest("sessions.active.v1");
+			const list = await rpcRequest("sessions", { type: "sessions.list.v1" });
+			const active = await rpcRequest("sessions", {
+				type: "sessions.active.v1",
+			});
 			const listIds = isRecord(list) && Array.isArray(list.ids) ? list.ids : [];
 			const activeId =
 				isRecord(active) && typeof active.id === "string" ? active.id : null;
@@ -278,7 +280,7 @@ async function handleSlashCommand(input: string): Promise<void> {
 				deliverToClient(`[session] invalid number: ${selector}`);
 				return;
 			}
-			await rpcRequest("sessions.switch.v1", { id });
+			await rpcRequest("sessions", { type: "sessions.switch.v1", id });
 			deliverToClient(`[session] switch queued: ${id}`);
 		} catch (error) {
 			deliverToClient(`[session] switch failed: ${rpcErrorMessage(error)}`);
@@ -288,14 +290,14 @@ async function handleSlashCommand(input: string): Promise<void> {
 
 	if (command === "/new") {
 		try {
-			const created = await rpcRequest("sessions.new.v1");
+			const created = await rpcRequest("sessions", { type: "sessions.new.v1" });
 			const id =
 				isRecord(created) && typeof created.id === "string" ? created.id : null;
 			if (!id) {
 				deliverToClient("[session] create failed: invalid response");
 				return;
 			}
-			await rpcRequest("sessions.switch.v1", { id });
+			await rpcRequest("sessions", { type: "sessions.switch.v1", id });
 			deliverToClient(`[session] created and switched: ${id}`);
 		} catch (error) {
 			deliverToClient(`[session] create failed: ${rpcErrorMessage(error)}`);
@@ -315,7 +317,10 @@ async function handleSlashCommand(input: string): Promise<void> {
 				);
 				return;
 			}
-			const response = await rpcRequest("sessions.get.v1", { id });
+			const response = await rpcRequest("sessions", {
+				type: "sessions.get.v1",
+				id,
+			});
 			const history =
 				isRecord(response) && Array.isArray(response.history)
 					? response.history
@@ -342,8 +347,43 @@ async function handleSlashCommand(input: string): Promise<void> {
 		return;
 	}
 
+	if (command === "/interrupt") {
+		const text = rest.join(" ");
+		if (!text) {
+			deliverToClient("[interrupt] usage: /interrupt <text>");
+			return;
+		}
+		try {
+			await rpcRequest("sessions", { type: "sessions.interrupt.v1", text });
+			deliverToClient("[interrupt] set");
+		} catch (error) {
+			deliverToClient(`[interrupt] failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	if (command === "/skip") {
+		try {
+			const result = await rpcRequest("sessions", { type: "sessions.skip.v1" });
+			deliverToClient(result === "no-op" ? "[skip] no-op" : "[skip] aborted");
+		} catch (error) {
+			deliverToClient(`[skip] failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
+	if (command === "/kill") {
+		try {
+			await rpcRequest("sessions", { type: "sessions.kill.v1" });
+			deliverToClient("[kill] queue cleared");
+		} catch (error) {
+			deliverToClient(`[kill] failed: ${rpcErrorMessage(error)}`);
+		}
+		return;
+	}
+
 	deliverToClient(
-		"[session] unknown command. use /sessions, /session <id|number>, /new, or /log [id|number]",
+		"[session] unknown command. use /sessions, /session <id|number>, /new, /log [id|number], /interrupt <text>, /skip, or /kill",
 	);
 }
 

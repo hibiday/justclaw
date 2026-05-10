@@ -1,4 +1,5 @@
 import { readInitContent } from "./agent-context";
+import { type EventDropDaemon, notifyEventDropped } from "./event-dropped";
 import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
@@ -28,10 +29,10 @@ export function parseEventNotificationParams(
 	return record as EventParams;
 }
 
-function requireSessionParamsId(
+function requireParamsId(
 	manifestName: string,
 	params: unknown,
-	method: string,
+	type: string,
 ): string {
 	if (
 		typeof params !== "object" ||
@@ -40,7 +41,7 @@ function requireSessionParamsId(
 		(params as Record<string, unknown>).id === ""
 	) {
 		throw new Error(
-			`${manifestName}: ${method} requires a non-empty string "id"`,
+			`${manifestName}: ${type} requires a non-empty string "id"`,
 		);
 	}
 	return (params as Record<string, unknown>).id as string;
@@ -76,84 +77,132 @@ export function createSessionRequestHandler(
 	queue: EventQueue,
 	sessionStore: SessionStore,
 	characterDir?: string,
+	daemonsRef?: { current: EventDropDaemon[] },
 ): (method: string, params: unknown) => Promise<unknown> {
 	return async (method, params) => {
-		if (method === "sessions.new.v1") {
-			const id = Bun.randomUUIDv7();
-			await sessionStore.create(id);
-			return { id };
-		}
+		if (method === "sessions") {
+			const type =
+				typeof params === "object" && params !== null
+					? (params as Record<string, unknown>).type
+					: undefined;
 
-		if (method === "sessions.switch.v1") {
-			const id = requireSessionParamsId(
-				manifestName,
-				params,
-				"sessions.switch.v1",
-			);
-			// Pre-check: reject immediately if the session does not exist, so the module
-			// gets a synchronous error rather than a later event.dropped.v1.
-			// The LLM loop loads the file again at apply time because the file may be
-			// removed or become unreadable between this check and the queue drain.
-			const history = await sessionStore.load(id);
-			if (history === null) {
-				throw new Error(
-					`${manifestName}: sessions.switch.v1: session "${id}" is unreadable or does not exist`,
-				);
+			if (type === "sessions.new.v1") {
+				const id = Bun.randomUUIDv7();
+				await sessionStore.create(id);
+				return { id };
 			}
-			queue.enqueue(manifestName, { type: "sessions.switch.v1", id });
-			// Enqueue INIT before returning "ok" so it is ahead of any event the caller
-			// sends after receiving the response. Only fires for empty (new) sessions.
-			if (history.length === 0 && characterDir) {
-				const initText = await readInitContent(characterDir);
-				if (initText) {
-					queue.enqueue(manifestName, { type: "event.v1", text: initText });
+
+			if (type === "sessions.switch.v1") {
+				const id = requireParamsId(manifestName, params, "sessions.switch.v1");
+				// Pre-check: reject immediately if the session does not exist, so the module
+				// gets a synchronous error rather than a later event.dropped.v1.
+				// The LLM loop loads the file again at apply time because the file may be
+				// removed or become unreadable between this check and the queue drain.
+				const history = await sessionStore.load(id);
+				if (history === null) {
+					throw new Error(
+						`${manifestName}: sessions.switch.v1: session "${id}" is unreadable or does not exist`,
+					);
 				}
+				queue.enqueue(manifestName, { type: "sessions.switch.v1", id });
+				// Enqueue INIT before returning "ok" so it is ahead of any event the caller
+				// sends after receiving the response. Only fires for empty (new) sessions.
+				if (history.length === 0 && characterDir) {
+					const initText = await readInitContent(characterDir);
+					if (initText) {
+						queue.enqueue(manifestName, { type: "event.v1", text: initText });
+					}
+				}
+				return "ok";
 			}
-			return "ok";
-		}
 
-		if (method === "sessions.active.v1") {
-			const activeId = await resolveReadableOrFallbackActiveSessionId(
-				queue,
-				sessionStore,
-			);
-			if (activeId !== null) {
-				return { id: activeId };
-			}
+			if (type === "sessions.active.v1") {
+				const activeId = await resolveReadableOrFallbackActiveSessionId(
+					queue,
+					sessionStore,
+				);
+				if (activeId !== null) {
+					return { id: activeId };
+				}
 
-			throw new Error(`${manifestName}: sessions.active.v1: no active session`);
-		}
-
-		if (method === "sessions.list.v1") {
-			return { ids: sessionStore.list() };
-		}
-
-		if (method === "sessions.delete.v1") {
-			const id = requireSessionParamsId(
-				manifestName,
-				params,
-				"sessions.delete.v1",
-			);
-			await sessionStore.delete(id);
-			if (id === queue.getMeta(ACTIVE_SESSION_META_KEY)) {
-				queue.deleteMeta(ACTIVE_SESSION_META_KEY);
-			}
-			return "ok";
-		}
-
-		if (method === "sessions.get.v1") {
-			const id = requireSessionParamsId(
-				manifestName,
-				params,
-				"sessions.get.v1",
-			);
-			const history = await sessionStore.load(id);
-			if (history === null) {
 				throw new Error(
-					`${manifestName}: sessions.get.v1: session "${id}" does not exist or could not be read`,
+					`${manifestName}: sessions.active.v1: no active session`,
 				);
 			}
-			return { history };
+
+			if (type === "sessions.list.v1") {
+				return { ids: sessionStore.list() };
+			}
+
+			if (type === "sessions.delete.v1") {
+				const id = requireParamsId(manifestName, params, "sessions.delete.v1");
+				await sessionStore.delete(id);
+				if (id === queue.getMeta(ACTIVE_SESSION_META_KEY)) {
+					queue.deleteMeta(ACTIVE_SESSION_META_KEY);
+				}
+				return "ok";
+			}
+
+			if (type === "sessions.get.v1") {
+				const id = requireParamsId(manifestName, params, "sessions.get.v1");
+				const history = await sessionStore.load(id);
+				if (history === null) {
+					throw new Error(
+						`${manifestName}: sessions.get.v1: session "${id}" does not exist or could not be read`,
+					);
+				}
+				return { history };
+			}
+
+			if (type === "sessions.interrupt.v1") {
+				if (typeof params !== "object" || params === null) {
+					throw new Error(
+						`${manifestName}: sessions.interrupt.v1 requires an object params`,
+					);
+				}
+				const { type: _type, ...payload } = params as Record<string, unknown>;
+				const previous = queue.setInterrupt(manifestName, {
+					type: "event.v1",
+					...payload,
+				});
+				if (previous && daemonsRef) {
+					const daemon = daemonsRef.current.find(
+						(d) => d.manifest.name === previous.source,
+					);
+					if (daemon) {
+						daemon.peer.notify("event", {
+							type: "event.dropped.v1",
+							source: previous.source,
+							timestamp: new Date().toISOString(),
+							params: previous.params,
+						});
+					} else {
+						console.error(
+							`[core] interrupt overwrite lost: source=${previous.source}`,
+						);
+					}
+				}
+				return "ok";
+			}
+
+			if (type === "sessions.skip.v1") {
+				const aborted = queue.abortCurrentRun();
+				return aborted ? "ok" : "no-op";
+			}
+
+			if (type === "sessions.kill.v1") {
+				const killed = queue.killPending();
+				if (daemonsRef) {
+					for (const event of killed) {
+						notifyEventDropped(daemonsRef.current, event);
+					}
+				}
+				return "ok";
+			}
+
+			throw new Error(
+				`${manifestName}: unsupported sessions type "${String(type)}"`,
+			);
 		}
 
 		throw new Error(`${manifestName}: unsupported method "${method}"`);

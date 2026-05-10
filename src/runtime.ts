@@ -313,6 +313,7 @@ function createPeer(
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
+	daemons: StartedDaemon[],
 	characterDir?: string,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
@@ -339,6 +340,7 @@ function createPeer(
 			queue,
 			sessionStore,
 			characterDir,
+			{ current: daemons },
 		),
 	});
 }
@@ -387,6 +389,7 @@ export async function startDaemon(
 		onFailure?: DaemonFailureHandler;
 		restartAttempts?: number;
 		queue: EventQueue;
+		daemons?: StartedDaemon[];
 	},
 ): Promise<StartedDaemon> {
 	throwIfAborted(options.abortSignal);
@@ -409,6 +412,7 @@ export async function startDaemon(
 		process,
 		options.queue,
 		options.sessionStore,
+		options.daemons ?? [],
 		options.characterDir,
 	);
 	const daemon: StartedDaemon = {
@@ -630,6 +634,7 @@ async function restartFailedDaemon(
 			queue: eventQueue,
 			sessionStore: options.sessionStore,
 			characterDir: options.characterDir,
+			daemons,
 			onFailure: (failedDaemon, failureError) => {
 				handleDaemonFailure(
 					failedDaemon,
@@ -702,6 +707,7 @@ export async function reloadModules(
 					queue: eventQueue,
 					sessionStore: options.sessionStore,
 					characterDir: options.characterDir,
+					daemons: daemonsRef.current,
 					onFailure: (daemon, error) => {
 						handleDaemonFailure(
 							daemon,

@@ -1,10 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import {
-	loadHomeAgentsFile,
-	resolveCharacterDir,
-	resolveSkillsDir,
-} from "./agent-context";
+import { resolveCharacterDir, resolveSkillsDir } from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import {
 	bootstrapRuntime,
@@ -77,7 +73,6 @@ async function main(): Promise<void> {
 		eventQueue = result.eventQueue;
 		timerSchedulerRef.current = result.timerScheduler;
 		const homeDir = path.dirname(result.modulesRoot);
-		const operatorContext = await loadHomeAgentsFile(homeDir);
 		const workspaceTools = createWorkspaceTools(
 			workspaceDir,
 			historyDir,
@@ -99,7 +94,7 @@ async function main(): Promise<void> {
 				workspaceDir,
 				historyDir,
 				characterDir,
-				operatorContext: operatorContext || undefined,
+				homeDir,
 				modulesRoot: result.modulesRoot,
 				skillsDir,
 				abortSignal: abortController.signal,

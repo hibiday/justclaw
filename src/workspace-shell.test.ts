@@ -1,22 +1,12 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-describe("WorkspaceShell with mocked sandbox base command", () => {
-	test("invokes createWorkspaceSandboxBaseCommand and runs sh -c", async () => {
-		const createWorkspaceSandboxBaseCommand = mock(() =>
-			Promise.resolve({
-				backend: "bwrap" as const,
-				cmdPrefix: [] as string[],
-				env: process.env as NodeJS.ProcessEnv,
-			}),
-		);
+const hasBwrap = Boolean(Bun.which("bwrap"));
 
-		mock.module("./sandbox", () => ({
-			createWorkspaceSandboxBaseCommand,
-		}));
-
+describe("WorkspaceShell", () => {
+	test.skipIf(!hasBwrap)("runs sh -c commands and returns output", async () => {
 		const { WorkspaceShell } = await import("./workspace");
 		const root = await mkdtemp(path.join(os.tmpdir(), "justclaw-sh-"));
 		const hist = path.join(root, "h");
@@ -26,10 +16,10 @@ describe("WorkspaceShell with mocked sandbox base command", () => {
 			const result = await shell.run({ commands: ["echo marker"] });
 			expect(result.output).toHaveLength(1);
 			expect(result.output[0]?.stdout.trim()).toBe("marker");
-			expect(result.output[0]?.outcome).toEqual({ type: "exit", exitCode: 0 });
-			expect(
-				createWorkspaceSandboxBaseCommand.mock.calls.length,
-			).toBeGreaterThan(0);
+			expect(result.output[0]?.outcome).toEqual({
+				type: "exit",
+				exitCode: 0,
+			});
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
