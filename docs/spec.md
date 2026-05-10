@@ -65,12 +65,7 @@ For ordinary event semantics, modules should use another payload field such as `
 | `tool/{name}` | core -> module | request | Invoke a tool exposed by the module |
 | `shutdown` | core -> module | request | Graceful stop |
 | `event` | module -> core | notification | LLM-bound event emitted by the module |
-| `sessions.new.v1` | module -> core | request | Create a new session; core returns its id |
-| `sessions.switch.v1` | module -> core | request | Enqueue a switch to an existing session (returns when enqueued, not when applied) |
-| `sessions.active.v1` | module -> core | request | Return the currently active session id |
-| `sessions.list.v1` | module -> core | request | List all session ids |
-| `sessions.get.v1` | module -> core | request | Retrieve history for a session |
-| `sessions.delete.v1` | module -> core | request | Delete a session's history file |
+| `sessions` | module -> core | request | Session operations; `params.type` selects the operation (see [Module → Core Session Requests](#module--core-session-requests)) |
 | `event` | core -> module | notification | Core-initiated notification (see Core → Module Messaging) |
 
 ## Module → Core Notification Types
@@ -120,7 +115,7 @@ Emitted by a module (or enqueued by the built-in `attach_file` tool) to attach a
 
 ## Module → Core Session Requests
 
-Session operations use JSON-RPC request/response so the module can confirm the result before emitting subsequent events.
+Session operations use JSON-RPC request/response (`method: "sessions"`) so the module can confirm the result before emitting subsequent events. The `params.type` field selects the operation.
 
 The bundled runtime always configures a session store (per-session history files under the history directory). A file is treated as a session only when all of the following hold: filename is UUID `{id}.json`, file is readable, JSON parsing succeeds, and the top-level JSON value is an array (minimum condition for `AgentInputItem[]`). Other `*.json` files and unreadable/invalid UUID files are not sessions. The session methods below assume that store is present.
 
@@ -133,7 +128,7 @@ Creates a new session and immediately writes an empty history file (`[]`). The c
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "sessions.new.v1" }
+{ "jsonrpc": "2.0", "id": 1, "method": "sessions", "params": { "type": "sessions.new.v1" } }
 ```
 
 Response:
@@ -155,7 +150,7 @@ The session becomes active before the next `event.v1` is processed by the LLM.
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 2, "method": "sessions.switch.v1", "params": { "id": "0196f4a2-..." } }
+{ "jsonrpc": "2.0", "id": 2, "method": "sessions", "params": { "type": "sessions.switch.v1", "id": "0196f4a2-..." } }
 ```
 
 Response:
@@ -198,7 +193,7 @@ The core returns a JSON-RPC error when no id is available from either step above
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 3, "method": "sessions.active.v1" }
+{ "jsonrpc": "2.0", "id": 3, "method": "sessions", "params": { "type": "sessions.active.v1" } }
 ```
 
 Response (when a session is active):
@@ -218,7 +213,7 @@ Returns the ids of all readable sessions (UUID `{id}.json` files that can be rea
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 3, "method": "sessions.list.v1" }
+{ "jsonrpc": "2.0", "id": 3, "method": "sessions", "params": { "type": "sessions.list.v1" } }
 ```
 
 Response:
@@ -240,7 +235,7 @@ The `history` field contains the raw `AgentInputItem[]` used internally by the L
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 4, "method": "sessions.get.v1", "params": { "id": "0196f4a2-..." } }
+{ "jsonrpc": "2.0", "id": 4, "method": "sessions", "params": { "type": "sessions.get.v1", "id": "0196f4a2-..." } }
 ```
 
 Response:
@@ -264,7 +259,7 @@ If a session is deleted while an LLM turn is in-flight, completion of that turn 
 Request:
 
 ```json
-{ "jsonrpc": "2.0", "id": 7, "method": "sessions.delete.v1", "params": { "id": "0196f4a2-..." } }
+{ "jsonrpc": "2.0", "id": 7, "method": "sessions", "params": { "type": "sessions.delete.v1", "id": "0196f4a2-..." } }
 ```
 
 Response:
@@ -276,6 +271,69 @@ Response:
 | Field | Type | Description |
 |---|---|---|
 | `id` | string | Session identifier. Must be a UUID (case-insensitive). Use the value returned by `sessions.new.v1` or an existing on-disk id. |
+
+### `sessions.interrupt.v1`
+
+Sets a single in-memory interrupt slot in the LLM loop. When the current run finishes (or is aborted via `sessions.skip.v1`), the loop checks the slot before calling `eventQueue.next()`. If set, the interrupt event is processed immediately without going through the SQLite queue.
+
+Only one slot exists. A second `sessions.interrupt.v1` overwrites the first; the overwritten event receives `event.dropped.v1`. The source of the interrupt event is the calling module name. All fields in `params` except `type` are forwarded as the event payload.
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "sessions",
+  "params": {
+    "type": "sessions.interrupt.v1",
+    "kind": "urgent",
+    "text": "..."
+  }
+}
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 5, "result": "ok" }
+```
+
+### `sessions.skip.v1`
+
+Aborts the currently running LLM cycle. The running event receives `event.dropped.v1` and is removed from the queue. If no run is active, returns `"no-op"`.
+
+Combine with `sessions.interrupt.v1` for immediate effect: set the interrupt slot, then call `sessions.skip.v1` to abort the current run. The loop picks up the interrupt slot as the next event instead of pulling from the queue.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 6, "method": "sessions", "params": { "type": "sessions.skip.v1" } }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 6, "result": "ok" }
+```
+
+`result` is `"ok"` when a run was aborted, `"no-op"` when nothing was running.
+
+### `sessions.kill.v1`
+
+Deletes all pending (not yet running) events from the queue. For each dropped event, `event.dropped.v1` is delivered to its source module. The event currently being processed by the LLM is not affected.
+
+Request:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "sessions", "params": { "type": "sessions.kill.v1" } }
+```
+
+Response:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": "ok" }
+```
 
 ## Lifecycle (daemon)
 
@@ -356,11 +414,11 @@ If the resolved interpreter is outside the sandbox's standard read-only allowlis
 
 ## Operator instructions
 
-The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` once at startup. If present, its content is prepended to the character context instructions before every LLM turn.
+The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is prepended to the character context instructions.
 
-This file is outside all sandbox write paths, so the agent cannot modify it. It is loaded once at process startup; changes to the file are not visible until the process restarts.
+This file is outside all sandbox write paths, so the agent cannot modify it. Changes to the file take effect on the next turn without restarting the process.
 
-Use this file for immutable operator-level instructions that must persist regardless of character directory contents.
+Use this file for operator-level instructions that must persist regardless of character directory contents.
 
 ## Character directory
 

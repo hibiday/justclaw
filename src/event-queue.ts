@@ -36,10 +36,17 @@ export function resolveEventQueuePath(
 
 type Waiter = (value: QueuedEvent | undefined) => void;
 
+type InterruptSlot = {
+	source: string;
+	params: Record<string, unknown>;
+};
+
 export class EventQueue {
 	#db: Database;
 	#closed = false;
 	#waiter: Waiter | null = null;
+	#runController: AbortController | null = null;
+	#interrupt: InterruptSlot | null = null;
 
 	constructor(dbPath: string) {
 		// SQLite opens the file path as-is; it does not create missing parents.
@@ -159,6 +166,59 @@ export class EventQueue {
 			source: row.source,
 			params: JSON.parse(row.params) as QueuedEvent["params"],
 		}));
+	}
+
+	// Set the in-memory interrupt slot. Returns the previously set slot if any
+	// (caller is responsible for emitting event.dropped.v1 for it).
+	setInterrupt(
+		source: string,
+		params: Record<string, unknown>,
+	): InterruptSlot | null {
+		const previous = this.#interrupt;
+		this.#interrupt = { source, params };
+		return previous;
+	}
+
+	// Consume and clear the interrupt slot. Returns null if no interrupt is set.
+	consumeInterrupt(): InterruptSlot | null {
+		const slot = this.#interrupt;
+		this.#interrupt = null;
+		return slot;
+	}
+
+	// Delete all pending events and return them. Caller is responsible for
+	// emitting event.dropped.v1 to each source.
+	killPending(): QueuedEvent[] {
+		const rows = this.#db
+			.query(
+				"SELECT id, source, params FROM events WHERE state = 'pending' ORDER BY id ASC",
+			)
+			.all() as { id: string; source: string; params: string }[];
+		if (rows.length > 0) {
+			this.#db.run("DELETE FROM events WHERE state = 'pending'");
+		}
+		return rows.map((row) => ({
+			id: row.id,
+			source: row.source,
+			params: JSON.parse(row.params) as QueuedEvent["params"],
+		}));
+	}
+
+	// Register the AbortController for the currently running LLM cycle so that
+	// sessions.skip.v1 can abort it.
+	setRunController(ctrl: AbortController | null): void {
+		this.#runController = ctrl;
+	}
+
+	// Abort the current LLM run. Returns true if a run was active, false otherwise.
+	abortCurrentRun(): boolean {
+		const ctrl = this.#runController;
+		if (!ctrl) {
+			return false;
+		}
+		this.#runController = null;
+		ctrl.abort();
+		return true;
 	}
 
 	close(): void {

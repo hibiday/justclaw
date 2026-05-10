@@ -13,6 +13,7 @@ import {
 import OpenAI from "openai";
 import {
 	loadAgentContext,
+	loadHomeAgentsFile,
 	loadSkillsIndex,
 	readInitContent,
 } from "./agent-context";
@@ -244,7 +245,7 @@ export type LlmLoopOptions = {
 	historyDir?: string;
 	characterDir?: string;
 	contextInstructions?: string;
-	operatorContext?: string;
+	homeDir?: string;
 	modulesRoot?: string;
 	skillsDir?: string;
 	sandboxFactory?: BootstrapRuntimeOptions["sandboxFactory"];
@@ -396,7 +397,17 @@ export async function runLlmLoop(
 	};
 
 	while (true) {
-		const event = await eventQueue.next();
+		// Interrupt slot takes priority over the persistent queue. Interrupt events
+		// are synthetic (not stored in the DB), so complete() is skipped for them.
+		const interrupt = eventQueue.consumeInterrupt();
+		const isInterrupt = interrupt !== null;
+		const event = isInterrupt
+			? {
+					id: Bun.randomUUIDv7(),
+					source: interrupt.source,
+					params: interrupt.params,
+				}
+			: await eventQueue.next();
 		if (!event) {
 			break;
 		}
@@ -693,11 +704,14 @@ export async function runLlmLoop(
 			}),
 		];
 
+		const operatorContext = options?.homeDir
+			? await loadHomeAgentsFile(options.homeDir)
+			: undefined;
 		const characterContext = options?.characterDir
 			? await loadAgentContext(options.characterDir)
 			: options?.contextInstructions;
 		const contextInstructions =
-			[options?.operatorContext, characterContext]
+			[operatorContext || undefined, characterContext]
 				.filter(Boolean)
 				.join("\n\n") || undefined;
 		const modules = daemonsRef.current.map((d) => ({
@@ -780,6 +794,15 @@ export async function runLlmLoop(
 						} as AgentInputItem)
 					: ({ role: "user", content: xml } as AgentInputItem);
 
+		const runController = new AbortController();
+		// Propagate the process-level abort into the per-run controller so that
+		// either a sessions.skip.v1 request or a process shutdown aborts the run.
+		options?.abortSignal?.addEventListener(
+			"abort",
+			() => runController.abort(),
+			{ once: true },
+		);
+		eventQueue.setRunController(runController);
 		try {
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
@@ -787,7 +810,9 @@ export async function runLlmLoop(
 					: event.params.type === "event.v1"
 						? xml
 						: [userInput];
-			const result = await runner.run(agent, runInput);
+			const result = await runner.run(agent, runInput, {
+				signal: runController.signal,
+			});
 			const text = result.finalOutput;
 			if (text?.trim()) {
 				const targetDaemon = daemonsRef.current.find(
@@ -808,13 +833,15 @@ export async function runLlmLoop(
 					resetSessionState(session);
 				}
 			}
-			eventQueue.complete(event.id);
+			if (!isInterrupt) eventQueue.complete(event.id);
 		} catch (error) {
 			console.error(
 				`[core] LLM cycle failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			notifyEventDropped(daemonsRef.current, event);
-			eventQueue.complete(event.id);
+			if (!isInterrupt) eventQueue.complete(event.id);
+		} finally {
+			eventQueue.setRunController(null);
 		}
 	}
 }

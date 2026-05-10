@@ -2607,9 +2607,9 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-module",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const newResult = await sendRequest("sessions.new.v1");',
-				'const listResult = await sendRequest("sessions.list.v1");',
-				`const getResult = await sendRequest("sessions.get.v1", { id: ${JSON.stringify(existingId)} });`,
+				'const newResult = await sendRequest("sessions", { type: "sessions.new.v1" });',
+				'const listResult = await sendRequest("sessions", { type: "sessions.list.v1" });',
+				`const getResult = await sendRequest("sessions", { type: "sessions.get.v1", id: ${JSON.stringify(existingId)} });`,
 				"await Bun.write(resultPath, JSON.stringify({ newResult, listResult, getResult }));",
 			]),
 		);
@@ -2650,7 +2650,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			"session-get-invalid",
 			createJsonRpcStdinClientModuleScript(resultPath, [
 				"try {",
-				'  await sendRequest("sessions.get.v1", { id: "not-a-uuid" });',
+				'  await sendRequest("sessions", { type: "sessions.get.v1", id: "not-a-uuid" });',
 				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
 				"} catch (e) {",
 				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
@@ -2689,7 +2689,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			"session-get-missing",
 			createJsonRpcStdinClientModuleScript(resultPath, [
 				"try {",
-				`  await sendRequest("sessions.get.v1", { id: ${JSON.stringify(missingId)} });`,
+				`  await sendRequest("sessions", { type: "sessions.get.v1", id: ${JSON.stringify(missingId)} });`,
 				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
 				"} catch (e) {",
 				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
@@ -2732,7 +2732,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			"session-get-corrupt",
 			createJsonRpcStdinClientModuleScript(resultPath, [
 				"try {",
-				`  await sendRequest("sessions.get.v1", { id: ${JSON.stringify(corruptId)} });`,
+				`  await sendRequest("sessions", { type: "sessions.get.v1", id: ${JSON.stringify(corruptId)} });`,
 				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
 				"} catch (e) {",
 				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
@@ -2772,7 +2772,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			"session-switch-missing",
 			createJsonRpcStdinClientModuleScript(resultPath, [
 				"try {",
-				`  await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(missingId)} });`,
+				`  await sendRequest("sessions", { type: "sessions.switch.v1", id: ${JSON.stringify(missingId)} });`,
 				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
 				"} catch (e) {",
 				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
@@ -2813,7 +2813,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			"session-active-module",
 			createJsonRpcStdinClientModuleScript(resultPath, [
 				"try {",
-				'  await sendRequest("sessions.active.v1");',
+				'  await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"  await Bun.write(resultPath, JSON.stringify({ ok: true }));",
 				"} catch (e) {",
 				"  await Bun.write(resultPath, JSON.stringify({ err: e instanceof Error ? e.message : String(e) }));",
@@ -2856,7 +2856,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-active-newest",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const activeResult = await sendRequest("sessions.active.v1");',
+				'const activeResult = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
 			]),
 		);
@@ -2897,7 +2897,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-active-newest-readable",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const activeResult = await sendRequest("sessions.active.v1");',
+				'const activeResult = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
 			]),
 		);
@@ -2939,7 +2939,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-active-meta",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const activeResult = await sendRequest("sessions.active.v1");',
+				'const activeResult = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
 			]),
 		);
@@ -2976,9 +2976,9 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-new-keeps-active",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const before = await sendRequest("sessions.active.v1");',
-				'const created = await sendRequest("sessions.new.v1");',
-				'const after = await sendRequest("sessions.active.v1");',
+				'const before = await sendRequest("sessions", { type: "sessions.active.v1" });',
+				'const created = await sendRequest("sessions", { type: "sessions.new.v1" });',
+				'const after = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ before, created, after }));",
 			]),
 		);
@@ -3026,8 +3026,8 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-delete-active",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				`await sendRequest("sessions.delete.v1", { id: ${JSON.stringify(activeId)} });`,
-				'const active = await sendRequest("sessions.active.v1");',
+				`await sendRequest("sessions", { type: "sessions.delete.v1", id: ${JSON.stringify(activeId)} });`,
+				'const active = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ active }));",
 			]),
 		);
@@ -3071,7 +3071,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-active-invalid-meta",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const activeResult = await sendRequest("sessions.active.v1");',
+				'const activeResult = await sendRequest("sessions", { type: "sessions.active.v1" });',
 				"await Bun.write(resultPath, JSON.stringify({ activeResult }));",
 			]),
 		);
@@ -3110,7 +3110,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			homeDir,
 			"session-switch-module",
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				`const switchResult = await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(sessionId)} });`,
+				`const switchResult = await sendRequest("sessions", { type: "sessions.switch.v1", id: ${JSON.stringify(sessionId)} });`,
 				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "after-switch" } }) + "\\n");',
 				"await Bun.write(resultPath, JSON.stringify({ switchResult }));",
 			]),
@@ -3232,8 +3232,8 @@ describe("INIT.md startup hook", () => {
 				replyable: true,
 			}),
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const newId = (await sendRequest("sessions.new.v1")).id;',
-				`await sendRequest("sessions.switch.v1", { id: newId });`,
+				'const newId = (await sendRequest("sessions", { type: "sessions.new.v1" })).id;',
+				`await sendRequest("sessions", { type: "sessions.switch.v1", id: newId });`,
 				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
 				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
 			]),
@@ -3300,7 +3300,7 @@ describe("INIT.md startup hook", () => {
 				replyable: true,
 			}),
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				`await sendRequest("sessions.switch.v1", { id: ${JSON.stringify(existingId)} });`,
+				`await sendRequest("sessions", { type: "sessions.switch.v1", id: ${JSON.stringify(existingId)} });`,
 				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
 				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
 			]),
@@ -3364,8 +3364,8 @@ describe("INIT.md startup hook", () => {
 				replyable: true,
 			}),
 			createJsonRpcStdinClientModuleScript(resultPath, [
-				'const newId = (await sendRequest("sessions.new.v1")).id;',
-				`await sendRequest("sessions.switch.v1", { id: newId });`,
+				'const newId = (await sendRequest("sessions", { type: "sessions.new.v1" })).id;',
+				`await sendRequest("sessions", { type: "sessions.switch.v1", id: newId });`,
 				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "user-event" } }) + "\\n");',
 				"await Bun.write(resultPath, JSON.stringify({ done: true }));",
 			]),
