@@ -1,6 +1,6 @@
 import { readInitContent } from "./agent-context";
-import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import { type EventDropDaemon, notifyEventDropped } from "./event-dropped";
+import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
 export type EventParams = Record<string, unknown> & {
@@ -93,11 +93,7 @@ export function createSessionRequestHandler(
 			}
 
 			if (type === "sessions.switch.v1") {
-				const id = requireParamsId(
-					manifestName,
-					params,
-					"sessions.switch.v1",
-				);
+				const id = requireParamsId(manifestName, params, "sessions.switch.v1");
 				// Pre-check: reject immediately if the session does not exist, so the module
 				// gets a synchronous error rather than a later event.dropped.v1.
 				// The LLM loop loads the file again at apply time because the file may be
@@ -139,11 +135,7 @@ export function createSessionRequestHandler(
 			}
 
 			if (type === "sessions.delete.v1") {
-				const id = requireParamsId(
-					manifestName,
-					params,
-					"sessions.delete.v1",
-				);
+				const id = requireParamsId(manifestName, params, "sessions.delete.v1");
 				await sessionStore.delete(id);
 				if (id === queue.getMeta(ACTIVE_SESSION_META_KEY)) {
 					queue.deleteMeta(ACTIVE_SESSION_META_KEY);
@@ -152,11 +144,7 @@ export function createSessionRequestHandler(
 			}
 
 			if (type === "sessions.get.v1") {
-				const id = requireParamsId(
-					manifestName,
-					params,
-					"sessions.get.v1",
-				);
+				const id = requireParamsId(manifestName, params, "sessions.get.v1");
 				const history = await sessionStore.load(id);
 				if (history === null) {
 					throw new Error(

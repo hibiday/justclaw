@@ -243,7 +243,9 @@ async function handleSlashCommand(input: string): Promise<void> {
 	if (command === "/sessions") {
 		try {
 			const list = await rpcRequest("sessions", { type: "sessions.list.v1" });
-			const active = await rpcRequest("sessions", { type: "sessions.active.v1" });
+			const active = await rpcRequest("sessions", {
+				type: "sessions.active.v1",
+			});
 			const listIds = isRecord(list) && Array.isArray(list.ids) ? list.ids : [];
 			const activeId =
 				isRecord(active) && typeof active.id === "string" ? active.id : null;
@@ -315,7 +317,10 @@ async function handleSlashCommand(input: string): Promise<void> {
 				);
 				return;
 			}
-			const response = await rpcRequest("sessions", { type: "sessions.get.v1", id });
+			const response = await rpcRequest("sessions", {
+				type: "sessions.get.v1",
+				id,
+			});
 			const history =
 				isRecord(response) && Array.isArray(response.history)
 					? response.history
