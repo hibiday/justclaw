@@ -565,6 +565,26 @@ function handleDaemonFailure(
 	});
 }
 
+// Maximum automatic restarts for a daemon that exits unexpectedly. Defaults to
+// 1 (one restart recovers transient process failure). Read at the point of use
+// and tolerant of bad input on purpose: this runs inside the fire-and-forget
+// failure-recovery path, so a typo must not throw and crash recovery — it warns
+// and falls back to the default instead.
+function resolveMaxRestartAttempts(): number {
+	const raw = process.env.JUSTCLAW_MAX_RESTART_ATTEMPTS;
+	if (raw === undefined || raw === "") {
+		return 1;
+	}
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		console.error(
+			`JUSTCLAW_MAX_RESTART_ATTEMPTS must be a non-negative integer, got ${JSON.stringify(raw)}; using default 1`,
+		);
+		return 1;
+	}
+	return parsed;
+}
+
 async function restartFailedDaemon(
 	daemon: StartedDaemon,
 	error: Error,
@@ -598,9 +618,7 @@ async function restartFailedDaemon(
 		return;
 	}
 
-	if (daemon.restartAttempts >= 1) {
-		// One automatic restart recovers transient process failure without
-		// introducing restart-loop policy before config exists.
+	if (daemon.restartAttempts >= resolveMaxRestartAttempts()) {
 		console.error(
 			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
 		);

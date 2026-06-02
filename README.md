@@ -64,6 +64,8 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_HOME` | no | `$HOME/justclaw` | Root directory for modules, workspace, history, character, and skills |
 | `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |
 | `JUSTCLAW_SKILLS` | no | `$JUSTCLAW_HOME/skills` | Override path for the skills directory |
+| `JUSTCLAW_MAX_TURNS` | no | `10` | Maximum agent turns (LLM call to tool calls to repeat) per event before the runner gives up. Positive integer |
+| `JUSTCLAW_MAX_RESTART_ATTEMPTS` | no | `1` | Maximum automatic restarts for a daemon that exits unexpectedly. Non-negative integer (`0` disables restart) |
 
 ## Architecture
 
