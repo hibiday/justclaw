@@ -58,6 +58,22 @@ export function resolveModelConfig(): string {
 	return model;
 }
 
+// Maximum agent turns (LLM call -> tool calls -> repeat) per event before the
+// runner gives up. Defaults to 10, matching the @openai/agents default.
+export function resolveMaxTurns(): number {
+	const raw = process.env.JUSTCLAW_MAX_TURNS;
+	if (raw === undefined || raw === "") {
+		return 10;
+	}
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 1) {
+		throw new Error(
+			`JUSTCLAW_MAX_TURNS must be a positive integer, got ${JSON.stringify(raw)}`,
+		);
+	}
+	return parsed;
+}
+
 function escapeXml(s: string): string {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -383,6 +399,7 @@ export async function runLlmLoop(
 	options?: LlmLoopOptions,
 ): Promise<void> {
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
+	const maxTurns = resolveMaxTurns();
 	const sessionStore = options?.sessionStore;
 	const baseAgent = new Agent({
 		name: "justclaw",
@@ -812,6 +829,7 @@ export async function runLlmLoop(
 						: [userInput];
 			const result = await runner.run(agent, runInput, {
 				signal: runController.signal,
+				maxTurns,
 			});
 			const text = result.finalOutput;
 			if (text?.trim()) {
