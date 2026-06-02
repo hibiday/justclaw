@@ -30,8 +30,15 @@ function createShutdownSignal(): {
 		process.off("SIGTERM", finish);
 	};
 
-	process.once("SIGINT", finish);
-	process.once("SIGTERM", finish);
+	// Use `on`, not `once`: @openai/agents' tracing provider installs its own
+	// SIGINT/SIGTERM handlers that call process.exit() unless another listener
+	// is still registered (it checks process.listeners(sig).length > 1). A
+	// `once` listener removes itself the moment the signal fires, so by the time
+	// the SDK handler runs it sees no other listener and exits the process —
+	// killing the core before stopDaemons can stop the module subprocesses,
+	// orphaning them. `finish` is idempotent, so a persistent listener is safe.
+	process.on("SIGINT", finish);
+	process.on("SIGTERM", finish);
 
 	return { dispose, promise };
 }
