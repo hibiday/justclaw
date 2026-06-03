@@ -805,7 +805,7 @@ Use this when the task is complete and no reply is needed — for example after 
 
 Event payloads are arbitrary JSON objects. The canonical text-oriented envelope is `type: "event.v1"`. The core uses `type` for envelope handling and does not forward that field to the LLM as a literal key in the user string. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
-**Multimodal envelopes (`image.send.v1`, `file.send.v1`):** The core still builds the same XML wrapper (`eventToXml`) from the payload (with `type` stripped before serialization). That XML is passed as an `input_text` part. In addition, the core passes a second content part: `input_image` and `input_file` both use a **data URL string** (`data:<mediaType>;base64,<data>`), matching what the Chat Completions path accepts. These rows are processed in the same session-adoption path as `event.v1`.
+**Multimodal envelopes (`image.send.v1`, `file.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so `mediaType` and `filename` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image` and `input_file` both use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
 
 **Conversion rules (for the XML half):**
 
