@@ -113,7 +113,14 @@ function objectToXml(obj: Record<string, unknown>, indent = "  "): string {
 
 export function eventToXml(event: QueuedEvent): string {
 	const timestamp = timestampFromUUIDv7(event.id);
-	const { type: _type, ...rest } = event.params;
+	const { type, ...rest } = event.params;
+	// For multimodal envelopes the base64 `data` rides a separate input_image /
+	// input_file content part (see the userInput builder below). Keep it out of
+	// the XML so the bytes are not sent twice; the text copy blows past the
+	// context window. The small descriptive fields (mediaType, filename) stay.
+	if (type === "image.send.v1" || type === "file.send.v1") {
+		delete (rest as Record<string, unknown>).data;
+	}
 	const inner = objectToXml(rest);
 	const attrs = `source="${escapeXml(event.source)}" timestamp="${escapeXml(timestamp)}"`;
 	return inner
