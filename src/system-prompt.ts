@@ -1,4 +1,4 @@
-import { buildRuntimeInstructions } from "./spec";
+import { buildRuntimeInstructions } from "./runtime-prompt";
 
 export function buildSystemPrompt(options: {
 	contextInstructions?: string;

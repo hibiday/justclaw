@@ -8,8 +8,8 @@ import type { AgentInputItem, Runner } from "@openai/agents";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import { runLlmLoop } from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
+import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
-import { buildRuntimeInstructions } from "./spec";
 
 const tempDirs: string[] = [];
 
