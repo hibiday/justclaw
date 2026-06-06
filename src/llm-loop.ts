@@ -619,7 +619,7 @@ export async function runLlmLoop(
 				description:
 					"Read a local image file and attach it to the LLM input on the next event cycle. " +
 					"The current run continues normally after this call; the image arrives in the next cycle. " +
-					"The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).",
+					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
 					properties: {
@@ -645,6 +645,7 @@ export async function runLlmLoop(
 						historyDir: historyDirOpt,
 						characterDir,
 						modulesRoot,
+						skillsDir,
 					} = options;
 					const historyDir = historyDirOpt ?? workspaceDir;
 					const { path: pathArg } = input as { path: string };
@@ -656,6 +657,7 @@ export async function runLlmLoop(
 						resolved,
 						characterDir,
 						modulesRoot,
+						skillsDir,
 					);
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
@@ -675,7 +677,7 @@ export async function runLlmLoop(
 				description:
 					"Read a local file and attach it to the LLM input on the next event cycle. " +
 					"Suitable for PDFs and other documents. The file arrives in the next cycle. " +
-					"The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).",
+					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
 					properties: {
@@ -701,6 +703,7 @@ export async function runLlmLoop(
 						historyDir: historyDirOpt,
 						characterDir,
 						modulesRoot,
+						skillsDir,
 					} = options;
 					const historyDir = historyDirOpt ?? workspaceDir;
 					const { path: pathArg } = input as { path: string };
@@ -712,6 +715,7 @@ export async function runLlmLoop(
 						resolved,
 						characterDir,
 						modulesRoot,
+						skillsDir,
 					);
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
