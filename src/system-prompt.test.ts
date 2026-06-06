@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildRuntimeInstructions } from "./spec";
+import { buildRuntimeInstructions } from "./runtime-prompt";
 import { buildSystemPrompt } from "./system-prompt";
 
 describe("buildRuntimeInstructions", () => {
