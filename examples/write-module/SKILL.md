@@ -299,7 +299,7 @@ async function main(): Promise<void> {
 void main();
 ```
 
-Timer modules cannot serve tool calls — they exit after emitting. They can receive `event.dropped.v1` only if they keep running long enough to receive it (before `process.exit(0)`). For delivery-critical work, use a daemon with internal scheduling instead of a timer.
+Timer modules cannot serve tool calls — they exit after emitting. They also never receive `event.dropped.v1`: the core only routes drop notifications to registered daemons, and a timer is a short-lived process that is not registered, so a drop of a timer's event is logged and discarded. For delivery-critical work, use a daemon with internal scheduling instead of a timer.
 
 ## Emitting events to the LLM
 
@@ -313,7 +313,7 @@ Timer modules cannot serve tool calls — they exit after emitting. They can rec
 
 The core strips `type` from the payload and converts the remaining fields to XML before passing them to the LLM. Constraints:
 
-- Object keys become XML element names. Keys must be valid XML names (no leading digits, no spaces, no special characters).
+- Object keys become XML element names. Keys must be valid XML names (no leading digits, no spaces, no special characters). An invalid key is not skipped: it fails conversion of the whole event, which is then dropped (the source receives `event.dropped.v1`). Never use untrusted or dynamic strings as keys — put variable data in values, not keys.
 - Strings, numbers, and booleans become text content.
 - Arrays become repeated elements with the same tag name.
 - `null` values are omitted.
@@ -418,7 +418,7 @@ No destination information is included. The module determines where to deliver t
 
 | Field | Type | Description |
 |---|---|---|
-| `tool` | string | Tool name (`shell`, `create_file`, `edit_file`, `delete_file`, or a module tool) |
+| `tool` | string | Tool name. Workspace tools use their bare name (`shell`, `create_file`, `edit_file`, `delete_file`); module tools use the `{module}__{name}` form they are exposed under. |
 | `input` | object | Arguments passed to the tool by the LLM |
 | `output` | string | JSON-encoded result returned by the tool |
 
@@ -439,9 +439,9 @@ Sent to the **current delivery target**, which may not be the module that owns t
 |---|---|---|
 | `source` | string | Module that originally emitted the event |
 | `timestamp` | string | ISO 8601, when the event was received by the core |
-| `params` | object | Original event params as emitted |
+| `params` | object | Original event params as emitted, except the base64 `data` field is stripped from `image.send.v1` / `file.send.v1` events |
 
-The core does not retry delivery. Re-emitting the event is the module's responsibility.
+The core does not retry delivery. Re-emitting the event is the module's responsibility. Because `data` is stripped from dropped `image.send.v1` / `file.send.v1` events, re-emit from your own pending store (Pattern 2) rather than from `params`.
 
 ## Sessions API
 
@@ -457,7 +457,7 @@ All 9 operations:
 | `sessions.list.v1` | `{ ids }` | All readable session ids, sorted lexicographically (chronological for UUIDv7). |
 | `sessions.get.v1` | `{ history }` | Raw `AgentInputItem[]` for the session. Structure may change between versions. |
 | `sessions.delete.v1` | `"ok"` | Idempotent. Clears `active_session_id` metadata if the deleted session was active. |
-| `sessions.interrupt.v1` | `"ok"` | Sets the single in-memory interrupt slot. The payload (all fields except `type`) is delivered to the LLM before the next queue event. **Single slot only** — a second call overwrites the first; the displaced event's source receives `event.dropped.v1`. |
+| `sessions.interrupt.v1` | `"ok"` | Sets the single in-memory interrupt slot. The payload (all fields except `type`) is delivered to the LLM before the next queue event, always as an `event.v1` (text/XML) — you cannot inject `image.send.v1` / `file.send.v1` through an interrupt. **Single slot only** — a second call overwrites the first; the displaced event's source receives `event.dropped.v1`. |
 | `sessions.skip.v1` | `"ok"` or `"no-op"` | Aborts the current LLM run. The running event receives `event.dropped.v1`. Returns `"no-op"` if nothing is running. Combine with `sessions.interrupt.v1` for immediate effect. |
 | `sessions.kill.v1` | `"ok"` | Drops all pending (not yet running) events from the queue. Each source module receives `event.dropped.v1` for its dropped events. |
 
@@ -492,7 +492,7 @@ Timer modules can call `sessions.*` requests during their run, before `process.e
 LLM reply text is delivered to the source of the most recently consumed event from a **replyable** module.
 
 - Set `replyable: true` in `module.json` if your module should receive LLM text replies.
-- Non-replyable modules trigger LLM cycles but do not receive reply text. Replies fall back to the last replyable source.
+- Non-replyable modules trigger LLM cycles but do not receive reply text. Replies fall back to the last replyable source. If no replyable source has been recorded yet, the reply text is dropped — no module receives it.
 - `route_message(module, text)` is a built-in LLM tool that overrides the delivery target within a cycle. It is called by the LLM, not by modules.
 - `route_message` only works to a **different** replyable module than the current target; calling it with the current target returns an error.
 
