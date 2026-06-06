@@ -4,21 +4,7 @@ Path: {{WORKSPACE_DIR}}
 
 Your primary working area for file operations. Files here persist across sessions. You have read-write access.
 
-### shell(commands, timeout_ms?)
-
-Execute shell commands sequentially inside the workspace sandbox. Each command runs as `sh -c <command>` and does not share state with prior calls.
-
-### create_file(path, content)
-
-Write full content to a file. Overwrites the file if it already exists.
-
-### edit_file(path, old, new)
-
-Replace a substring in an existing file. old must match exactly once; if not unique, include more surrounding context.
-
-### delete_file(path)
-
-Delete a file.
+Tools: shell, create_file, edit_file, delete_file. See each tool's own description for usage.
 
 ## History
 
@@ -57,12 +43,8 @@ Modules directory: {{MODULES_ROOT}}
 {{MODULE_TABLE}}
 
 Module tools are called as {module}__{tool}.
-route_message(module, text) routes a message to a **different** replyable module than the current delivery target. Calling it with the current delivery target returns an error — to reply to the sender of the current event, emit free-form text instead; it is delivered automatically.
-restart_modules({ continuation }) reloads the modules directory: discovery runs first; if discovery, manifest parsing, or an empty result fails, running modules are left unchanged and the tool reports an error. A **successful** reload ends the current LLM run immediately, so the reloaded module set is first visible on the **next** event. `continuation` is required: pass a non-empty string to enqueue one `event.v1` handoff (source fixed to current event source); pass empty string when no follow-up is needed.
-turn_end() ends the current turn immediately without delivering any message to the user or any module. Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently. Do NOT use this when you have something to say; emit free-form text instead.
 
-attach_image(path) reads an image file and attaches it to the LLM input on the next cycle via image.send.v1. The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).
-attach_file(path) does the same for documents (PDFs, etc.) via file.send.v1. Same path restrictions apply.
+Built-in tools: route_message, restart_modules, turn_end, attach_image, attach_file. See each tool's own description for usage.
 
 {{SKILLS_SECTION}}
 

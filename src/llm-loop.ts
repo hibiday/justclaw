@@ -221,7 +221,7 @@ function buildRouteMessageTool(
 	return tool({
 		name: "route_message",
 		description:
-			"Route a message to a replyable module other than the current delivery target. Use this only when forwarding output to a different module. To reply to the sender of the current event, emit free-form text instead — it is delivered automatically.",
+			"Route a message to a replyable module other than the current delivery target. Use this only when forwarding output to a different module. To reply to the sender of the current event, emit free-form text instead — it is delivered automatically. Calling it with the current delivery target as the destination returns an error.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -618,7 +618,8 @@ export async function runLlmLoop(
 				name: "attach_image",
 				description:
 					"Read a local image file and attach it to the LLM input on the next event cycle. " +
-					"The current run continues normally after this call; the image arrives in the next cycle.",
+					"The current run continues normally after this call; the image arrives in the next cycle. " +
+					"The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
 					properties: {
@@ -673,7 +674,8 @@ export async function runLlmLoop(
 				name: "attach_file",
 				description:
 					"Read a local file and attach it to the LLM input on the next event cycle. " +
-					"Suitable for PDFs and other documents. The file arrives in the next cycle.",
+					"Suitable for PDFs and other documents. The file arrives in the next cycle. " +
+					"The path must be within a sandbox-accessible directory (workspace, character, modules, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
 					properties: {
