@@ -1,5 +1,9 @@
 import { readInitContent } from "./agent-context";
-import { type EventDropDaemon, notifyEventDropped } from "./event-dropped";
+import {
+	type EventDropDaemon,
+	notifyDropped,
+	notifyEventDropped,
+} from "./event-dropped";
 import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
@@ -166,21 +170,14 @@ export function createSessionRequestHandler(
 					...payload,
 				});
 				if (previous && daemonsRef) {
-					const daemon = daemonsRef.current.find(
-						(d) => d.manifest.name === previous.source,
+					// The interrupt slot has no UUIDv7 id, so the timestamp comes from
+					// wall-clock time rather than the event id (see notifyDropped).
+					notifyDropped(
+						daemonsRef.current,
+						previous.source,
+						previous.params,
+						new Date().toISOString(),
 					);
-					if (daemon) {
-						daemon.peer.notify("event", {
-							type: "event.dropped.v1",
-							source: previous.source,
-							timestamp: new Date().toISOString(),
-							params: previous.params,
-						});
-					} else {
-						console.error(
-							`[core] interrupt overwrite lost: source=${previous.source}`,
-						);
-					}
 				}
 				return "ok";
 			}

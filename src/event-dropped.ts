@@ -18,19 +18,41 @@ function sanitizeParams(params: unknown): unknown {
 	return rest;
 }
 
+// Send an event.dropped.v1 notification to the source module, or log the loss
+// if that module is not available. The timestamp is supplied by the caller:
+// dropped queue events derive it from their UUIDv7 id, while interrupt-slot
+// events have no id and use wall-clock time. `idForLog` is optional for the
+// same reason (interrupt slots have no id to log).
+export function notifyDropped(
+	daemons: EventDropDaemon[],
+	source: string,
+	params: unknown,
+	timestamp: string,
+	idForLog?: string,
+): void {
+	const daemon = daemons.find((d) => d.manifest.name === source);
+	if (daemon) {
+		daemon.peer.notify("event", {
+			type: "event.dropped.v1",
+			source,
+			timestamp,
+			params: sanitizeParams(params),
+		});
+	} else {
+		const idSuffix = idForLog ? ` id=${idForLog}` : "";
+		console.error(`[core] event lost: source=${source}${idSuffix}`);
+	}
+}
+
 export function notifyEventDropped(
 	daemons: EventDropDaemon[],
 	event: QueuedEvent,
 ): void {
-	const daemon = daemons.find((d) => d.manifest.name === event.source);
-	if (daemon) {
-		daemon.peer.notify("event", {
-			type: "event.dropped.v1",
-			source: event.source,
-			timestamp: timestampFromUUIDv7(event.id),
-			params: sanitizeParams(event.params),
-		});
-	} else {
-		console.error(`[core] event lost: source=${event.source} id=${event.id}`);
-	}
+	notifyDropped(
+		daemons,
+		event.source,
+		event.params,
+		timestampFromUUIDv7(event.id),
+		event.id,
+	);
 }
