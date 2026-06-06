@@ -3,6 +3,7 @@
 	"module": "src/index.ts",
 	"type": "module",
 	"private": true,
+	"license": "MIT",
 	"scripts": {
 		"check": "biome check",
 		"format": "biome format --write",
