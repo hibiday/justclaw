@@ -21,6 +21,22 @@ JSON-RPC's two message kinds map to two distinct concerns:
 - **Tool calling** uses request/response. The core asks a module to perform an action and waits for the result. This corresponds directly to LLM tool calling.
 - **Events and messaging** use notifications. Modules emit events (e.g., external input received, file changed, timer fired) as one-way notifications. The core may also send notifications to modules, primarily for delivering messages.
 
+### Errors
+
+Error responses follow standard JSON-RPC 2.0. A peer that receives a request it cannot serve replies with an `error` object instead of a `result`:
+
+| Code | When |
+|---|---|
+| `-32601` | The request reaches a peer with no request handler registered (for example, a `tool/{name}` call sent to a timer module, which serves no tools). Message: `Method not found`. |
+| `-32000` | The request handler ran but threw. The thrown error's message is returned verbatim. Used for application-level failures such as an unsupported `sessions.*` type or a `sessions.switch.v1` to a nonexistent session. |
+
+A malformed line (invalid JSON, missing `jsonrpc: "2.0"`, or a non-string `method`) is not answered with an error response; it raises a local error on the receiving side instead, because a correlation `id` may not be recoverable.
+
+On the response-handling side, a peer never tears down the transport over a bad response:
+
+- A response whose `id` is `null` (the JSON-RPC convention when the request `id` could not be recovered) is logged and ignored — it cannot be correlated to a pending request.
+- A response carrying an `id` that matches no pending request raises a local error.
+
 ## Delivery Guarantees
 
 The protocol provides best-effort delivery only. The core does not retry, persist, or acknowledge notifications. Modules are responsible for ensuring reliable delivery to external systems where it matters.
@@ -31,7 +47,7 @@ Modules with durability requirements should implement their own queuing, retry, 
 
 A module may expose **tools** — request/response handlers the core can call. Tools are declared in the response to `initialize`.
 
-Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without inspecting their schema.
+Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without validating their payload schema. The only field it inspects is the reserved `type` discriminator (see [Reserved Fields](#reserved-fields)), which must be one of the known envelope types (`event.v1`, `image.send.v1`, `file.send.v1`); everything else in the payload is passed through untouched.
 
 A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls). Both module types may send `sessions.*` requests to the core.
 
@@ -449,7 +465,7 @@ The core reads the following files from the character directory, in order:
 | `MEMORY.md` | Cross-session memory |
 | `INIT.md` | Startup tasks — injected as an `event.v1` when a new empty session becomes active |
 
-Each present file is read as UTF-8, trimmed, and formatted as:
+`INIT.md` is the exception: it is **not** concatenated into the context instructions. It feeds the separate event-injection path described in its table row above and never appears in the system prompt. The remaining files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`) each present are read as UTF-8, trimmed, and formatted as:
 
 ```
 ## FILENAME.md
