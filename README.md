@@ -10,6 +10,15 @@ The core processes events through a single LLM queue, providing reasoning, sessi
 
 Runtime: **Bun**
 
+## Philosophy
+
+What justclaw leaves out is as deliberate as what it includes.
+
+- **Right, not minimal.** Features are omitted until something concretely needs them — no permission system, no event schemas, no delivery guarantees, yet. The omissions are the design, not gaps in it.
+- **Small core, mechanism not policy.** The core provides mechanisms: an event bus, a single serial LLM queue, process spawning, message routing. Modules decide policy: retries, persistence, formatting, error handling. Policy belongs in modules, not the core.
+- **Unix philosophy.** Composable modules over text protocols (NDJSON, JSON-RPC). One responsibility per module. Failure is isolated by process boundaries.
+- **LLMs tolerate ambiguity.** Data whose only consumer is the LLM stays loosely structured. Strict types live only at boundaries where machine code reads them.
+
 ## Requirements
 
 - [Bun](https://bun.sh)
@@ -71,16 +80,10 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 
 The core runs a single LLM inference queue. Modules communicate with the core over NDJSON (JSON-RPC 2.0) on stdin/stdout. Events from modules are enqueued and processed serially; the LLM may call back into modules via tool calls.
 
-```
-Module (source)                    Core                         Module (target)
- |                                  |                              |
- |-- event (notification) -------->|                              |
- |                                  |-- enqueue to LLM queue      |
- |                                  |   (single queue, serial)    |
- |                                  |                              |
- |                                  |-- tool/{name} (request) --> |
- |                                  |<-- result ------------------ |
-```
+1. A module emits an event (notification) to the core.
+2. The core enqueues it on the single, serial LLM queue.
+3. The LLM processes the event and may call module tools (`tool/{name}`, request/response).
+4. Output is delivered to the current routing target.
 
 ### Core capabilities
 
