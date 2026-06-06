@@ -39,11 +39,13 @@ A daemon module may provide both tools and events. A timer module emits events o
 
 Each entry in the `tools` array follows the OpenAI function tool format:
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | string | Tool name. Must be unique within the module. Used as `{module}__{name}` in the LLM context. |
-| `description` | string | Description for the LLM |
-| `parameters` | object | JSON Schema object describing the parameters |
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | yes | Tool name. Must be unique within the module. Used as `{module}__{name}` in the LLM context. |
+| `description` | string | no | Description for the LLM |
+| `parameters` | object | no | JSON Schema object describing the parameters |
+
+The core validates only that `name` is a non-empty string. `description` and `parameters` are passed through to the LLM unchanged and may be omitted; the core does not validate their contents.
 
 ## Reserved Fields
 
@@ -301,7 +303,7 @@ Response:
 
 ### `sessions.skip.v1`
 
-Aborts the currently running LLM cycle. The running event receives `event.dropped.v1` and is removed from the queue. If no run is active, returns `"no-op"`.
+Aborts the currently running LLM cycle by signaling its abort controller. If no run is active, returns `"no-op"` and nothing else happens. The skip request itself only signals the abort; the aborted cycle is then torn down by the LLM loop's normal abort handling, which delivers `event.dropped.v1` to the source and removes the event from the queue (the same path used for any LLM-failure drop). Delivery and removal therefore happen asynchronously, after the request has returned, not within the skip handler.
 
 Combine with `sessions.interrupt.v1` for immediate effect: set the interrupt slot, then call `sessions.skip.v1` to abort the current run. The loop picks up the interrupt slot as the next event instead of pulling from the queue.
 
@@ -574,7 +576,7 @@ The core notifies the current message target each time a tool completes — both
 | Field | Type | Description |
 |---|---|---|
 | `type` | string | Always `tool_call.v1` |
-| `tool` | string | Tool name (`shell`, `create_file`, `edit_file`, or `delete_file`) |
+| `tool` | string | Tool name. Workspace tools use their bare name (`shell`, `create_file`, `edit_file`, `delete_file`). Module tools use the `{module}__{name}` form they are exposed under in the LLM context. |
 | `input` | object | Arguments passed to the tool by the LLM |
 | `output` | string | JSON-encoded result returned by the tool |
 
@@ -614,7 +616,9 @@ In all cases the notification shape is the same.
 | `type` | string | Always `event.dropped.v1` |
 | `source` | string | Name of the module that originally emitted the event |
 | `timestamp` | string | ISO 8601, when the event was originally received by the core |
-| `params` | object | Original event params as emitted by the source module |
+| `params` | object | Original event params as emitted by the source module, with one exception (see below) |
+
+For `image.send.v1` and `file.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
 
 If the source module is not available (for example, not loaded after restart or the daemon is gone), the core logs the loss and removes the queue row; it does not retry delivery. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
@@ -685,7 +689,7 @@ route_message(module: string, text: string)
 | `module` | Target module name (must differ from the current delivery target) |
 | `text` | Message body |
 
-The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true` and differs from the current delivery target; otherwise the tool returns an error. On success, the core updates the default delivery target.
+The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true` and differs from the current delivery target; otherwise the tool returns an error. On success, the core sets the transient delivery-target override (see [Transient override](#transient-override)) to the named module for the rest of the current cycle. It does not modify the persisted `last_replyable_target`.
 
 Trailing free-form assistant text after the LLM run is delivered the same way: only when the current delivery target module is replyable.
 
