@@ -1,10 +1,19 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolveWorkspaceDir, WorkspaceEditor } from "./workspace";
+import {
+	resolveWorkspaceDir,
+	runReadFileBase64,
+	WorkspaceEditor,
+} from "./workspace";
 
 const hasBwrap = Boolean(Bun.which("bwrap"));
+// runReadFileBase64 runs under whichever sandbox backend the platform provides
+// (bwrap on Linux, sandbox-exec on macOS), so gate on either being present.
+const hasSandbox =
+	hasBwrap ||
+	(process.platform === "darwin" && Boolean(Bun.which("sandbox-exec")));
 
 const tempDirs: string[] = [];
 
@@ -152,6 +161,43 @@ describe("WorkspaceEditor", () => {
 			});
 			expect(r.status).toBe("failed");
 			expect(r.output).toMatch(/not unique \(3 occurrences\)/);
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"runReadFileBase64 round-trips binary bytes (attach_image/attach_file)",
+		async () => {
+			// Regression: BSD base64 (macOS) rejects `base64 FILE` and the old
+			// `base64 | tr` pipeline masked the failure behind tr's zero exit, so
+			// attach_image/attach_file silently produced empty data on macOS.
+			const root = await createTempDir("justclaw-ws-");
+			// 1x1 transparent PNG.
+			const expected =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+			const filePath = path.join(root, "pixel.png");
+			await writeFile(filePath, Buffer.from(expected, "base64"));
+			const r = await runReadFileBase64(
+				root,
+				historyDirForWorkspace(root),
+				process.platform,
+				path.resolve(filePath),
+			);
+			expect(r.ok).toBe(true);
+			expect(r.content).toBe(expected);
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"runReadFileBase64 reports failure for a missing file",
+		async () => {
+			const root = await createTempDir("justclaw-ws-");
+			const r = await runReadFileBase64(
+				root,
+				historyDirForWorkspace(root),
+				process.platform,
+				path.join(root, "does-not-exist.png"),
+			);
+			expect(r.ok).toBe(false);
 		},
 	);
 });

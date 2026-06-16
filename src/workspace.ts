@@ -282,15 +282,14 @@ export async function runReadFileBase64(
 		historyDir,
 		{ platform, characterDir, modulesRoot, skillsDir },
 	);
+	// Read the file via stdin redirect rather than `base64 "$1"`: BSD base64
+	// (macOS) rejects a positional file argument and only accepts stdin or -i,
+	// while GNU base64 (Linux) accepts both. The redirect is portable across both
+	// and also makes the exit code reflect base64/open failures -- a `base64 | tr`
+	// pipeline would mask them behind tr's always-zero exit. Newlines (GNU wraps
+	// at 76 columns) are stripped in JS so no second piped process is needed.
 	const proc = Bun.spawn({
-		cmd: [
-			...spec.cmdPrefix,
-			"sh",
-			"-c",
-			'base64 "$1" | tr -d "\\n"',
-			"--",
-			absPath,
-		],
+		cmd: [...spec.cmdPrefix, "sh", "-c", 'base64 < "$1"', "--", absPath],
 		cwd: workspaceDir,
 		stdin: "ignore",
 		stdout: "pipe",
@@ -302,7 +301,11 @@ export async function runReadFileBase64(
 		new Response(proc.stderr).text(),
 	]);
 	await proc.exited;
-	return { ok: proc.exitCode === 0, content, stderr };
+	return {
+		ok: proc.exitCode === 0,
+		content: content.replace(/\r?\n/g, ""),
+		stderr,
+	};
 }
 
 async function runEditFile(

@@ -88,6 +88,10 @@ const DARWIN_READONLY_PATHS = [
 	"/Library",
 	"/private/etc",
 	"/private/var/run",
+	// Nix installs interpreters and their shared libraries under /nix/store. On a
+	// nix-on-macOS setup `sh`/`base64`/module interpreters resolve there and fail
+	// to load their libraries unless the store is readable. Mirrors LINUX_READONLY_PATHS.
+	"/nix",
 ] as const;
 const LINUX_READONLY_PATHS = [
 	"/bin",
