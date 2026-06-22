@@ -2,7 +2,9 @@ import path from "node:path";
 
 /**
  * Files read from {@link resolveCharacterDir}'s directory, in order.
- * Each present file is included in the system prompt under a `## FILENAME` heading.
+ * Each present file is included in the system prompt fenced in an XML element
+ * named after the file (e.g. `<SOUL.md>...</SOUL.md>`). runtime instructions
+ * document what each file means, so the tag name alone is sufficient.
  * The LLM may write back to these files (character dir is rw-mounted in the sandbox).
  */
 export const CHARACTER_FILES = [
@@ -83,9 +85,11 @@ export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
 
 /**
  * Reads present files from {@link CHARACTER_FILES} under `characterDir`.
- * Each non-empty file becomes a `## FILENAME\n<content>` section.
- * Sections are joined with a blank line. Missing files are silently skipped;
- * other read errors propagate.
+ * Each non-empty file is fenced in an XML element named after the file:
+ * `<FILENAME>\n<content>\n</FILENAME>`. The fence delimits each block
+ * unambiguously so file content cannot impersonate a sibling section or the
+ * surrounding runtime instructions. Sections are joined with a blank line.
+ * Missing files are silently skipped; other read errors propagate.
  */
 export async function loadAgentContext(characterDir: string): Promise<string> {
 	const sections: string[] = [];
@@ -96,7 +100,7 @@ export async function loadAgentContext(characterDir: string): Promise<string> {
 		}
 		const trimmed = (await file.text()).trim();
 		if (trimmed) {
-			sections.push(`## ${filename}\n${trimmed}`);
+			sections.push(`<${filename}>\n${trimmed}\n</${filename}>`);
 		}
 	}
 	return sections.join("\n\n");

@@ -268,7 +268,7 @@ describe("runLlmLoop", () => {
 		await loopTask;
 
 		expect(capturedAgent?.instructions).toBe(
-			`## AGENTS.md\nCONTEXT_BLOCK\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
+			`<AGENTS.md>\nCONTEXT_BLOCK\n</AGENTS.md>\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
 		);
 	});
 
