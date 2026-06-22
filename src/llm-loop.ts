@@ -740,8 +740,16 @@ export async function runLlmLoop(
 		const characterContext = options?.characterDir
 			? await loadAgentContext(options.characterDir)
 			: options?.contextInstructions;
+		// Operator instructions live in a fixed file the agent cannot edit, so they
+		// get their own tag distinct from the editable character files — the fence
+		// keeps the trust boundary explicit and unforgeable by file content.
 		const contextInstructions =
-			[operatorContext || undefined, characterContext]
+			[
+				operatorContext
+					? `<operator-instructions>\n${operatorContext}\n</operator-instructions>`
+					: undefined,
+				characterContext,
+			]
 				.filter(Boolean)
 				.join("\n\n") || undefined;
 		const modules = daemonsRef.current.map((d) => ({

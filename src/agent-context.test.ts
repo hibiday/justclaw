@@ -40,12 +40,12 @@ describe("loadAgentContext", () => {
 		}
 	});
 
-	test("returns a single ## FILENAME section when only one file exists", async () => {
+	test("returns a single filename-fenced section when only one file exists", async () => {
 		const dir = await mkdtemp(path.join(os.tmpdir(), "justclaw-ch-"));
 		try {
 			await Bun.write(path.join(dir, "SOUL.md"), "  line one\nline two  \n");
 			expect(await loadAgentContext(dir)).toBe(
-				"## SOUL.md\nline one\nline two",
+				"<SOUL.md>\nline one\nline two\n</SOUL.md>",
 			);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
@@ -58,7 +58,7 @@ describe("loadAgentContext", () => {
 			await Bun.write(path.join(dir, "AGENTS.md"), "first");
 			await Bun.write(path.join(dir, "MEMORY.md"), "last");
 			expect(await loadAgentContext(dir)).toBe(
-				"## AGENTS.md\nfirst\n\n## MEMORY.md\nlast",
+				"<AGENTS.md>\nfirst\n</AGENTS.md>\n\n<MEMORY.md>\nlast\n</MEMORY.md>",
 			);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
@@ -72,7 +72,7 @@ describe("loadAgentContext", () => {
 			await Bun.write(path.join(dir, "USER.md"), "user block");
 			await Bun.write(path.join(dir, "AGENTS.md"), "agents block");
 			expect(await loadAgentContext(dir)).toBe(
-				"## AGENTS.md\nagents block\n\n## USER.md\nuser block",
+				"<AGENTS.md>\nagents block\n</AGENTS.md>\n\n<USER.md>\nuser block\n</USER.md>",
 			);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
@@ -84,7 +84,7 @@ describe("loadAgentContext", () => {
 		try {
 			await Bun.write(path.join(dir, "IDENTITY.md"), "   \n\t  ");
 			await Bun.write(path.join(dir, "USER.md"), "kept");
-			expect(await loadAgentContext(dir)).toBe("## USER.md\nkept");
+			expect(await loadAgentContext(dir)).toBe("<USER.md>\nkept\n</USER.md>");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
@@ -108,7 +108,7 @@ describe("loadAgentContext", () => {
 			await Bun.write(path.join(dir, "SOUL.md"), "s");
 			// AGENTS.md and USER.md missing
 			expect(await loadAgentContext(dir)).toBe(
-				"## SOUL.md\ns\n\n## IDENTITY.md\ni\n\n## MEMORY.md\nm",
+				"<SOUL.md>\ns\n</SOUL.md>\n\n<IDENTITY.md>\ni\n</IDENTITY.md>\n\n<MEMORY.md>\nm\n</MEMORY.md>",
 			);
 		} finally {
 			await rm(dir, { recursive: true, force: true });

@@ -34,7 +34,10 @@ export function buildRuntimeInstructions(
 		)
 		.join("\n");
 
-	return interpolate(mainTemplate.trimEnd(), {
+	// Fence the whole block in <runtime> so the model can tell operator/character
+	// context apart from machine-supplied runtime facts. The inner prose stays
+	// Markdown; only the outer boundary is XML.
+	const body = interpolate(mainTemplate.trimEnd(), {
 		WORKSPACE_DIR: workspaceDir,
 		HISTORY_DIR: historyDir,
 		CHARACTER_DIR: characterDir,
@@ -42,6 +45,7 @@ export function buildRuntimeInstructions(
 		MODULE_TABLE: moduleTable,
 		SKILLS_SECTION: buildSkillsSection(skillsDir, skills),
 	});
+	return `<runtime>\n${body}\n</runtime>`;
 }
 
 // The skills section has two structurally different renderings (configured vs.

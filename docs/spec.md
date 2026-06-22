@@ -432,7 +432,7 @@ If the resolved interpreter is outside the sandbox's standard read-only allowlis
 
 ## Operator instructions
 
-The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is prepended to the character context instructions.
+The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is fenced in an `<operator-instructions>` element and prepended to the character context instructions. The dedicated tag — distinct from the character-file tags below — keeps the trust boundary explicit: operator instructions live in a fixed file the agent cannot edit, and the fence prevents editable character content from impersonating them.
 
 This file is outside all sandbox write paths, so the agent cannot modify it. Changes to the file take effect on the next turn without restarting the process.
 
@@ -465,14 +465,15 @@ The core reads the following files from the character directory, in order:
 | `MEMORY.md` | Cross-session memory |
 | `INIT.md` | Startup tasks — injected as an `event.v1` when a new empty session becomes active |
 
-`INIT.md` is the exception: it is **not** concatenated into the context instructions. It feeds the separate event-injection path described in its table row above and never appears in the system prompt. The remaining files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`) each present are read as UTF-8, trimmed, and formatted as:
+`INIT.md` is the exception: it is **not** concatenated into the context instructions. It feeds the separate event-injection path described in its table row above and never appears in the system prompt. The remaining files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`) each present are read as UTF-8, trimmed, and fenced in an XML element named after the file:
 
 ```
-## FILENAME.md
+<FILENAME.md>
 <trimmed content>
+</FILENAME.md>
 ```
 
-Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
+The tag name is the filename itself (e.g. `<SOUL.md>`); runtime instructions document what each file means, so no descriptive attribute is needed. The fence delimits each block unambiguously, so a file's content cannot impersonate a sibling section or the surrounding runtime instructions by emitting a matching heading. File content stays Markdown; only the boundary is XML. Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
 
 Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors from reading a present file propagate and abort `runLlmLoop` (they are not caught per-event).
 
@@ -537,10 +538,10 @@ The bundled LLM loop rebuilds the agent `instructions` string immediately before
 
 | Part | Source | Content |
 |---|---|---|
-| Context instructions | Character files on disk (`AGENTS.md`, `SOUL.md`, etc.) | Sections per file, as described under [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
-| Runtime instructions | `src/spec.ts` (`buildRuntimeInstructions`) | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, and skill index when a skills directory is configured). |
+| Context instructions | Operator `AGENTS.md` and character files on disk (`SOUL.md`, etc.) | Each file fenced in its own XML element, as described under [Operator instructions](#operator-instructions) and [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
+| Runtime instructions | `buildRuntimeInstructions` | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, and skill index when a skills directory is configured), fenced in a `<runtime>` element. Inner prose is Markdown; only the boundary is XML. |
 
-The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
+The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Each part is fenced in XML elements (`<operator-instructions>`, the per-file character tags, and `<runtime>`) so the model can tell operator instructions, editable character content, and machine-supplied runtime facts apart, and so content in one block cannot impersonate another. Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
 
 Before each LLM turn, the bundled loop refreshes the module table from the currently loaded daemons so `replyable` and tool names match the live process set. A successful `restart_modules` updates processes immediately and **ends the current LLM run**. The **next** dequeued event gets the updated prompt and module tool names.
 
