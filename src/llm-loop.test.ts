@@ -214,7 +214,7 @@ describe("downscaleImage", () => {
 	const tinyPngBase64 =
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 
-	test("keeps small images unchanged", async () => {
+	test("keeps images within the max dimensions unchanged", async () => {
 		const original = Buffer.from(tinyPngBase64, "base64");
 
 		const result = await downscaleImage(original, "image/png");
@@ -223,18 +223,20 @@ describe("downscaleImage", () => {
 		expect(result.data).toEqual(original);
 	});
 
-	test("normalizes large decodable images to JPEG", async () => {
-		const original = Buffer.concat([
-			Buffer.from(tinyPngBase64, "base64"),
-			Buffer.alloc(600 * 1024),
-		]);
+	test("normalizes oversized decodable images to JPEG", async () => {
+		const original = await new Bun.Image(Buffer.from(tinyPngBase64, "base64"))
+			.resize(3000, 3000)
+			.png()
+			.bytes();
 
 		const result = await downscaleImage(original, "image/png");
+		const metadata = await new Bun.Image(result.data).metadata();
 
 		expect(result.mediaType).toBe("image/jpeg");
 		expect(result.data[0]).toBe(0xff);
 		expect(result.data[1]).toBe(0xd8);
-		expect(result.data.byteLength).toBeLessThan(original.byteLength);
+		expect(metadata.width).toBe(2048);
+		expect(metadata.height).toBe(2048);
 	});
 
 	test("falls back to the original bytes when decode fails", async () => {
@@ -333,10 +335,12 @@ describe("runLlmLoop", () => {
 	test("downscales image.send.v1 before building LLM input", async () => {
 		const tinyPngBase64 =
 			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-		const imageData = Buffer.concat([
-			Buffer.from(tinyPngBase64, "base64"),
-			Buffer.alloc(600 * 1024),
-		]).toString("base64");
+		const imageData = Buffer.from(
+			await new Bun.Image(Buffer.from(tinyPngBase64, "base64"))
+				.resize(3000, 3000)
+				.png()
+				.bytes(),
+		).toString("base64");
 		const home = await createTempDir("justclaw-llm-image-");
 		const dbPath = path.join(home, "events.db");
 		const queue = new EventQueue(dbPath);
@@ -371,9 +375,12 @@ describe("runLlmLoop", () => {
 		);
 		const image = userInput.content[1]?.image;
 		expect(image?.startsWith("data:image/jpeg;base64,")).toBe(true);
-		expect(image?.length).toBeLessThan(
-			`data:image/png;base64,${imageData}`.length,
-		);
+		const outputBase64 = image?.replace("data:image/jpeg;base64,", "");
+		const outputMetadata = await new Bun.Image(
+			Buffer.from(outputBase64 ?? "", "base64"),
+		).metadata();
+		expect(outputMetadata.width).toBe(2048);
+		expect(outputMetadata.height).toBe(2048);
 	});
 
 	test("builds audio.send.v1 as user audio input", async () => {

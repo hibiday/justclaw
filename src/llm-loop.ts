@@ -175,15 +175,11 @@ function inferAudioFormat(params: Record<string, unknown>): "wav" | "mp3" {
 }
 
 const IMAGE_MAX_DIMENSION = 2048;
-const IMAGE_RESIZE_MIN_BYTES = 512 * 1024;
 
 export async function downscaleImage(
 	bytes: Uint8Array,
 	mediaType: string,
 ): Promise<{ data: Uint8Array; mediaType: string }> {
-	if (bytes.byteLength < IMAGE_RESIZE_MIN_BYTES) {
-		return { data: bytes, mediaType };
-	}
 	try {
 		// Full-resolution phone photos (~6 MB) are the same image regardless of how
 		// they are stored, but the base64 copy rides the conversation history and is
@@ -194,7 +190,15 @@ export async function downscaleImage(
 		// so capping the long edge at 2048px costs zero image tokens while cutting the
 		// payload from megabytes to a few hundred KB. Resize on ingestion so only the
 		// small copy is ever stored and replayed.
-		const resized = await new Bun.Image(bytes)
+		const image = new Bun.Image(bytes);
+		const metadata = await image.metadata();
+		if (
+			metadata.width <= IMAGE_MAX_DIMENSION &&
+			metadata.height <= IMAGE_MAX_DIMENSION
+		) {
+			return { data: bytes, mediaType };
+		}
+		const resized = await image
 			.resize(IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION, {
 				fit: "inside",
 				withoutEnlargement: true,

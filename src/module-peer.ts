@@ -8,7 +8,7 @@ import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
 export type EventParams = Record<string, unknown> & {
-	type: "event.v1" | "image.send.v1" | "file.send.v1";
+	type: "event.v1" | "image.send.v1" | "file.send.v1" | "audio.send.v1";
 };
 
 export function parseEventNotificationParams(
@@ -23,10 +23,11 @@ export function parseEventNotificationParams(
 	if (
 		record.type !== "event.v1" &&
 		record.type !== "image.send.v1" &&
-		record.type !== "file.send.v1"
+		record.type !== "file.send.v1" &&
+		record.type !== "audio.send.v1"
 	) {
 		throw new Error(
-			`${moduleName}: event type must be "event.v1", "image.send.v1", or "file.send.v1"`,
+			`${moduleName}: event type must be "event.v1", "image.send.v1", "file.send.v1", or "audio.send.v1"`,
 		);
 	}
 
