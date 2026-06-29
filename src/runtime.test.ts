@@ -4061,6 +4061,18 @@ describe("turn_end", () => {
 		await mkdir(characterDir, { recursive: true });
 		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
 		queue.enqueue("mod", { type: "event.v1", kind: "background-task" });
+		const notifications: unknown[] = [];
+		const daemon = daemonsRef.current[0];
+		if (!daemon) {
+			throw new Error("expected started daemon");
+		}
+		const origNotify = daemon.peer.notify.bind(daemon.peer);
+		daemon.peer.notify = (method: string, params: unknown) => {
+			if (method === "event") {
+				notifications.push(params);
+			}
+			return origNotify(method, params);
+		};
 
 		const rc = new RunContext();
 		let toolResult: unknown;
@@ -4091,6 +4103,12 @@ describe("turn_end", () => {
 		await stopDaemons(daemonsRef.current);
 
 		expect(toolResult).toBe("ok");
+		expect(notifications).toContainEqual({
+			type: "tool_call.v1",
+			tool: "turn_end",
+			input: {},
+			output: "ok",
+		});
 	});
 });
 

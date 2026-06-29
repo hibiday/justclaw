@@ -722,7 +722,7 @@ restart_modules({ continuation: string })
 |---|---|
 | `continuation` | Required. Ignored when reload fails. When reload succeeds and `continuation` is non-empty (after trim), the core enqueues exactly one follow-up internal event with `source` set to the **current** `event.source` and `params` fixed to `{ "type": "event.v1", "text": "<trimmed continuation>" }`. Pass an empty string when no follow-up is needed. The LLM does not supply `source` or arbitrary params. |
 
-The bundled LLM loop implements this as a core tool (not wrapped with `tool_call.v1` notification). It requires a configured session store and modules root; if those are missing, the tool returns an error string instead of reloading.
+The bundled LLM loop implements this as a core tool. It requires a configured session store and modules root; if those are missing, the tool returns an error string instead of reloading.
 
 **Turn boundary:** After `restart_modules` **succeeds**, processes match disk and the current LLM run ends immediately after that tool call. The agent does not continue with more tool calls or trailing free-form text in the reloaded state. The **next** `event.v1` shows the new module table and runs normally against the reloaded modules. Use a non-empty `continuation` when you want the core to enqueue exactly one handoff event under that new module set.
 
@@ -736,7 +736,7 @@ attach_image({ path: string })
 |---|---|
 | `path` | Path to an image file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`.
 
 ### Built-in Tool: `attach_file`
 
@@ -748,7 +748,7 @@ attach_file({ path: string })
 |---|---|
 | `path` | Path to a file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `attach_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `attach_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`.
 
 ### Built-in Tool: `shell`
 
@@ -818,7 +818,7 @@ End the current LLM turn immediately without delivering any message. The SDK's a
 turn_end()
 ```
 
-No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered and no `tool_call.v1` notification is emitted.
+No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered.
 
 Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently.
 

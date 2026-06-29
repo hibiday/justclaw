@@ -658,13 +658,7 @@ export async function runLlmLoop(
 			},
 		});
 
-		const tools: Tool[] = [
-			...(options?.workspaceTools ?? []).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
-			),
-			...buildModuleTools(daemonsRef.current).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
-			),
+		const coreTools: Tool[] = [
 			buildRouteMessageTool(
 				daemonsRef,
 				() => currentTarget,
@@ -807,6 +801,18 @@ export async function runLlmLoop(
 					return "ok";
 				},
 			}),
+		];
+
+		const tools: Tool[] = [
+			...(options?.workspaceTools ?? []).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
+			...buildModuleTools(daemonsRef.current).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
+			...coreTools.map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
 		];
 
 		const operatorContext = options?.homeDir
