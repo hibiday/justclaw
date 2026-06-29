@@ -232,6 +232,49 @@ async function prepareImageEventForInput(
 	};
 }
 
+function summarizeToolOutputForNotification(output: unknown): string {
+	if (
+		typeof output === "object" &&
+		output !== null &&
+		(output as { type?: unknown }).type === "image"
+	) {
+		const image = (output as { image?: unknown }).image;
+		if (typeof image === "object" && image !== null) {
+			const record = image as Record<string, unknown>;
+			return JSON.stringify({
+				type: "image",
+				image: {
+					mediaType: record.mediaType,
+					size: record.size,
+					sha256: record.sha256,
+					link: record.link,
+				},
+			});
+		}
+	}
+	if (
+		typeof output === "object" &&
+		output !== null &&
+		(output as { type?: unknown }).type === "file"
+	) {
+		const file = (output as { file?: unknown }).file;
+		if (typeof file === "object" && file !== null) {
+			const record = file as Record<string, unknown>;
+			return JSON.stringify({
+				type: "file",
+				file: {
+					filename: record.filename,
+					mediaType: record.mediaType,
+					size: record.size,
+					sha256: record.sha256,
+					link: record.link,
+				},
+			});
+		}
+	}
+	return typeof output === "string" ? output : JSON.stringify(output);
+}
+
 function wrapWithNotification(
 	t: Tool,
 	getTarget: () => string,
@@ -251,8 +294,7 @@ function wrapWithNotification(
 			} catch {
 				// keep raw string when invoke receives non-JSON input
 			}
-			const outputStr =
-				typeof output === "string" ? output : JSON.stringify(output);
+			const outputStr = summarizeToolOutputForNotification(output);
 			const daemon = daemonsRef.current.find(
 				(d) => d.manifest.name === getTarget(),
 			);
@@ -686,8 +728,7 @@ export async function runLlmLoop(
 			tool({
 				name: "attach_image",
 				description:
-					"Read a local image file and attach it to the LLM input on the next event cycle. " +
-					"The current run continues normally after this call; the image arrives in the next cycle. " +
+					"Read a local image file and attach it to the LLM input in this turn. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -731,21 +772,27 @@ export async function runLlmLoop(
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
 					}
-					const data = read.content;
 					const mediaType = inferImageMediaType(resolved);
-					eventQueue.enqueue(event.source, {
-						type: "image.send.v1",
-						data,
-						mediaType,
-					});
-					return "ok";
+					const original = Buffer.from(read.content, "base64");
+					const image = await downscaleImage(original, mediaType);
+					return {
+						type: "image",
+						image: {
+							data: Buffer.from(image.data).toString("base64"),
+							mediaType: image.mediaType,
+							size: image.data.byteLength,
+							sha256: new Bun.CryptoHasher("sha256")
+								.update(image.data)
+								.digest("hex"),
+							link: resolved,
+						},
+					};
 				},
 			}),
 			tool({
 				name: "attach_file",
 				description:
-					"Read a local file and attach it to the LLM input on the next event cycle. " +
-					"Suitable for PDFs and other documents. The file arrives in the next cycle. " +
+					"Read a local file and attach it to the LLM input in this turn. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -789,16 +836,22 @@ export async function runLlmLoop(
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
 					}
-					const data = read.content;
 					const mediaType = inferFileMediaType(resolved);
 					const filename = path.basename(resolved);
-					eventQueue.enqueue(event.source, {
-						type: "file.send.v1",
-						data,
-						mediaType,
-						filename,
-					});
-					return "ok";
+					const bytes = Buffer.from(read.content, "base64");
+					return {
+						type: "file",
+						file: {
+							data: read.content,
+							mediaType,
+							filename,
+							size: bytes.byteLength,
+							sha256: new Bun.CryptoHasher("sha256")
+								.update(bytes)
+								.digest("hex"),
+							link: resolved,
+						},
+					};
 				},
 			}),
 		];

@@ -4,7 +4,9 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AgentInputItem, Runner } from "@openai/agents";
+import type { Agent, AgentInputItem, Runner } from "@openai/agents";
+import type { FunctionTool } from "@openai/agents-core";
+import { RunContext } from "@openai/agents-core";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import { downscaleImage, runLlmLoop } from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
@@ -26,6 +28,16 @@ async function createTempDir(prefix: string): Promise<string> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function findFunctionTool(agent: Agent, name: string): FunctionTool {
+	const found = agent.tools?.find(
+		(t): t is FunctionTool => t.type === "function" && t.name === name,
+	);
+	if (!found) {
+		throw new Error(`tool ${name} not found on agent`);
+	}
+	return found;
 }
 
 describe("SessionStore", () => {
@@ -358,6 +370,110 @@ describe("runLlmLoop", () => {
 		expect(image?.length).toBeLessThan(
 			`data:image/png;base64,${imageData}`.length,
 		);
+	});
+
+	test("attach_image returns an image tool result in the current turn", async () => {
+		const tinyPngBase64 =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+		const home = await createTempDir("justclaw-attach-image-");
+		const dbPath = path.join(home, "events.db");
+		const imagePath = path.join(home, "pixel.png");
+		const imageBytes = Buffer.from(tinyPngBase64, "base64");
+		await Bun.write(imagePath, imageBytes);
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+
+		let toolResult: unknown;
+		const rc = new RunContext();
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				toolResult = await findFunctionTool(agent, "attach_image").invoke(
+					rc,
+					JSON.stringify({ path: imagePath }),
+				);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			workspaceDir: home,
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(toolResult).toEqual({
+			type: "image",
+			image: {
+				data: tinyPngBase64,
+				mediaType: "image/png",
+				size: imageBytes.byteLength,
+				sha256: new Bun.CryptoHasher("sha256").update(imageBytes).digest("hex"),
+				link: imagePath,
+			},
+		});
+		const db = new Database(dbPath);
+		try {
+			const pendingCount = db
+				.query("SELECT count(*) AS n FROM events")
+				.get() as { n: number };
+			expect(pendingCount.n).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("attach_file returns a file tool result in the current turn", async () => {
+		const home = await createTempDir("justclaw-attach-file-");
+		const dbPath = path.join(home, "events.db");
+		const filePath = path.join(home, "note.txt");
+		const fileContent = "hello file\n";
+		const fileBytes = Buffer.from(fileContent);
+		await Bun.write(filePath, fileContent);
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+
+		let toolResult: unknown;
+		const rc = new RunContext();
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				toolResult = await findFunctionTool(agent, "attach_file").invoke(
+					rc,
+					JSON.stringify({ path: filePath }),
+				);
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			workspaceDir: home,
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(toolResult).toEqual({
+			type: "file",
+			file: {
+				data: Buffer.from(fileContent).toString("base64"),
+				mediaType: "text/plain",
+				filename: "note.txt",
+				size: fileBytes.byteLength,
+				sha256: new Bun.CryptoHasher("sha256").update(fileBytes).digest("hex"),
+				link: filePath,
+			},
+		});
+		const db = new Database(dbPath);
+		try {
+			const pendingCount = db
+				.query("SELECT count(*) AS n FROM events")
+				.get() as { n: number };
+			expect(pendingCount.n).toBe(0);
+		} finally {
+			db.close();
+		}
 	});
 
 	test("skips LLM for sessions.switch.v1 and completes the event", async () => {

@@ -112,7 +112,7 @@ See [Event Format for LLM](#event-format-for-llm) for how each envelope reaches 
 
 ### `image.send.v1`
 
-Emitted by a module (or enqueued by the built-in `attach_image` tool) to attach image bytes on the next dequeue. Params:
+Emitted by a module to attach image bytes on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -122,7 +122,7 @@ Emitted by a module (or enqueued by the built-in `attach_image` tool) to attach 
 
 ### `file.send.v1`
 
-Emitted by a module (or enqueued by the built-in `attach_file` tool) to attach a document on the next dequeue. Params:
+Emitted by a module to attach a document on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -736,7 +736,7 @@ attach_image({ path: string })
 |---|---|
 | `path` | Path to an image file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, downscales large images before re-encoding them, and returns the image as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
 
 ### Built-in Tool: `attach_file`
 
@@ -748,7 +748,7 @@ attach_file({ path: string })
 |---|---|
 | `path` | Path to a file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `attach_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, and returns the file as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
 
 ### Built-in Tool: `shell`
 
