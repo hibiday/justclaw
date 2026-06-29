@@ -47,7 +47,7 @@ Modules with durability requirements should implement their own queuing, retry, 
 
 A module may expose **tools** — request/response handlers the core can call. Tools are declared in the response to `initialize`.
 
-Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without validating their payload schema. The only field it inspects is the reserved `type` discriminator (see [Reserved Fields](#reserved-fields)), which must be one of the known envelope types (`event.v1`, `image.send.v1`, `file.send.v1`); everything else in the payload is passed through untouched.
+Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without validating their payload schema. The only field it inspects is the reserved `type` discriminator (see [Reserved Fields](#reserved-fields)), which must be one of the known envelope types (`event.v1`, `image.send.v1`, `file.send.v1`, `audio.send.v1`); everything else in the payload is passed through untouched.
 
 A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls). Both module types may send `sessions.*` requests to the core.
 
@@ -89,7 +89,7 @@ For `tool/{name}` responses, the top-level `result.type` field is reserved by th
 
 Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
 
-Inline image data is stored in session history. Inline file data is not: before session history is stored, the core replaces every `input_file` byte payload with file metadata plus `omitted: "data"`, regardless of whether the file came from `file.send.v1`, `attach_file`, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
+Inline image data is stored in session history. Inline file and audio data are not: before session history is stored, the core replaces every `input_file` and `audio` byte payload with metadata plus `omitted: "data"`, regardless of whether the payload came from an event envelope, a built-in attach tool, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
 
 ## Methods
 
@@ -111,6 +111,7 @@ Modules emit LLM-bound events as notifications with `method: "event"`. The `type
 | `event.v1` | Canonical text-oriented event; payload fields are converted to XML for the LLM (see [Event Format for LLM](#event-format-for-llm)). |
 | `image.send.v1` | Delivers a base64-encoded image on the **next** LLM cycle (see below). |
 | `file.send.v1` | Delivers a base64-encoded file (for example a PDF) on the **next** LLM cycle (see below). |
+| `audio.send.v1` | Delivers base64-encoded audio on the **next** LLM cycle (see below). |
 
 ```json
 {
@@ -146,6 +147,17 @@ Emitted by a module to attach a document on the next dequeue. Params:
 | `data` | string | Base64-encoded file bytes |
 | `mediaType` | string | MIME type (for example `application/pdf`) |
 | `filename` | string | Basename for the file slot |
+
+### `audio.send.v1`
+
+Emitted by a module to attach audio bytes on the next dequeue. Params:
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `audio.send.v1` |
+| `data` | string | Base64-encoded audio bytes |
+| `mediaType` | string | MIME type (for example `audio/wav`) |
+| `format` | string | Audio format for Chat Completions input. Use `wav` or `mp3`. |
 
 ## Module → Core Session Requests
 
@@ -651,7 +663,7 @@ In all cases the notification shape is the same.
 | `timestamp` | string | ISO 8601, when the event was originally received by the core |
 | `params` | object | Original event params as emitted by the source module, with one exception (see below) |
 
-For `image.send.v1` and `file.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
+For `image.send.v1`, `file.send.v1`, and `audio.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, `format`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
 
 If the source module is not available (for example, not loaded after restart or the daemon is gone), the core logs the loss and removes the queue row; it does not retry delivery. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
@@ -842,7 +854,7 @@ Use this when the task is complete and no reply is needed — for example after 
 
 Event payloads are arbitrary JSON objects. The canonical text-oriented envelope is `type: "event.v1"`. The core uses `type` for envelope handling and does not forward that field to the LLM as a literal key in the user string. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
-**Multimodal envelopes (`image.send.v1`, `file.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so `mediaType` and `filename` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image` and `input_file` both use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
+**Multimodal envelopes (`image.send.v1`, `file.send.v1`, `audio.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so fields such as `mediaType`, `filename`, and `format` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image`, `input_file`, or `audio`. Image and file content use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. Audio content uses inline base64 plus `format` (`wav` or `mp3`) so the OpenAI adapter can build `input_audio`. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
 
 **Conversion rules (for the XML half):**
 

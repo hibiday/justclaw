@@ -115,11 +115,15 @@ function objectToXml(obj: Record<string, unknown>, indent = "  "): string {
 export function eventToXml(event: QueuedEvent): string {
 	const timestamp = timestampFromUUIDv7(event.id);
 	const { type, ...rest } = event.params;
-	// For multimodal envelopes the base64 `data` rides a separate input_image /
-	// input_file content part (see the userInput builder below). Keep it out of
-	// the XML so the bytes are not sent twice; the text copy blows past the
-	// context window. The small descriptive fields (mediaType, filename) stay.
-	if (type === "image.send.v1" || type === "file.send.v1") {
+	// For multimodal envelopes the base64 `data` rides a separate content part
+	// (see the userInput builder below). Keep it out of the XML so the bytes are
+	// not sent twice; the text copy blows past the context window. The small
+	// descriptive fields (mediaType, filename, format) stay.
+	if (
+		type === "image.send.v1" ||
+		type === "file.send.v1" ||
+		type === "audio.send.v1"
+	) {
 		delete (rest as Record<string, unknown>).data;
 	}
 	const inner = objectToXml(rest);
@@ -156,6 +160,18 @@ function inferFileMediaType(filePath: string): string {
 		default:
 			return "application/octet-stream";
 	}
+}
+
+function inferAudioFormat(params: Record<string, unknown>): "wav" | "mp3" {
+	if (params.format === "wav" || params.format === "mp3") {
+		return params.format;
+	}
+	const mediaType =
+		typeof params.mediaType === "string" ? params.mediaType.toLowerCase() : "";
+	if (mediaType === "audio/mpeg" || mediaType === "audio/mp3") {
+		return "mp3";
+	}
+	return "wav";
 }
 
 const IMAGE_MAX_DIMENSION = 2048;
@@ -440,6 +456,30 @@ function fileMetadataFromDataUrl(
 	};
 }
 
+function audioMetadataFromInline(
+	value: unknown,
+	format?: unknown,
+): Record<string, unknown> | null {
+	const mediaType =
+		format === "mp3"
+			? "audio/mpeg"
+			: format === "wav"
+				? "audio/wav"
+				: "application/octet-stream";
+	const decoded = decodeInlineBytes(value, mediaType);
+	if (!decoded) {
+		return null;
+	}
+	return {
+		type: "audio",
+		format,
+		mediaType: decoded.mediaType,
+		size: decoded.bytes.byteLength,
+		sha256: sha256Hex(decoded.bytes),
+		attachable: false,
+	};
+}
+
 function fileMetadataText(
 	metadata: Record<string, unknown>,
 ): Record<string, string> {
@@ -455,9 +495,30 @@ function fileMetadataText(
 	};
 }
 
+function audioMetadataText(
+	metadata: Record<string, unknown>,
+): Record<string, string> {
+	return {
+		type: "input_text",
+		text: JSON.stringify({
+			type: "audio",
+			audio: {
+				...metadata,
+				omitted: "data",
+			},
+		}),
+	};
+}
+
 function sanitizeHistoryContent(part: unknown): unknown {
 	if (!isRecord(part)) {
 		return part;
+	}
+	if (part.type === "audio") {
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			audioMetadataFromInline(part.audio, part.format);
+		return metadata ? audioMetadataText(metadata) : part;
 	}
 	if (part.type === "input_file") {
 		const metadata =
@@ -873,10 +934,11 @@ export async function runLlmLoop(
 		if (
 			envelopeType !== "event.v1" &&
 			envelopeType !== "image.send.v1" &&
-			envelopeType !== "file.send.v1"
+			envelopeType !== "file.send.v1" &&
+			envelopeType !== "audio.send.v1"
 		) {
 			console.warn(
-				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(envelopeType)} (expected event.v1, image.send.v1, or file.send.v1); dropping`,
+				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(envelopeType)} (expected event.v1, image.send.v1, file.send.v1, or audio.send.v1); dropping`,
 			);
 			eventQueue.complete(event.id);
 			continue;
@@ -1257,7 +1319,19 @@ export async function runLlmLoop(
 								},
 							],
 						} as AgentInputItem)
-					: ({ role: "user", content: xml } as AgentInputItem);
+					: eventForInput.params.type === "audio.send.v1"
+						? ({
+								role: "user",
+								content: [
+									{ type: "input_text", text: xml },
+									{
+										type: "audio",
+										audio: String(eventForInput.params.data),
+										format: inferAudioFormat(eventForInput.params),
+									},
+								],
+							} as AgentInputItem)
+						: ({ role: "user", content: xml } as AgentInputItem);
 
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that

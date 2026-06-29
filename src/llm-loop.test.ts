@@ -376,6 +376,52 @@ describe("runLlmLoop", () => {
 		);
 	});
 
+	test("builds audio.send.v1 as user audio input", async () => {
+		const audioData = Buffer.from("audio-bytes").toString("base64");
+		const home = await createTempDir("justclaw-llm-audio-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", {
+			type: "audio.send.v1",
+			data: audioData,
+			mediaType: "audio/wav",
+			format: "wav",
+		});
+
+		let capturedInput: unknown;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				capturedInput = input;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(Array.isArray(capturedInput)).toBe(true);
+		const inputArr = capturedInput as AgentInputItem[];
+		const userInput = inputArr[0] as {
+			content: {
+				type: string;
+				text?: string;
+				audio?: string;
+				format?: string;
+			}[];
+		};
+		expect(userInput.content[0]?.text).toContain("<format>wav</format>");
+		expect(userInput.content[0]?.text).not.toContain(audioData);
+		expect(userInput.content[1]).toEqual({
+			type: "audio",
+			audio: audioData,
+			format: "wav",
+		});
+	});
+
 	test("attach_image returns an image tool result in the current turn", async () => {
 		const tinyPngBase64 =
 			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -511,14 +557,18 @@ describe("runLlmLoop", () => {
 		}
 	});
 
-	test("sanitizes file inputs but keeps image inputs before storing history", () => {
+	test("sanitizes file and audio inputs but keeps image inputs before storing history", () => {
 		const imageBytes = Buffer.from("image-bytes");
 		const fileBytes = Buffer.from("file-bytes");
+		const audioBytes = Buffer.from("audio-bytes");
 		const imageSha = new Bun.CryptoHasher("sha256")
 			.update(imageBytes)
 			.digest("hex");
 		const fileSha = new Bun.CryptoHasher("sha256")
 			.update(fileBytes)
+			.digest("hex");
+		const audioSha = new Bun.CryptoHasher("sha256")
+			.update(audioBytes)
 			.digest("hex");
 		const history = [
 			{
@@ -532,6 +582,11 @@ describe("runLlmLoop", () => {
 						type: "input_file",
 						file: `data:text/plain;base64,${fileBytes.toString("base64")}`,
 						filename: "user-note.txt",
+					},
+					{
+						type: "audio",
+						audio: audioBytes.toString("base64"),
+						format: "wav",
 					},
 				],
 			},
@@ -584,6 +639,9 @@ describe("runLlmLoop", () => {
 		expect(JSON.stringify(sanitized)).not.toContain(
 			fileBytes.toString("base64"),
 		);
+		expect(JSON.stringify(sanitized)).not.toContain(
+			audioBytes.toString("base64"),
+		);
 		expect(sanitized).toEqual([
 			{
 				role: "user",
@@ -602,6 +660,21 @@ describe("runLlmLoop", () => {
 								mediaType: "text/plain",
 								size: fileBytes.byteLength,
 								sha256: fileSha,
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "audio",
+							audio: {
+								type: "audio",
+								format: "wav",
+								mediaType: "audio/wav",
+								size: audioBytes.byteLength,
+								sha256: audioSha,
 								attachable: false,
 								omitted: "data",
 							},
