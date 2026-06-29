@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import {
 	Agent,
@@ -155,6 +156,80 @@ function inferFileMediaType(filePath: string): string {
 		default:
 			return "application/octet-stream";
 	}
+}
+
+const IMAGE_MAX_DIMENSION = 2048;
+const IMAGE_RESIZE_MIN_BYTES = 512 * 1024;
+
+export async function downscaleImage(
+	bytes: Uint8Array,
+	mediaType: string,
+): Promise<{ data: Uint8Array; mediaType: string }> {
+	if (bytes.byteLength < IMAGE_RESIZE_MIN_BYTES) {
+		return { data: bytes, mediaType };
+	}
+	try {
+		// Full-resolution phone photos (~6 MB) are the same image regardless of how
+		// they are stored, but the base64 copy rides the conversation history and is
+		// resent on every LLM turn. Left at native size they accumulate until a request
+		// exceeds the provider's max body size (Anthropic returned 413 once the history
+		// held ~32 MB of images). Both Anthropic and OpenAI internally downscale images
+		// before tokenizing (Anthropic to a 1568px long edge, OpenAI to a 2048px box),
+		// so capping the long edge at 2048px costs zero image tokens while cutting the
+		// payload from megabytes to a few hundred KB. Resize on ingestion so only the
+		// small copy is ever stored and replayed.
+		const resized = await new Bun.Image(bytes)
+			.resize(IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION, {
+				fit: "inside",
+				withoutEnlargement: true,
+			})
+			.jpeg({ quality: 85 })
+			.bytes();
+		if (resized.byteLength === 0) {
+			return { data: bytes, mediaType };
+		}
+		// Re-encode normalizes to JPEG; mediaType must follow or the declared type
+		// and the base64 bytes disagree.
+		return { data: resized, mediaType: "image/jpeg" };
+	} catch (error) {
+		// Undecodable/unsupported image: fall back to the original. Sending it risks
+		// the 413 again, but dropping the image silently is worse for a chat bridge.
+		console.error(
+			`[core] image downscale failed (${mediaType}), sending original: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return { data: bytes, mediaType };
+	}
+}
+
+async function prepareImageEventForInput(
+	event: QueuedEvent,
+): Promise<QueuedEvent> {
+	if (
+		event.params.type !== "image.send.v1" ||
+		typeof event.params.data !== "string"
+	) {
+		return event;
+	}
+	const mediaType =
+		typeof event.params.mediaType === "string"
+			? event.params.mediaType
+			: "image/jpeg";
+	const original = Buffer.from(event.params.data, "base64");
+	const image = await downscaleImage(original, mediaType);
+	if (
+		image.data.byteLength === original.byteLength &&
+		image.mediaType === mediaType
+	) {
+		return event;
+	}
+	return {
+		...event,
+		params: {
+			...event.params,
+			data: Buffer.from(image.data).toString("base64"),
+			mediaType: image.mediaType,
+		},
+	};
 }
 
 function wrapWithNotification(
@@ -806,27 +881,28 @@ export async function runLlmLoop(
 				return { isFinalOutput: false, isInterrupted: undefined };
 			},
 		});
-		const xml = eventToXml(event);
+		const eventForInput = await prepareImageEventForInput(event);
+		const xml = eventToXml(eventForInput);
 		const userInput: AgentInputItem =
-			event.params.type === "image.send.v1"
+			eventForInput.params.type === "image.send.v1"
 				? ({
 						role: "user",
 						content: [
 							{ type: "input_text", text: xml },
 							{
 								type: "input_image",
-								image: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+								image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
 							},
 						],
 					} as AgentInputItem)
-				: event.params.type === "file.send.v1"
+				: eventForInput.params.type === "file.send.v1"
 					? ({
 							role: "user",
 							content: [
 								{ type: "input_text", text: xml },
 								{
 									type: "input_file",
-									file: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+									file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
 								},
 							],
 						} as AgentInputItem)
@@ -845,7 +921,7 @@ export async function runLlmLoop(
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
 					? [...session.history, userInput]
-					: event.params.type === "event.v1"
+					: eventForInput.params.type === "event.v1"
 						? xml
 						: [userInput];
 			const result = await runner.run(agent, runInput, {

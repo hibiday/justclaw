@@ -6,7 +6,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentInputItem, Runner } from "@openai/agents";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
-import { runLlmLoop } from "./llm-loop";
+import { downscaleImage, runLlmLoop } from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
@@ -194,6 +194,48 @@ describe("SessionStore", () => {
 	});
 });
 
+describe("downscaleImage", () => {
+	const tinyPngBase64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+	test("keeps small images unchanged", async () => {
+		const original = Buffer.from(tinyPngBase64, "base64");
+
+		const result = await downscaleImage(original, "image/png");
+
+		expect(result.mediaType).toBe("image/png");
+		expect(result.data).toEqual(original);
+	});
+
+	test("normalizes large decodable images to JPEG", async () => {
+		const original = Buffer.concat([
+			Buffer.from(tinyPngBase64, "base64"),
+			Buffer.alloc(600 * 1024),
+		]);
+
+		const result = await downscaleImage(original, "image/png");
+
+		expect(result.mediaType).toBe("image/jpeg");
+		expect(result.data[0]).toBe(0xff);
+		expect(result.data[1]).toBe(0xd8);
+		expect(result.data.byteLength).toBeLessThan(original.byteLength);
+	});
+
+	test("falls back to the original bytes when decode fails", async () => {
+		const original = Buffer.alloc(600 * 1024, 1);
+		const originalConsoleError = console.error;
+		console.error = () => {};
+		try {
+			const result = await downscaleImage(original, "image/png");
+
+			expect(result.mediaType).toBe("image/png");
+			expect(result.data).toEqual(original);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
+});
+
 describe("runLlmLoop", () => {
 	test("sessions.switch.v1 is skipped with event.dropped when target file missing at apply time", async () => {
 		const home = await createTempDir("justclaw-llm-switch-missing-");
@@ -269,6 +311,52 @@ describe("runLlmLoop", () => {
 
 		expect(capturedAgent?.instructions).toBe(
 			`<AGENTS.md>\nCONTEXT_BLOCK\n</AGENTS.md>\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
+		);
+	});
+
+	test("downscales image.send.v1 before building LLM input", async () => {
+		const tinyPngBase64 =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+		const imageData = Buffer.concat([
+			Buffer.from(tinyPngBase64, "base64"),
+			Buffer.alloc(600 * 1024),
+		]).toString("base64");
+		const home = await createTempDir("justclaw-llm-image-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", {
+			type: "image.send.v1",
+			data: imageData,
+			mediaType: "image/png",
+		});
+
+		let capturedInput: unknown;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				capturedInput = input;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(Array.isArray(capturedInput)).toBe(true);
+		const inputArr = capturedInput as AgentInputItem[];
+		const userInput = inputArr[0] as {
+			content: { type: string; text?: string; image?: string }[];
+		};
+		expect(userInput.content[0]?.text).toContain(
+			"<mediaType>image/jpeg</mediaType>",
+		);
+		const image = userInput.content[1]?.image;
+		expect(image?.startsWith("data:image/jpeg;base64,")).toBe(true);
+		expect(image?.length).toBeLessThan(
+			`data:image/png;base64,${imageData}`.length,
 		);
 	});
 
