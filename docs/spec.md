@@ -47,7 +47,7 @@ Modules with durability requirements should implement their own queuing, retry, 
 
 A module may expose **tools** — request/response handlers the core can call. Tools are declared in the response to `initialize`.
 
-Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without validating their payload schema. The only field it inspects is the reserved `type` discriminator (see [Reserved Fields](#reserved-fields)), which must be one of the known envelope types (`event.v1`, `image.send.v1`, `file.send.v1`); everything else in the payload is passed through untouched.
+Events are not declared. A module may emit any notification at any time; the core forwards them to the LLM queue without validating their payload schema. The only field it inspects is the reserved `type` discriminator (see [Reserved Fields](#reserved-fields)), which must be one of the known envelope types (`event.v1`, `image.send.v1`, `file.send.v1`, `audio.send.v1`); everything else in the payload is passed through untouched.
 
 A daemon module may provide both tools and events. A timer module emits events only (it does not stay running, so it cannot serve tool calls). Both module types may send `sessions.*` requests to the core.
 
@@ -75,6 +75,22 @@ This applies to:
 
 For ordinary event semantics, modules should use another payload field such as `kind` rather than overloading `type`. `kind` is a convention, not a reserved protocol field.
 
+### Tool Result Types
+
+For `tool/{name}` responses, the top-level `result.type` field is reserved by the core:
+
+| `result.type` | Handling |
+|---|---|
+| omitted | The whole `result` is converted with `JSON.stringify(result)` and passed to the LLM as text. This is the backwards-compatible default. |
+| `json` | `result.data` is converted with `JSON.stringify(result.data)` when present; otherwise the whole `result` is stringified. |
+| `image` | `result.image.data` is treated as base64 image bytes, downscaled by the same image ingestion rule used for `image.send.v1`, and passed to the LLM as an image tool result. |
+| `file` | `result.file.data` is treated as base64 file bytes and passed to the LLM as a file tool result. |
+| anything else | The whole `result` is converted with `JSON.stringify(result)`. |
+
+Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
+
+Inline image data is stored in session history. Inline file and audio data are not: before session history is stored, the core replaces every `input_file` and `audio` byte payload with metadata plus `omitted: "data"`, regardless of whether the payload came from an event envelope, a built-in attach tool, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
+
 ## Methods
 
 | Method | Direction | Kind | Description |
@@ -95,6 +111,7 @@ Modules emit LLM-bound events as notifications with `method: "event"`. The `type
 | `event.v1` | Canonical text-oriented event; payload fields are converted to XML for the LLM (see [Event Format for LLM](#event-format-for-llm)). |
 | `image.send.v1` | Delivers a base64-encoded image on the **next** LLM cycle (see below). |
 | `file.send.v1` | Delivers a base64-encoded file (for example a PDF) on the **next** LLM cycle (see below). |
+| `audio.send.v1` | Delivers base64-encoded audio on the **next** LLM cycle (see below). |
 
 ```json
 {
@@ -112,7 +129,7 @@ See [Event Format for LLM](#event-format-for-llm) for how each envelope reaches 
 
 ### `image.send.v1`
 
-Emitted by a module (or enqueued by the built-in `attach_image` tool) to attach image bytes on the next dequeue. Params:
+Emitted by a module to attach image bytes on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -122,7 +139,7 @@ Emitted by a module (or enqueued by the built-in `attach_image` tool) to attach 
 
 ### `file.send.v1`
 
-Emitted by a module (or enqueued by the built-in `attach_file` tool) to attach a document on the next dequeue. Params:
+Emitted by a module to attach a document on the next dequeue. Params:
 
 | Field | Type | Description |
 |---|---|---|
@@ -130,6 +147,17 @@ Emitted by a module (or enqueued by the built-in `attach_file` tool) to attach a
 | `data` | string | Base64-encoded file bytes |
 | `mediaType` | string | MIME type (for example `application/pdf`) |
 | `filename` | string | Basename for the file slot |
+
+### `audio.send.v1`
+
+Emitted by a module to attach audio bytes on the next dequeue. Params:
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `audio.send.v1` |
+| `data` | string | Base64-encoded audio bytes |
+| `mediaType` | string | MIME type (for example `audio/wav`) |
+| `format` | string | Audio format for Chat Completions input. Use `wav` or `mp3`. |
 
 ## Module → Core Session Requests
 
@@ -635,7 +663,7 @@ In all cases the notification shape is the same.
 | `timestamp` | string | ISO 8601, when the event was originally received by the core |
 | `params` | object | Original event params as emitted by the source module, with one exception (see below) |
 
-For `image.send.v1` and `file.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
+For `image.send.v1`, `file.send.v1`, and `audio.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, `format`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
 
 If the source module is not available (for example, not loaded after restart or the daemon is gone), the core logs the loss and removes the queue row; it does not retry delivery. Re-emitting the event is the module's responsibility; the core does not replay it automatically.
 
@@ -722,7 +750,7 @@ restart_modules({ continuation: string })
 |---|---|
 | `continuation` | Required. Ignored when reload fails. When reload succeeds and `continuation` is non-empty (after trim), the core enqueues exactly one follow-up internal event with `source` set to the **current** `event.source` and `params` fixed to `{ "type": "event.v1", "text": "<trimmed continuation>" }`. Pass an empty string when no follow-up is needed. The LLM does not supply `source` or arbitrary params. |
 
-The bundled LLM loop implements this as a core tool (not wrapped with `tool_call.v1` notification). It requires a configured session store and modules root; if those are missing, the tool returns an error string instead of reloading.
+The bundled LLM loop implements this as a core tool. It requires a configured session store and modules root; if those are missing, the tool returns an error string instead of reloading.
 
 **Turn boundary:** After `restart_modules` **succeeds**, processes match disk and the current LLM run ends immediately after that tool call. The agent does not continue with more tool calls or trailing free-form text in the reloaded state. The **next** `event.v1` shows the new module table and runs normally against the reloaded modules. Use a non-empty `continuation` when you want the core to enqueue exactly one handoff event under that new module set.
 
@@ -736,7 +764,7 @@ attach_image({ path: string })
 |---|---|
 | `path` | Path to an image file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, base64-encodes the bytes, and enqueues `image.send.v1` with `source` set to the current event source. The image is **not** injected into the current LLM run; it is delivered when that queue row is processed on a later cycle. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, downscales large images before re-encoding them, and returns the image as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
 
 ### Built-in Tool: `attach_file`
 
@@ -748,7 +776,7 @@ attach_file({ path: string })
 |---|---|
 | `path` | Path to a file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, base64-encodes the bytes, and enqueues `file.send.v1` with `source` set to the current event source. Delivery is on the **next** cycle after enqueue, same as `attach_image`. On success the tool returns `"ok"`; on failure it returns `error: ...`. This tool is not wrapped with `tool_call.v1` module notifications.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, and returns the file as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
 
 ### Built-in Tool: `shell`
 
@@ -818,7 +846,7 @@ End the current LLM turn immediately without delivering any message. The SDK's a
 turn_end()
 ```
 
-No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered and no `tool_call.v1` notification is emitted.
+No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered.
 
 Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently.
 
@@ -826,7 +854,7 @@ Use this when the task is complete and no reply is needed — for example after 
 
 Event payloads are arbitrary JSON objects. The canonical text-oriented envelope is `type: "event.v1"`. The core uses `type` for envelope handling and does not forward that field to the LLM as a literal key in the user string. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
-**Multimodal envelopes (`image.send.v1`, `file.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so `mediaType` and `filename` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image` and `input_file` both use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
+**Multimodal envelopes (`image.send.v1`, `file.send.v1`, `audio.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so fields such as `mediaType`, `filename`, and `format` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image`, `input_file`, or `audio`. Image and file content use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. Audio content uses inline base64 plus `format` (`wav` or `mp3`) so the OpenAI adapter can build `input_audio`. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
 
 **Conversion rules (for the XML half):**
 

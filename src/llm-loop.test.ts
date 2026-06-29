@@ -4,12 +4,25 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AgentInputItem, Runner } from "@openai/agents";
+import type { Agent, AgentInputItem, Runner } from "@openai/agents";
+import type { FunctionTool } from "@openai/agents-core";
+import { RunContext } from "@openai/agents-core";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
-import { runLlmLoop } from "./llm-loop";
+import {
+	downscaleImage,
+	runLlmLoop,
+	sanitizeHistoryForStorage,
+} from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
+
+const hasBwrap = Boolean(Bun.which("bwrap"));
+// attach_image/attach_file read through the workspace sandbox, so only run
+// those integration checks when the platform sandbox backend is available.
+const hasSandbox =
+	hasBwrap ||
+	(process.platform === "darwin" && Boolean(Bun.which("sandbox-exec")));
 
 const tempDirs: string[] = [];
 
@@ -26,6 +39,43 @@ async function createTempDir(prefix: string): Promise<string> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+async function waitUntil(
+	condition: () => boolean | Promise<boolean>,
+	timeoutMs = 1000,
+): Promise<void> {
+	const started = Date.now();
+	while (!(await condition())) {
+		if (Date.now() - started > timeoutMs) {
+			throw new Error("condition timed out");
+		}
+		await delay(10);
+	}
+}
+
+async function waitForQueueEmpty(dbPath: string): Promise<void> {
+	const db = new Database(dbPath);
+	try {
+		await waitUntil(() => {
+			const row = db.query("SELECT count(*) AS n FROM events").get() as {
+				n: number;
+			};
+			return row.n === 0;
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function findFunctionTool(agent: Agent, name: string): FunctionTool {
+	const found = agent.tools?.find(
+		(t): t is FunctionTool => t.type === "function" && t.name === name,
+	);
+	if (!found) {
+		throw new Error(`tool ${name} not found on agent`);
+	}
+	return found;
 }
 
 describe("SessionStore", () => {
@@ -194,6 +244,50 @@ describe("SessionStore", () => {
 	});
 });
 
+describe("downscaleImage", () => {
+	const tinyPngBase64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+	test("keeps images within the max dimensions unchanged", async () => {
+		const original = Buffer.from(tinyPngBase64, "base64");
+
+		const result = await downscaleImage(original, "image/png");
+
+		expect(result.mediaType).toBe("image/png");
+		expect(result.data).toEqual(original);
+	});
+
+	test("normalizes oversized decodable images to JPEG", async () => {
+		const original = await new Bun.Image(Buffer.from(tinyPngBase64, "base64"))
+			.resize(3000, 3000)
+			.png()
+			.bytes();
+
+		const result = await downscaleImage(original, "image/png");
+		const metadata = await new Bun.Image(result.data).metadata();
+
+		expect(result.mediaType).toBe("image/jpeg");
+		expect(result.data[0]).toBe(0xff);
+		expect(result.data[1]).toBe(0xd8);
+		expect(metadata.width).toBe(2048);
+		expect(metadata.height).toBe(2048);
+	});
+
+	test("falls back to the original bytes when decode fails", async () => {
+		const original = Buffer.alloc(600 * 1024, 1);
+		const originalConsoleError = console.error;
+		console.error = () => {};
+		try {
+			const result = await downscaleImage(original, "image/png");
+
+			expect(result.mediaType).toBe("image/png");
+			expect(result.data).toEqual(original);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
+});
+
 describe("runLlmLoop", () => {
 	test("sessions.switch.v1 is skipped with event.dropped when target file missing at apply time", async () => {
 		const home = await createTempDir("justclaw-llm-switch-missing-");
@@ -270,6 +364,412 @@ describe("runLlmLoop", () => {
 		expect(capturedAgent?.instructions).toBe(
 			`<AGENTS.md>\nCONTEXT_BLOCK\n</AGENTS.md>\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
 		);
+	});
+
+	test("downscales image.send.v1 before building LLM input", async () => {
+		const tinyPngBase64 =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+		const imageData = Buffer.from(
+			await new Bun.Image(Buffer.from(tinyPngBase64, "base64"))
+				.resize(3000, 3000)
+				.png()
+				.bytes(),
+		).toString("base64");
+		const home = await createTempDir("justclaw-llm-image-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", {
+			type: "image.send.v1",
+			data: imageData,
+			mediaType: "image/png",
+		});
+
+		let capturedInput: unknown;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				capturedInput = input;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(Array.isArray(capturedInput)).toBe(true);
+		const inputArr = capturedInput as AgentInputItem[];
+		const userInput = inputArr[0] as {
+			content: { type: string; text?: string; image?: string }[];
+		};
+		expect(userInput.content[0]?.text).toContain(
+			"<mediaType>image/jpeg</mediaType>",
+		);
+		const image = userInput.content[1]?.image;
+		expect(image?.startsWith("data:image/jpeg;base64,")).toBe(true);
+		const outputBase64 = image?.replace("data:image/jpeg;base64,", "");
+		const outputMetadata = await new Bun.Image(
+			Buffer.from(outputBase64 ?? "", "base64"),
+		).metadata();
+		expect(outputMetadata.width).toBe(2048);
+		expect(outputMetadata.height).toBe(2048);
+	});
+
+	test("builds audio.send.v1 as user audio input", async () => {
+		const audioData = Buffer.from("audio-bytes").toString("base64");
+		const home = await createTempDir("justclaw-llm-audio-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", {
+			type: "audio.send.v1",
+			data: audioData,
+			mediaType: "audio/wav",
+			format: "wav",
+		});
+
+		let capturedInput: unknown;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				capturedInput = input;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await delay(80);
+		queue.close();
+		await loopTask;
+
+		expect(Array.isArray(capturedInput)).toBe(true);
+		const inputArr = capturedInput as AgentInputItem[];
+		const userInput = inputArr[0] as {
+			content: {
+				type: string;
+				text?: string;
+				audio?: string;
+				format?: string;
+			}[];
+		};
+		expect(userInput.content[0]?.text).toContain("<format>wav</format>");
+		expect(userInput.content[0]?.text).not.toContain(audioData);
+		expect(userInput.content[1]).toEqual({
+			type: "audio",
+			audio: audioData,
+			format: "wav",
+		});
+	});
+
+	test.skipIf(!hasSandbox)(
+		"attach_image returns an image tool result in the current turn",
+		async () => {
+			const tinyPngBase64 =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+			const home = await createTempDir("justclaw-attach-image-");
+			const dbPath = path.join(home, "events.db");
+			const imagePath = path.join(home, "pixel.png");
+			const imageBytes = Buffer.from(tinyPngBase64, "base64");
+			await Bun.write(imagePath, imageBytes);
+			const queue = new EventQueue(dbPath);
+			queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+
+			let toolResult: unknown;
+			const rc = new RunContext();
+			const mockRunner = {
+				run: async (agent: Agent) => {
+					toolResult = await findFunctionTool(agent, "attach_image").invoke(
+						rc,
+						JSON.stringify({ path: imagePath }),
+					);
+					return { finalOutput: null, history: [] };
+				},
+			} as unknown as Runner;
+
+			const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+				runner: mockRunner,
+				workspaceDir: home,
+			});
+			await waitForQueueEmpty(dbPath);
+			queue.close();
+			await loopTask;
+
+			const sha256 = new Bun.CryptoHasher("sha256")
+				.update(imageBytes)
+				.digest("hex");
+			expect(toolResult).toEqual({
+				type: "image",
+				image: {
+					data: tinyPngBase64,
+					mediaType: "image/png",
+					size: imageBytes.byteLength,
+					sha256,
+					link: imagePath,
+				},
+				providerData: {
+					justclaw: {
+						metadata: {
+							type: "image",
+							mediaType: "image/png",
+							size: imageBytes.byteLength,
+							sha256,
+							link: imagePath,
+							attachable: true,
+						},
+					},
+				},
+			});
+			const db = new Database(dbPath);
+			try {
+				const pendingCount = db
+					.query("SELECT count(*) AS n FROM events")
+					.get() as { n: number };
+				expect(pendingCount.n).toBe(0);
+			} finally {
+				db.close();
+			}
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"attach_file returns a file tool result in the current turn",
+		async () => {
+			const home = await createTempDir("justclaw-attach-file-");
+			const dbPath = path.join(home, "events.db");
+			const filePath = path.join(home, "note.txt");
+			const fileContent = "hello file\n";
+			const fileBytes = Buffer.from(fileContent);
+			await Bun.write(filePath, fileContent);
+			const queue = new EventQueue(dbPath);
+			queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+
+			let toolResult: unknown;
+			const rc = new RunContext();
+			const mockRunner = {
+				run: async (agent: Agent) => {
+					toolResult = await findFunctionTool(agent, "attach_file").invoke(
+						rc,
+						JSON.stringify({ path: filePath }),
+					);
+					return { finalOutput: null, history: [] };
+				},
+			} as unknown as Runner;
+
+			const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+				runner: mockRunner,
+				workspaceDir: home,
+			});
+			await waitForQueueEmpty(dbPath);
+			queue.close();
+			await loopTask;
+
+			const sha256 = new Bun.CryptoHasher("sha256")
+				.update(fileBytes)
+				.digest("hex");
+			expect(toolResult).toEqual({
+				type: "file",
+				file: {
+					data: Buffer.from(fileContent).toString("base64"),
+					mediaType: "text/plain",
+					filename: "note.txt",
+					size: fileBytes.byteLength,
+					sha256,
+					link: filePath,
+				},
+				providerData: {
+					justclaw: {
+						metadata: {
+							type: "file",
+							filename: "note.txt",
+							mediaType: "text/plain",
+							size: fileBytes.byteLength,
+							sha256,
+							link: filePath,
+							attachable: true,
+						},
+					},
+				},
+			});
+			const db = new Database(dbPath);
+			try {
+				const pendingCount = db
+					.query("SELECT count(*) AS n FROM events")
+					.get() as { n: number };
+				expect(pendingCount.n).toBe(0);
+			} finally {
+				db.close();
+			}
+		},
+	);
+
+	test("sanitizes file and audio inputs but keeps image inputs before storing history", () => {
+		const imageBytes = Buffer.from("image-bytes");
+		const fileBytes = Buffer.from("file-bytes");
+		const audioBytes = Buffer.from("audio-bytes");
+		const imageSha = new Bun.CryptoHasher("sha256")
+			.update(imageBytes)
+			.digest("hex");
+		const fileSha = new Bun.CryptoHasher("sha256")
+			.update(fileBytes)
+			.digest("hex");
+		const audioSha = new Bun.CryptoHasher("sha256")
+			.update(audioBytes)
+			.digest("hex");
+		const history = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+					},
+					{
+						type: "input_file",
+						file: `data:text/plain;base64,${fileBytes.toString("base64")}`,
+						filename: "user-note.txt",
+					},
+					{
+						type: "audio",
+						audio: audioBytes.toString("base64"),
+						format: "wav",
+					},
+				],
+			},
+			{
+				type: "function_call_result",
+				name: "mod__media",
+				callId: "call-1",
+				status: "completed",
+				output: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "image",
+									mediaType: "image/png",
+									size: imageBytes.byteLength,
+									sha256: imageSha,
+									link: "/tmp/image.png",
+									attachable: true,
+								},
+							},
+						},
+					},
+					{
+						type: "input_file",
+						file: `data:text/plain;base64,${fileBytes.toString("base64")}`,
+						filename: "note.txt",
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "file",
+									filename: "note.txt",
+									mediaType: "text/plain",
+									size: fileBytes.byteLength,
+									sha256: fileSha,
+									link: "/tmp/note.txt",
+									attachable: false,
+								},
+							},
+						},
+					},
+				],
+			},
+		] as AgentInputItem[];
+
+		const sanitized = sanitizeHistoryForStorage(history);
+		expect(JSON.stringify(sanitized)).toContain(imageBytes.toString("base64"));
+		expect(JSON.stringify(sanitized)).not.toContain(
+			fileBytes.toString("base64"),
+		);
+		expect(JSON.stringify(sanitized)).not.toContain(
+			audioBytes.toString("base64"),
+		);
+		expect(sanitized).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "file",
+							file: {
+								type: "file",
+								filename: "user-note.txt",
+								mediaType: "text/plain",
+								size: fileBytes.byteLength,
+								sha256: fileSha,
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "audio",
+							audio: {
+								type: "audio",
+								format: "wav",
+								mediaType: "audio/wav",
+								size: audioBytes.byteLength,
+								sha256: audioSha,
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+				],
+			},
+			{
+				type: "function_call_result",
+				name: "mod__media",
+				callId: "call-1",
+				status: "completed",
+				output: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "image",
+									mediaType: "image/png",
+									size: imageBytes.byteLength,
+									sha256: imageSha,
+									link: "/tmp/image.png",
+									attachable: true,
+								},
+							},
+						},
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "file",
+							file: {
+								type: "file",
+								filename: "note.txt",
+								mediaType: "text/plain",
+								size: fileBytes.byteLength,
+								sha256: fileSha,
+								link: "/tmp/note.txt",
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+				],
+			},
+		]);
 	});
 
 	test("skips LLM for sessions.switch.v1 and completes the event", async () => {

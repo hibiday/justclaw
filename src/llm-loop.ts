@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import {
 	Agent,
@@ -114,11 +115,15 @@ function objectToXml(obj: Record<string, unknown>, indent = "  "): string {
 export function eventToXml(event: QueuedEvent): string {
 	const timestamp = timestampFromUUIDv7(event.id);
 	const { type, ...rest } = event.params;
-	// For multimodal envelopes the base64 `data` rides a separate input_image /
-	// input_file content part (see the userInput builder below). Keep it out of
-	// the XML so the bytes are not sent twice; the text copy blows past the
-	// context window. The small descriptive fields (mediaType, filename) stay.
-	if (type === "image.send.v1" || type === "file.send.v1") {
+	// For multimodal envelopes the base64 `data` rides a separate content part
+	// (see the userInput builder below). Keep it out of the XML so the bytes are
+	// not sent twice; the text copy blows past the context window. The small
+	// descriptive fields (mediaType, filename, format) stay.
+	if (
+		type === "image.send.v1" ||
+		type === "file.send.v1" ||
+		type === "audio.send.v1"
+	) {
 		delete (rest as Record<string, unknown>).data;
 	}
 	const inner = objectToXml(rest);
@@ -157,6 +162,462 @@ function inferFileMediaType(filePath: string): string {
 	}
 }
 
+function inferAudioFormat(params: Record<string, unknown>): "wav" | "mp3" {
+	if (params.format === "wav" || params.format === "mp3") {
+		return params.format;
+	}
+	const mediaType =
+		typeof params.mediaType === "string" ? params.mediaType.toLowerCase() : "";
+	if (mediaType === "audio/mpeg" || mediaType === "audio/mp3") {
+		return "mp3";
+	}
+	return "wav";
+}
+
+const IMAGE_MAX_DIMENSION = 2048;
+
+export async function downscaleImage(
+	bytes: Uint8Array,
+	mediaType: string,
+): Promise<{ data: Uint8Array; mediaType: string }> {
+	try {
+		// Full-resolution phone photos (~6 MB) are the same image regardless of how
+		// they are stored, but the base64 copy rides the conversation history and is
+		// resent on every LLM turn. Left at native size they accumulate until a request
+		// exceeds the provider's max body size (Anthropic returned 413 once the history
+		// held ~32 MB of images). Both Anthropic and OpenAI internally downscale images
+		// before tokenizing (Anthropic to a 1568px long edge, OpenAI to a 2048px box),
+		// so capping the long edge at 2048px costs zero image tokens while cutting the
+		// payload from megabytes to a few hundred KB. Resize on ingestion so only the
+		// small copy is ever stored and replayed.
+		const image = new Bun.Image(bytes);
+		const metadata = await image.metadata();
+		if (
+			metadata.width <= IMAGE_MAX_DIMENSION &&
+			metadata.height <= IMAGE_MAX_DIMENSION
+		) {
+			return { data: bytes, mediaType };
+		}
+		const resized = await image
+			.resize(IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION, {
+				fit: "inside",
+				withoutEnlargement: true,
+			})
+			.jpeg({ quality: 85 })
+			.bytes();
+		if (resized.byteLength === 0) {
+			return { data: bytes, mediaType };
+		}
+		// Re-encode normalizes to JPEG; mediaType must follow or the declared type
+		// and the base64 bytes disagree.
+		return { data: resized, mediaType: "image/jpeg" };
+	} catch (error) {
+		// Undecodable/unsupported image: fall back to the original. Sending it risks
+		// the 413 again, but dropping the image silently is worse for a chat bridge.
+		console.error(
+			`[core] image downscale failed (${mediaType}), sending original: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return { data: bytes, mediaType };
+	}
+}
+
+async function prepareImageEventForInput(
+	event: QueuedEvent,
+): Promise<QueuedEvent> {
+	if (
+		event.params.type !== "image.send.v1" ||
+		typeof event.params.data !== "string"
+	) {
+		return event;
+	}
+	const mediaType =
+		typeof event.params.mediaType === "string"
+			? event.params.mediaType
+			: "image/jpeg";
+	const original = Buffer.from(event.params.data, "base64");
+	const image = await downscaleImage(original, mediaType);
+	if (
+		image.data.byteLength === original.byteLength &&
+		image.mediaType === mediaType
+	) {
+		return event;
+	}
+	return {
+		...event,
+		params: {
+			...event.params,
+			data: Buffer.from(image.data).toString("base64"),
+			mediaType: image.mediaType,
+		},
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+}
+
+async function isAttachableLink(link: unknown): Promise<boolean> {
+	if (typeof link !== "string" || link.length === 0) {
+		return false;
+	}
+	try {
+		const proc = Bun.spawn(["test", "-f", link, "-a", "-r", link], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		return (await proc.exited) === 0;
+	} catch {
+		return false;
+	}
+}
+
+async function buildMediaMetadata(
+	type: "image" | "file",
+	bytes: Uint8Array,
+	mediaType: string,
+	link: unknown,
+	filename?: unknown,
+): Promise<Record<string, unknown>> {
+	return {
+		type,
+		...(typeof filename === "string" && filename.length > 0
+			? { filename }
+			: {}),
+		mediaType,
+		size: bytes.byteLength,
+		sha256: sha256Hex(bytes),
+		...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		attachable: await isAttachableLink(link),
+	};
+}
+
+function attachProviderMetadata(
+	providerData: unknown,
+	metadata: Record<string, unknown>,
+): Record<string, unknown> {
+	const base = isRecord(providerData) ? { ...providerData } : {};
+	const justclaw = isRecord(base.justclaw) ? { ...base.justclaw } : {};
+	return {
+		...base,
+		justclaw: {
+			...justclaw,
+			metadata,
+		},
+	};
+}
+
+function decodeInlineBytes(
+	value: unknown,
+	fallbackMediaType: string,
+): { bytes: Uint8Array; mediaType: string } | null {
+	if (value instanceof Uint8Array) {
+		return { bytes: value, mediaType: fallbackMediaType };
+	}
+	if (typeof value !== "string" || value.length === 0) {
+		return null;
+	}
+	const match = /^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s.exec(value);
+	if (match) {
+		return {
+			bytes: Buffer.from(match[2] ?? "", "base64"),
+			mediaType: match[1] ?? fallbackMediaType,
+		};
+	}
+	return { bytes: Buffer.from(value, "base64"), mediaType: fallbackMediaType };
+}
+
+async function prepareImageToolResult(
+	result: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+	const image = isRecord(result.image) ? result.image : result;
+	const decoded = decodeInlineBytes(
+		image.data ?? result.data,
+		typeof image.mediaType === "string"
+			? image.mediaType
+			: typeof result.mediaType === "string"
+				? result.mediaType
+				: "image/jpeg",
+	);
+	if (!decoded) {
+		return null;
+	}
+	const downscaled = await downscaleImage(decoded.bytes, decoded.mediaType);
+	const link = image.link ?? result.link;
+	const metadata = await buildMediaMetadata(
+		"image",
+		downscaled.data,
+		downscaled.mediaType,
+		link,
+	);
+	return {
+		type: "image",
+		image: {
+			data: Buffer.from(downscaled.data).toString("base64"),
+			mediaType: downscaled.mediaType,
+			size: metadata.size,
+			sha256: metadata.sha256,
+			...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		},
+		...(typeof result.detail === "string" ? { detail: result.detail } : {}),
+		providerData: attachProviderMetadata(result.providerData, metadata),
+	};
+}
+
+async function prepareFileToolResult(
+	result: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+	const file = isRecord(result.file) ? result.file : result;
+	const decoded = decodeInlineBytes(
+		file.data ?? (typeof result.file === "string" ? result.file : result.data),
+		typeof file.mediaType === "string"
+			? file.mediaType
+			: typeof result.mediaType === "string"
+				? result.mediaType
+				: "application/octet-stream",
+	);
+	if (!decoded) {
+		return null;
+	}
+	const filename =
+		file.filename ??
+		result.filename ??
+		(typeof result.name === "string" ? result.name : undefined);
+	const link = file.link ?? result.link;
+	const metadata = await buildMediaMetadata(
+		"file",
+		decoded.bytes,
+		decoded.mediaType,
+		link,
+		filename,
+	);
+	return {
+		type: "file",
+		file: {
+			data: Buffer.from(decoded.bytes).toString("base64"),
+			mediaType: decoded.mediaType,
+			filename:
+				typeof filename === "string" && filename.length > 0
+					? filename
+					: "attachment",
+			size: metadata.size,
+			sha256: metadata.sha256,
+			...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		},
+		providerData: attachProviderMetadata(result.providerData, metadata),
+	};
+}
+
+async function prepareToolResultForLlm(result: unknown): Promise<unknown> {
+	if (!isRecord(result)) {
+		return JSON.stringify(result);
+	}
+	const type = result.type;
+	if (type === undefined || type === "json") {
+		return JSON.stringify(
+			type === "json" && "data" in result ? result.data : result,
+		);
+	}
+	if (type === "image") {
+		return (await prepareImageToolResult(result)) ?? JSON.stringify(result);
+	}
+	if (type === "file") {
+		return (await prepareFileToolResult(result)) ?? JSON.stringify(result);
+	}
+	return JSON.stringify(result);
+}
+
+function metadataFromProviderData(
+	providerData: unknown,
+): Record<string, unknown> | null {
+	if (!isRecord(providerData) || !isRecord(providerData.justclaw)) {
+		return null;
+	}
+	const metadata = providerData.justclaw.metadata;
+	return isRecord(metadata) ? { ...metadata } : null;
+}
+
+function fileMetadataFromDataUrl(
+	value: unknown,
+	filename?: unknown,
+): Record<string, unknown> | null {
+	const decoded = decodeInlineBytes(value, "application/octet-stream");
+	if (!decoded) {
+		return null;
+	}
+	return {
+		type: "file",
+		...(typeof filename === "string" && filename.length > 0
+			? { filename }
+			: {}),
+		mediaType: decoded.mediaType,
+		size: decoded.bytes.byteLength,
+		sha256: sha256Hex(decoded.bytes),
+		attachable: false,
+	};
+}
+
+function audioMetadataFromInline(
+	value: unknown,
+	format?: unknown,
+): Record<string, unknown> | null {
+	const mediaType =
+		format === "mp3"
+			? "audio/mpeg"
+			: format === "wav"
+				? "audio/wav"
+				: "application/octet-stream";
+	const decoded = decodeInlineBytes(value, mediaType);
+	if (!decoded) {
+		return null;
+	}
+	return {
+		type: "audio",
+		format,
+		mediaType: decoded.mediaType,
+		size: decoded.bytes.byteLength,
+		sha256: sha256Hex(decoded.bytes),
+		attachable: false,
+	};
+}
+
+function fileMetadataText(
+	metadata: Record<string, unknown>,
+): Record<string, string> {
+	return {
+		type: "input_text",
+		text: JSON.stringify({
+			type: "file",
+			file: {
+				...metadata,
+				omitted: "data",
+			},
+		}),
+	};
+}
+
+function audioMetadataText(
+	metadata: Record<string, unknown>,
+): Record<string, string> {
+	return {
+		type: "input_text",
+		text: JSON.stringify({
+			type: "audio",
+			audio: {
+				...metadata,
+				omitted: "data",
+			},
+		}),
+	};
+}
+
+function sanitizeHistoryContent(part: unknown): unknown {
+	if (!isRecord(part)) {
+		return part;
+	}
+	if (part.type === "audio") {
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			audioMetadataFromInline(part.audio, part.format);
+		return metadata ? audioMetadataText(metadata) : part;
+	}
+	if (part.type === "input_file") {
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			fileMetadataFromDataUrl(part.file, part.filename);
+		return metadata ? fileMetadataText(metadata) : part;
+	}
+	if (part.type === "file") {
+		const file = isRecord(part.file) ? part.file : part;
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			fileMetadataFromDataUrl(
+				file.data ?? part.file,
+				file.filename ?? part.filename,
+			);
+		return metadata
+			? { type: "text", text: fileMetadataText(metadata).text }
+			: part;
+	}
+	return part;
+}
+
+export function sanitizeHistoryForStorage(
+	history: AgentInputItem[],
+): AgentInputItem[] {
+	return history.map((item) => {
+		if (!isRecord(item)) {
+			return item;
+		}
+		if ("content" in item && Array.isArray(item.content)) {
+			return {
+				...item,
+				content: item.content.map(sanitizeHistoryContent),
+			} as AgentInputItem;
+		}
+		if (item.type === "function_call_result") {
+			const output = item.output;
+			if (Array.isArray(output)) {
+				return {
+					...item,
+					output: output.map(sanitizeHistoryContent),
+				} as AgentInputItem;
+			}
+			return {
+				...item,
+				output: sanitizeHistoryContent(output),
+			} as AgentInputItem;
+		}
+		return item;
+	});
+}
+
+function summarizeToolOutputForNotification(output: unknown): string {
+	if (
+		typeof output === "object" &&
+		output !== null &&
+		(output as { type?: unknown }).type === "image"
+	) {
+		const image = (output as { image?: unknown }).image;
+		if (typeof image === "object" && image !== null) {
+			const record = image as Record<string, unknown>;
+			return JSON.stringify({
+				type: "image",
+				image: {
+					mediaType: record.mediaType,
+					size: record.size,
+					sha256: record.sha256,
+					link: record.link,
+				},
+			});
+		}
+	}
+	if (
+		typeof output === "object" &&
+		output !== null &&
+		(output as { type?: unknown }).type === "file"
+	) {
+		const file = (output as { file?: unknown }).file;
+		if (typeof file === "object" && file !== null) {
+			const record = file as Record<string, unknown>;
+			return JSON.stringify({
+				type: "file",
+				file: {
+					filename: record.filename,
+					mediaType: record.mediaType,
+					size: record.size,
+					sha256: record.sha256,
+					link: record.link,
+				},
+			});
+		}
+	}
+	return typeof output === "string" ? output : JSON.stringify(output);
+}
+
 function wrapWithNotification(
 	t: Tool,
 	getTarget: () => string,
@@ -176,8 +637,7 @@ function wrapWithNotification(
 			} catch {
 				// keep raw string when invoke receives non-JSON input
 			}
-			const outputStr =
-				typeof output === "string" ? output : JSON.stringify(output);
+			const outputStr = summarizeToolOutputForNotification(output);
 			const daemon = daemonsRef.current.find(
 				(d) => d.manifest.name === getTarget(),
 			);
@@ -206,7 +666,7 @@ function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 						`tool/${toolDef.name}`,
 						input ?? {},
 					);
-					return JSON.stringify(result);
+					return prepareToolResultForLlm(result);
 				},
 			}),
 		),
@@ -478,10 +938,11 @@ export async function runLlmLoop(
 		if (
 			envelopeType !== "event.v1" &&
 			envelopeType !== "image.send.v1" &&
-			envelopeType !== "file.send.v1"
+			envelopeType !== "file.send.v1" &&
+			envelopeType !== "audio.send.v1"
 		) {
 			console.warn(
-				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(envelopeType)} (expected event.v1, image.send.v1, or file.send.v1); dropping`,
+				`[core] unsupported internal event type for ${event.source} (id=${event.id}): ${String(envelopeType)} (expected event.v1, image.send.v1, file.send.v1, or audio.send.v1); dropping`,
 			);
 			eventQueue.complete(event.id);
 			continue;
@@ -583,13 +1044,7 @@ export async function runLlmLoop(
 			},
 		});
 
-		const tools: Tool[] = [
-			...(options?.workspaceTools ?? []).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
-			),
-			...buildModuleTools(daemonsRef.current).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
-			),
+		const coreTools: Tool[] = [
 			buildRouteMessageTool(
 				daemonsRef,
 				() => currentTarget,
@@ -617,8 +1072,7 @@ export async function runLlmLoop(
 			tool({
 				name: "attach_image",
 				description:
-					"Read a local image file and attach it to the LLM input on the next event cycle. " +
-					"The current run continues normally after this call; the image arrives in the next cycle. " +
+					"Read a local image file and attach it to the LLM input in this turn. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -662,21 +1116,32 @@ export async function runLlmLoop(
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
 					}
-					const data = read.content;
 					const mediaType = inferImageMediaType(resolved);
-					eventQueue.enqueue(event.source, {
-						type: "image.send.v1",
-						data,
-						mediaType,
-					});
-					return "ok";
+					const original = Buffer.from(read.content, "base64");
+					const image = await downscaleImage(original, mediaType);
+					const metadata = await buildMediaMetadata(
+						"image",
+						image.data,
+						image.mediaType,
+						resolved,
+					);
+					return {
+						type: "image",
+						image: {
+							data: Buffer.from(image.data).toString("base64"),
+							mediaType: image.mediaType,
+							size: metadata.size,
+							sha256: metadata.sha256,
+							link: resolved,
+						},
+						providerData: attachProviderMetadata(undefined, metadata),
+					};
 				},
 			}),
 			tool({
 				name: "attach_file",
 				description:
-					"Read a local file and attach it to the LLM input on the next event cycle. " +
-					"Suitable for PDFs and other documents. The file arrives in the next cycle. " +
+					"Read a local file and attach it to the LLM input in this turn. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -720,18 +1185,42 @@ export async function runLlmLoop(
 					if (!read.ok) {
 						return `error: ${read.stderr.trim() || "read failed"}`;
 					}
-					const data = read.content;
 					const mediaType = inferFileMediaType(resolved);
 					const filename = path.basename(resolved);
-					eventQueue.enqueue(event.source, {
-						type: "file.send.v1",
-						data,
+					const bytes = Buffer.from(read.content, "base64");
+					const metadata = await buildMediaMetadata(
+						"file",
+						bytes,
 						mediaType,
+						resolved,
 						filename,
-					});
-					return "ok";
+					);
+					return {
+						type: "file",
+						file: {
+							data: read.content,
+							mediaType,
+							filename,
+							size: metadata.size,
+							sha256: metadata.sha256,
+							link: resolved,
+						},
+						providerData: attachProviderMetadata(undefined, metadata),
+					};
 				},
 			}),
+		];
+
+		const tools: Tool[] = [
+			...(options?.workspaceTools ?? []).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
+			...buildModuleTools(daemonsRef.current).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
+			...coreTools.map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			),
 		];
 
 		const operatorContext = options?.homeDir
@@ -806,31 +1295,47 @@ export async function runLlmLoop(
 				return { isFinalOutput: false, isInterrupted: undefined };
 			},
 		});
-		const xml = eventToXml(event);
+		const eventForInput = await prepareImageEventForInput(event);
+		const xml = eventToXml(eventForInput);
 		const userInput: AgentInputItem =
-			event.params.type === "image.send.v1"
+			eventForInput.params.type === "image.send.v1"
 				? ({
 						role: "user",
 						content: [
 							{ type: "input_text", text: xml },
 							{
 								type: "input_image",
-								image: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+								image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
 							},
 						],
 					} as AgentInputItem)
-				: event.params.type === "file.send.v1"
+				: eventForInput.params.type === "file.send.v1"
 					? ({
 							role: "user",
 							content: [
 								{ type: "input_text", text: xml },
 								{
 									type: "input_file",
-									file: `data:${String(event.params.mediaType)};base64,${String(event.params.data)}`,
+									file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+									...(typeof eventForInput.params.filename === "string"
+										? { filename: eventForInput.params.filename }
+										: {}),
 								},
 							],
 						} as AgentInputItem)
-					: ({ role: "user", content: xml } as AgentInputItem);
+					: eventForInput.params.type === "audio.send.v1"
+						? ({
+								role: "user",
+								content: [
+									{ type: "input_text", text: xml },
+									{
+										type: "audio",
+										audio: String(eventForInput.params.data),
+										format: inferAudioFormat(eventForInput.params),
+									},
+								],
+							} as AgentInputItem)
+						: ({ role: "user", content: xml } as AgentInputItem);
 
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that
@@ -845,7 +1350,7 @@ export async function runLlmLoop(
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
 					? [...session.history, userInput]
-					: event.params.type === "event.v1"
+					: eventForInput.params.type === "event.v1"
 						? xml
 						: [userInput];
 			const result = await runner.run(agent, runInput, {
@@ -864,7 +1369,7 @@ export async function runLlmLoop(
 					});
 				}
 			}
-			session.history = result.history;
+			session.history = sanitizeHistoryForStorage(result.history);
 			if (sessionStore && session.currentSessionId !== null) {
 				if (await shouldPersistCurrentSession(session, eventQueue)) {
 					await sessionStore.save(session.currentSessionId, session.history);

@@ -7,11 +7,15 @@ export type EventDropDaemon = {
 };
 
 // Omit binary data fields from dropped notifications to avoid sending large
-// payloads (e.g. base64 image/file contents) back through the module channel.
+// payloads (e.g. base64 image/file/audio contents) back through the module channel.
 function sanitizeParams(params: unknown): unknown {
 	if (typeof params !== "object" || params === null) return params;
 	const record = params as Record<string, unknown>;
-	if (record.type !== "image.send.v1" && record.type !== "file.send.v1") {
+	if (
+		record.type !== "image.send.v1" &&
+		record.type !== "file.send.v1" &&
+		record.type !== "audio.send.v1"
+	) {
 		return params;
 	}
 	const { data: _data, ...rest } = record;

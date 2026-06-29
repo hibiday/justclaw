@@ -51,4 +51,23 @@ describe("eventToXml", () => {
 		expect(xml).toContain("<filename>report.pdf</filename>");
 		expect(xml).toContain("<mediaType>application/pdf</mediaType>");
 	});
+
+	test("excludes base64 data but keeps format for audio.send.v1", () => {
+		const data = "QUJDREVG".repeat(1000);
+		const event: QueuedEvent = {
+			id,
+			source: "bluebubbles",
+			params: {
+				type: "audio.send.v1",
+				data,
+				mediaType: "audio/wav",
+				format: "wav",
+			},
+		};
+		const xml = eventToXml(event);
+		expect(xml).not.toContain(data);
+		expect(xml).not.toContain("<data>");
+		expect(xml).toContain("<format>wav</format>");
+		expect(xml).toContain("<mediaType>audio/wav</mediaType>");
+	});
 });
