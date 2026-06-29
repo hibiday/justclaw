@@ -17,6 +17,13 @@ import type { StartedDaemon } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
 
+const hasBwrap = Boolean(Bun.which("bwrap"));
+// attach_image/attach_file read through the workspace sandbox, so only run
+// those integration checks when the platform sandbox backend is available.
+const hasSandbox =
+	hasBwrap ||
+	(process.platform === "darwin" && Boolean(Bun.which("sandbox-exec")));
+
 const tempDirs: string[] = [];
 
 afterEach(async () => {
@@ -32,6 +39,33 @@ async function createTempDir(prefix: string): Promise<string> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+async function waitUntil(
+	condition: () => boolean | Promise<boolean>,
+	timeoutMs = 1000,
+): Promise<void> {
+	const started = Date.now();
+	while (!(await condition())) {
+		if (Date.now() - started > timeoutMs) {
+			throw new Error("condition timed out");
+		}
+		await delay(10);
+	}
+}
+
+async function waitForQueueEmpty(dbPath: string): Promise<void> {
+	const db = new Database(dbPath);
+	try {
+		await waitUntil(() => {
+			const row = db.query("SELECT count(*) AS n FROM events").get() as {
+				n: number;
+			};
+			return row.n === 0;
+		});
+	} finally {
+		db.close();
+	}
 }
 
 function findFunctionTool(agent: Agent, name: string): FunctionTool {
@@ -361,7 +395,7 @@ describe("runLlmLoop", () => {
 		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
 			runner: mockRunner,
 		});
-		await delay(80);
+		await waitForQueueEmpty(dbPath);
 		queue.close();
 		await loopTask;
 
@@ -429,140 +463,146 @@ describe("runLlmLoop", () => {
 		});
 	});
 
-	test("attach_image returns an image tool result in the current turn", async () => {
-		const tinyPngBase64 =
-			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-		const home = await createTempDir("justclaw-attach-image-");
-		const dbPath = path.join(home, "events.db");
-		const imagePath = path.join(home, "pixel.png");
-		const imageBytes = Buffer.from(tinyPngBase64, "base64");
-		await Bun.write(imagePath, imageBytes);
-		const queue = new EventQueue(dbPath);
-		queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+	test.skipIf(!hasSandbox)(
+		"attach_image returns an image tool result in the current turn",
+		async () => {
+			const tinyPngBase64 =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+			const home = await createTempDir("justclaw-attach-image-");
+			const dbPath = path.join(home, "events.db");
+			const imagePath = path.join(home, "pixel.png");
+			const imageBytes = Buffer.from(tinyPngBase64, "base64");
+			await Bun.write(imagePath, imageBytes);
+			const queue = new EventQueue(dbPath);
+			queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
 
-		let toolResult: unknown;
-		const rc = new RunContext();
-		const mockRunner = {
-			run: async (agent: Agent) => {
-				toolResult = await findFunctionTool(agent, "attach_image").invoke(
-					rc,
-					JSON.stringify({ path: imagePath }),
-				);
-				return { finalOutput: null, history: [] };
-			},
-		} as unknown as Runner;
+			let toolResult: unknown;
+			const rc = new RunContext();
+			const mockRunner = {
+				run: async (agent: Agent) => {
+					toolResult = await findFunctionTool(agent, "attach_image").invoke(
+						rc,
+						JSON.stringify({ path: imagePath }),
+					);
+					return { finalOutput: null, history: [] };
+				},
+			} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
-			runner: mockRunner,
-			workspaceDir: home,
-		});
-		await delay(80);
-		queue.close();
-		await loopTask;
+			const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+				runner: mockRunner,
+				workspaceDir: home,
+			});
+			await waitForQueueEmpty(dbPath);
+			queue.close();
+			await loopTask;
 
-		const sha256 = new Bun.CryptoHasher("sha256")
-			.update(imageBytes)
-			.digest("hex");
-		expect(toolResult).toEqual({
-			type: "image",
-			image: {
-				data: tinyPngBase64,
-				mediaType: "image/png",
-				size: imageBytes.byteLength,
-				sha256,
-				link: imagePath,
-			},
-			providerData: {
-				justclaw: {
-					metadata: {
-						type: "image",
-						mediaType: "image/png",
-						size: imageBytes.byteLength,
-						sha256,
-						link: imagePath,
-						attachable: true,
+			const sha256 = new Bun.CryptoHasher("sha256")
+				.update(imageBytes)
+				.digest("hex");
+			expect(toolResult).toEqual({
+				type: "image",
+				image: {
+					data: tinyPngBase64,
+					mediaType: "image/png",
+					size: imageBytes.byteLength,
+					sha256,
+					link: imagePath,
+				},
+				providerData: {
+					justclaw: {
+						metadata: {
+							type: "image",
+							mediaType: "image/png",
+							size: imageBytes.byteLength,
+							sha256,
+							link: imagePath,
+							attachable: true,
+						},
 					},
 				},
-			},
-		});
-		const db = new Database(dbPath);
-		try {
-			const pendingCount = db
-				.query("SELECT count(*) AS n FROM events")
-				.get() as { n: number };
-			expect(pendingCount.n).toBe(0);
-		} finally {
-			db.close();
-		}
-	});
+			});
+			const db = new Database(dbPath);
+			try {
+				const pendingCount = db
+					.query("SELECT count(*) AS n FROM events")
+					.get() as { n: number };
+				expect(pendingCount.n).toBe(0);
+			} finally {
+				db.close();
+			}
+		},
+	);
 
-	test("attach_file returns a file tool result in the current turn", async () => {
-		const home = await createTempDir("justclaw-attach-file-");
-		const dbPath = path.join(home, "events.db");
-		const filePath = path.join(home, "note.txt");
-		const fileContent = "hello file\n";
-		const fileBytes = Buffer.from(fileContent);
-		await Bun.write(filePath, fileContent);
-		const queue = new EventQueue(dbPath);
-		queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+	test.skipIf(!hasSandbox)(
+		"attach_file returns a file tool result in the current turn",
+		async () => {
+			const home = await createTempDir("justclaw-attach-file-");
+			const dbPath = path.join(home, "events.db");
+			const filePath = path.join(home, "note.txt");
+			const fileContent = "hello file\n";
+			const fileBytes = Buffer.from(fileContent);
+			await Bun.write(filePath, fileContent);
+			const queue = new EventQueue(dbPath);
+			queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
 
-		let toolResult: unknown;
-		const rc = new RunContext();
-		const mockRunner = {
-			run: async (agent: Agent) => {
-				toolResult = await findFunctionTool(agent, "attach_file").invoke(
-					rc,
-					JSON.stringify({ path: filePath }),
-				);
-				return { finalOutput: null, history: [] };
-			},
-		} as unknown as Runner;
+			let toolResult: unknown;
+			const rc = new RunContext();
+			const mockRunner = {
+				run: async (agent: Agent) => {
+					toolResult = await findFunctionTool(agent, "attach_file").invoke(
+						rc,
+						JSON.stringify({ path: filePath }),
+					);
+					return { finalOutput: null, history: [] };
+				},
+			} as unknown as Runner;
 
-		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
-			runner: mockRunner,
-			workspaceDir: home,
-		});
-		await delay(80);
-		queue.close();
-		await loopTask;
+			const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+				runner: mockRunner,
+				workspaceDir: home,
+			});
+			await waitForQueueEmpty(dbPath);
+			queue.close();
+			await loopTask;
 
-		const sha256 = new Bun.CryptoHasher("sha256")
-			.update(fileBytes)
-			.digest("hex");
-		expect(toolResult).toEqual({
-			type: "file",
-			file: {
-				data: Buffer.from(fileContent).toString("base64"),
-				mediaType: "text/plain",
-				filename: "note.txt",
-				size: fileBytes.byteLength,
-				sha256,
-				link: filePath,
-			},
-			providerData: {
-				justclaw: {
-					metadata: {
-						type: "file",
-						filename: "note.txt",
-						mediaType: "text/plain",
-						size: fileBytes.byteLength,
-						sha256,
-						link: filePath,
-						attachable: true,
+			const sha256 = new Bun.CryptoHasher("sha256")
+				.update(fileBytes)
+				.digest("hex");
+			expect(toolResult).toEqual({
+				type: "file",
+				file: {
+					data: Buffer.from(fileContent).toString("base64"),
+					mediaType: "text/plain",
+					filename: "note.txt",
+					size: fileBytes.byteLength,
+					sha256,
+					link: filePath,
+				},
+				providerData: {
+					justclaw: {
+						metadata: {
+							type: "file",
+							filename: "note.txt",
+							mediaType: "text/plain",
+							size: fileBytes.byteLength,
+							sha256,
+							link: filePath,
+							attachable: true,
+						},
 					},
 				},
-			},
-		});
-		const db = new Database(dbPath);
-		try {
-			const pendingCount = db
-				.query("SELECT count(*) AS n FROM events")
-				.get() as { n: number };
-			expect(pendingCount.n).toBe(0);
-		} finally {
-			db.close();
-		}
-	});
+			});
+			const db = new Database(dbPath);
+			try {
+				const pendingCount = db
+					.query("SELECT count(*) AS n FROM events")
+					.get() as { n: number };
+				expect(pendingCount.n).toBe(0);
+			} finally {
+				db.close();
+			}
+		},
+	);
 
 	test("sanitizes file and audio inputs but keeps image inputs before storing history", () => {
 		const imageBytes = Buffer.from("image-bytes");
