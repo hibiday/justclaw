@@ -4112,6 +4112,163 @@ describe("turn_end", () => {
 	});
 });
 
+describe("module tool media results", () => {
+	test("converts reserved json, image, and file results for the LLM", async () => {
+		const homeDir = await createTempDir("justclaw-llm-module-media-");
+		const imagePath = path.join(homeDir, "image.png");
+		const filePath = path.join(homeDir, "note.txt");
+		const imageBytes = Buffer.from("image-bytes");
+		const fileBytes = Buffer.from("file-bytes");
+		await writeFile(imagePath, imageBytes);
+		await writeFile(filePath, fileBytes);
+		const initializeResponse = JSON.stringify({
+			tools: [
+				{
+					name: "media",
+					description: "return media",
+					parameters: {
+						type: "object",
+						properties: { kind: { type: "string" } },
+						required: ["kind"],
+						additionalProperties: false,
+					},
+				},
+			],
+		});
+		await writeDaemonModule(
+			homeDir,
+			"mod",
+			`#!/usr/bin/env bun
+const lines = [];
+for await (const chunk of Bun.stdin.stream()) {
+	lines.push(chunk);
+	const text = Buffer.concat(lines).toString("utf8");
+	const inputLines = text.split(/\\r?\\n/);
+	while (inputLines.length > 1) {
+		const line = inputLines.shift();
+		if (!line) continue;
+		const message = JSON.parse(line);
+		if (message.method === "initialize") {
+			console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: ${initializeResponse} }));
+		} else if (message.method === "shutdown") {
+			console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+			process.exit(0);
+		} else if (message.method === "tool/media") {
+			if (message.params.kind === "json") {
+				console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { type: "json", data: { ok: true } } }));
+			} else if (message.params.kind === "image") {
+				console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { type: "image", image: { data: ${JSON.stringify(imageBytes.toString("base64"))}, mediaType: "image/png", link: ${JSON.stringify(imagePath)} } } }));
+			} else {
+				console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { type: "file", file: { data: ${JSON.stringify(fileBytes.toString("base64"))}, mediaType: "text/plain", filename: "note.txt", link: ${JSON.stringify(filePath)} } } }));
+			}
+		}
+	}
+	lines.length = 0;
+	if (inputLines[0]) lines.push(Buffer.from(inputLines[0]));
+}
+`,
+		);
+		const ctx = createSessionContext(homeDir);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...ctx,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		const daemonsRef = { current: runtime.daemons };
+		const queue = runtime.eventQueue;
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
+		queue.enqueue("mod", { type: "event.v1", kind: "k" });
+
+		const rc = new RunContext();
+		let jsonResult: unknown;
+		let imageResult: unknown;
+		let fileResult: unknown;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				const media = findFunctionTool(agent, "mod__media");
+				jsonResult = await media.invoke(rc, JSON.stringify({ kind: "json" }));
+				imageResult = await media.invoke(rc, JSON.stringify({ kind: "image" }));
+				fileResult = await media.invoke(rc, JSON.stringify({ kind: "file" }));
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore: ctx.sessionStore,
+			workspaceDir: "/tmp/ws",
+			historyDir: path.join(homeDir, "history"),
+			characterDir,
+			modulesRoot: runtime.modulesRoot,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await delay(200);
+		queue.close();
+		await loopTask;
+		await stopDaemons(daemonsRef.current);
+
+		const imageSha = new Bun.CryptoHasher("sha256")
+			.update(imageBytes)
+			.digest("hex");
+		const fileSha = new Bun.CryptoHasher("sha256")
+			.update(fileBytes)
+			.digest("hex");
+		expect(jsonResult).toBe(JSON.stringify({ ok: true }));
+		expect(imageResult).toEqual({
+			type: "image",
+			image: {
+				data: imageBytes.toString("base64"),
+				mediaType: "image/png",
+				size: imageBytes.byteLength,
+				sha256: imageSha,
+				link: imagePath,
+			},
+			providerData: {
+				justclaw: {
+					metadata: {
+						type: "image",
+						mediaType: "image/png",
+						size: imageBytes.byteLength,
+						sha256: imageSha,
+						link: imagePath,
+						attachable: true,
+					},
+				},
+			},
+		});
+		expect(fileResult).toEqual({
+			type: "file",
+			file: {
+				data: fileBytes.toString("base64"),
+				mediaType: "text/plain",
+				filename: "note.txt",
+				size: fileBytes.byteLength,
+				sha256: fileSha,
+				link: filePath,
+			},
+			providerData: {
+				justclaw: {
+					metadata: {
+						type: "file",
+						filename: "note.txt",
+						mediaType: "text/plain",
+						size: fileBytes.byteLength,
+						sha256: fileSha,
+						link: filePath,
+						attachable: true,
+					},
+				},
+			},
+		});
+	});
+});
+
 // ---------------------------------------------------------------------------
 // fireTimer
 // ---------------------------------------------------------------------------

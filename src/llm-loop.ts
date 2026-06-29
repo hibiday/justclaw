@@ -232,6 +232,284 @@ async function prepareImageEventForInput(
 	};
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+}
+
+async function isAttachableLink(link: unknown): Promise<boolean> {
+	if (typeof link !== "string" || link.length === 0) {
+		return false;
+	}
+	try {
+		const proc = Bun.spawn(["test", "-f", link, "-a", "-r", link], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		return (await proc.exited) === 0;
+	} catch {
+		return false;
+	}
+}
+
+async function buildMediaMetadata(
+	type: "image" | "file",
+	bytes: Uint8Array,
+	mediaType: string,
+	link: unknown,
+	filename?: unknown,
+): Promise<Record<string, unknown>> {
+	return {
+		type,
+		...(typeof filename === "string" && filename.length > 0
+			? { filename }
+			: {}),
+		mediaType,
+		size: bytes.byteLength,
+		sha256: sha256Hex(bytes),
+		...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		attachable: await isAttachableLink(link),
+	};
+}
+
+function attachProviderMetadata(
+	providerData: unknown,
+	metadata: Record<string, unknown>,
+): Record<string, unknown> {
+	const base = isRecord(providerData) ? { ...providerData } : {};
+	const justclaw = isRecord(base.justclaw) ? { ...base.justclaw } : {};
+	return {
+		...base,
+		justclaw: {
+			...justclaw,
+			metadata,
+		},
+	};
+}
+
+function decodeInlineBytes(
+	value: unknown,
+	fallbackMediaType: string,
+): { bytes: Uint8Array; mediaType: string } | null {
+	if (value instanceof Uint8Array) {
+		return { bytes: value, mediaType: fallbackMediaType };
+	}
+	if (typeof value !== "string" || value.length === 0) {
+		return null;
+	}
+	const match = /^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s.exec(value);
+	if (match) {
+		return {
+			bytes: Buffer.from(match[2] ?? "", "base64"),
+			mediaType: match[1] ?? fallbackMediaType,
+		};
+	}
+	return { bytes: Buffer.from(value, "base64"), mediaType: fallbackMediaType };
+}
+
+async function prepareImageToolResult(
+	result: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+	const image = isRecord(result.image) ? result.image : result;
+	const decoded = decodeInlineBytes(
+		image.data ?? result.data,
+		typeof image.mediaType === "string"
+			? image.mediaType
+			: typeof result.mediaType === "string"
+				? result.mediaType
+				: "image/jpeg",
+	);
+	if (!decoded) {
+		return null;
+	}
+	const downscaled = await downscaleImage(decoded.bytes, decoded.mediaType);
+	const link = image.link ?? result.link;
+	const metadata = await buildMediaMetadata(
+		"image",
+		downscaled.data,
+		downscaled.mediaType,
+		link,
+	);
+	return {
+		type: "image",
+		image: {
+			data: Buffer.from(downscaled.data).toString("base64"),
+			mediaType: downscaled.mediaType,
+			size: metadata.size,
+			sha256: metadata.sha256,
+			...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		},
+		...(typeof result.detail === "string" ? { detail: result.detail } : {}),
+		providerData: attachProviderMetadata(result.providerData, metadata),
+	};
+}
+
+async function prepareFileToolResult(
+	result: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+	const file = isRecord(result.file) ? result.file : result;
+	const decoded = decodeInlineBytes(
+		file.data ?? (typeof result.file === "string" ? result.file : result.data),
+		typeof file.mediaType === "string"
+			? file.mediaType
+			: typeof result.mediaType === "string"
+				? result.mediaType
+				: "application/octet-stream",
+	);
+	if (!decoded) {
+		return null;
+	}
+	const filename =
+		file.filename ??
+		result.filename ??
+		(typeof result.name === "string" ? result.name : undefined);
+	const link = file.link ?? result.link;
+	const metadata = await buildMediaMetadata(
+		"file",
+		decoded.bytes,
+		decoded.mediaType,
+		link,
+		filename,
+	);
+	return {
+		type: "file",
+		file: {
+			data: Buffer.from(decoded.bytes).toString("base64"),
+			mediaType: decoded.mediaType,
+			filename:
+				typeof filename === "string" && filename.length > 0
+					? filename
+					: "attachment",
+			size: metadata.size,
+			sha256: metadata.sha256,
+			...(typeof link === "string" && link.length > 0 ? { link } : {}),
+		},
+		providerData: attachProviderMetadata(result.providerData, metadata),
+	};
+}
+
+async function prepareToolResultForLlm(result: unknown): Promise<unknown> {
+	if (!isRecord(result)) {
+		return JSON.stringify(result);
+	}
+	const type = result.type;
+	if (type === undefined || type === "json") {
+		return JSON.stringify(
+			type === "json" && "data" in result ? result.data : result,
+		);
+	}
+	if (type === "image") {
+		return (await prepareImageToolResult(result)) ?? JSON.stringify(result);
+	}
+	if (type === "file") {
+		return (await prepareFileToolResult(result)) ?? JSON.stringify(result);
+	}
+	return JSON.stringify(result);
+}
+
+function metadataFromProviderData(
+	providerData: unknown,
+): Record<string, unknown> | null {
+	if (!isRecord(providerData) || !isRecord(providerData.justclaw)) {
+		return null;
+	}
+	const metadata = providerData.justclaw.metadata;
+	return isRecord(metadata) ? { ...metadata } : null;
+}
+
+function fileMetadataFromDataUrl(
+	value: unknown,
+	filename?: unknown,
+): Record<string, unknown> | null {
+	const decoded = decodeInlineBytes(value, "application/octet-stream");
+	if (!decoded) {
+		return null;
+	}
+	return {
+		type: "file",
+		...(typeof filename === "string" && filename.length > 0
+			? { filename }
+			: {}),
+		mediaType: decoded.mediaType,
+		size: decoded.bytes.byteLength,
+		sha256: sha256Hex(decoded.bytes),
+		attachable: false,
+	};
+}
+
+function fileMetadataText(
+	metadata: Record<string, unknown>,
+): Record<string, string> {
+	return {
+		type: "input_text",
+		text: JSON.stringify({
+			type: "file",
+			file: {
+				...metadata,
+				omitted: "data",
+			},
+		}),
+	};
+}
+
+function sanitizeHistoryContent(part: unknown): unknown {
+	if (!isRecord(part)) {
+		return part;
+	}
+	if (part.type === "input_file") {
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			fileMetadataFromDataUrl(part.file, part.filename);
+		return metadata ? fileMetadataText(metadata) : part;
+	}
+	if (part.type === "file") {
+		const file = isRecord(part.file) ? part.file : part;
+		const metadata =
+			metadataFromProviderData(part.providerData) ??
+			fileMetadataFromDataUrl(
+				file.data ?? part.file,
+				file.filename ?? part.filename,
+			);
+		return metadata
+			? { type: "text", text: fileMetadataText(metadata).text }
+			: part;
+	}
+	return part;
+}
+
+export function sanitizeHistoryForStorage(
+	history: AgentInputItem[],
+): AgentInputItem[] {
+	return history.map((item) => {
+		if (!isRecord(item)) {
+			return item;
+		}
+		if ("content" in item && Array.isArray(item.content)) {
+			return {
+				...item,
+				content: item.content.map(sanitizeHistoryContent),
+			} as AgentInputItem;
+		}
+		if (item.type === "function_call_result") {
+			const output = item.output;
+			if (Array.isArray(output)) {
+				return {
+					...item,
+					output: output.map(sanitizeHistoryContent),
+				} as AgentInputItem;
+			}
+			return {
+				...item,
+				output: sanitizeHistoryContent(output),
+			} as AgentInputItem;
+		}
+		return item;
+	});
+}
+
 function summarizeToolOutputForNotification(output: unknown): string {
 	if (
 		typeof output === "object" &&
@@ -323,7 +601,7 @@ function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 						`tool/${toolDef.name}`,
 						input ?? {},
 					);
-					return JSON.stringify(result);
+					return prepareToolResultForLlm(result);
 				},
 			}),
 		),
@@ -775,17 +1053,22 @@ export async function runLlmLoop(
 					const mediaType = inferImageMediaType(resolved);
 					const original = Buffer.from(read.content, "base64");
 					const image = await downscaleImage(original, mediaType);
+					const metadata = await buildMediaMetadata(
+						"image",
+						image.data,
+						image.mediaType,
+						resolved,
+					);
 					return {
 						type: "image",
 						image: {
 							data: Buffer.from(image.data).toString("base64"),
 							mediaType: image.mediaType,
-							size: image.data.byteLength,
-							sha256: new Bun.CryptoHasher("sha256")
-								.update(image.data)
-								.digest("hex"),
+							size: metadata.size,
+							sha256: metadata.sha256,
 							link: resolved,
 						},
+						providerData: attachProviderMetadata(undefined, metadata),
 					};
 				},
 			}),
@@ -839,18 +1122,24 @@ export async function runLlmLoop(
 					const mediaType = inferFileMediaType(resolved);
 					const filename = path.basename(resolved);
 					const bytes = Buffer.from(read.content, "base64");
+					const metadata = await buildMediaMetadata(
+						"file",
+						bytes,
+						mediaType,
+						resolved,
+						filename,
+					);
 					return {
 						type: "file",
 						file: {
 							data: read.content,
 							mediaType,
 							filename,
-							size: bytes.byteLength,
-							sha256: new Bun.CryptoHasher("sha256")
-								.update(bytes)
-								.digest("hex"),
+							size: metadata.size,
+							sha256: metadata.sha256,
 							link: resolved,
 						},
+						providerData: attachProviderMetadata(undefined, metadata),
 					};
 				},
 			}),
@@ -962,6 +1251,9 @@ export async function runLlmLoop(
 								{
 									type: "input_file",
 									file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+									...(typeof eventForInput.params.filename === "string"
+										? { filename: eventForInput.params.filename }
+										: {}),
 								},
 							],
 						} as AgentInputItem)
@@ -999,7 +1291,7 @@ export async function runLlmLoop(
 					});
 				}
 			}
-			session.history = result.history;
+			session.history = sanitizeHistoryForStorage(result.history);
 			if (sessionStore && session.currentSessionId !== null) {
 				if (await shouldPersistCurrentSession(session, eventQueue)) {
 					await sessionStore.save(session.currentSessionId, session.history);

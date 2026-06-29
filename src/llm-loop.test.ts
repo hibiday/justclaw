@@ -8,7 +8,11 @@ import type { Agent, AgentInputItem, Runner } from "@openai/agents";
 import type { FunctionTool } from "@openai/agents-core";
 import { RunContext } from "@openai/agents-core";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
-import { downscaleImage, runLlmLoop } from "./llm-loop";
+import {
+	downscaleImage,
+	runLlmLoop,
+	sanitizeHistoryForStorage,
+} from "./llm-loop";
 import type { StartedDaemon } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
@@ -403,14 +407,29 @@ describe("runLlmLoop", () => {
 		queue.close();
 		await loopTask;
 
+		const sha256 = new Bun.CryptoHasher("sha256")
+			.update(imageBytes)
+			.digest("hex");
 		expect(toolResult).toEqual({
 			type: "image",
 			image: {
 				data: tinyPngBase64,
 				mediaType: "image/png",
 				size: imageBytes.byteLength,
-				sha256: new Bun.CryptoHasher("sha256").update(imageBytes).digest("hex"),
+				sha256,
 				link: imagePath,
+			},
+			providerData: {
+				justclaw: {
+					metadata: {
+						type: "image",
+						mediaType: "image/png",
+						size: imageBytes.byteLength,
+						sha256,
+						link: imagePath,
+						attachable: true,
+					},
+				},
 			},
 		});
 		const db = new Database(dbPath);
@@ -454,6 +473,9 @@ describe("runLlmLoop", () => {
 		queue.close();
 		await loopTask;
 
+		const sha256 = new Bun.CryptoHasher("sha256")
+			.update(fileBytes)
+			.digest("hex");
 		expect(toolResult).toEqual({
 			type: "file",
 			file: {
@@ -461,8 +483,21 @@ describe("runLlmLoop", () => {
 				mediaType: "text/plain",
 				filename: "note.txt",
 				size: fileBytes.byteLength,
-				sha256: new Bun.CryptoHasher("sha256").update(fileBytes).digest("hex"),
+				sha256,
 				link: filePath,
+			},
+			providerData: {
+				justclaw: {
+					metadata: {
+						type: "file",
+						filename: "note.txt",
+						mediaType: "text/plain",
+						size: fileBytes.byteLength,
+						sha256,
+						link: filePath,
+						attachable: true,
+					},
+				},
 			},
 		});
 		const db = new Database(dbPath);
@@ -474,6 +509,147 @@ describe("runLlmLoop", () => {
 		} finally {
 			db.close();
 		}
+	});
+
+	test("sanitizes file inputs but keeps image inputs before storing history", () => {
+		const imageBytes = Buffer.from("image-bytes");
+		const fileBytes = Buffer.from("file-bytes");
+		const imageSha = new Bun.CryptoHasher("sha256")
+			.update(imageBytes)
+			.digest("hex");
+		const fileSha = new Bun.CryptoHasher("sha256")
+			.update(fileBytes)
+			.digest("hex");
+		const history = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+					},
+					{
+						type: "input_file",
+						file: `data:text/plain;base64,${fileBytes.toString("base64")}`,
+						filename: "user-note.txt",
+					},
+				],
+			},
+			{
+				type: "function_call_result",
+				name: "mod__media",
+				callId: "call-1",
+				status: "completed",
+				output: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "image",
+									mediaType: "image/png",
+									size: imageBytes.byteLength,
+									sha256: imageSha,
+									link: "/tmp/image.png",
+									attachable: true,
+								},
+							},
+						},
+					},
+					{
+						type: "input_file",
+						file: `data:text/plain;base64,${fileBytes.toString("base64")}`,
+						filename: "note.txt",
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "file",
+									filename: "note.txt",
+									mediaType: "text/plain",
+									size: fileBytes.byteLength,
+									sha256: fileSha,
+									link: "/tmp/note.txt",
+									attachable: false,
+								},
+							},
+						},
+					},
+				],
+			},
+		] as AgentInputItem[];
+
+		const sanitized = sanitizeHistoryForStorage(history);
+		expect(JSON.stringify(sanitized)).toContain(imageBytes.toString("base64"));
+		expect(JSON.stringify(sanitized)).not.toContain(
+			fileBytes.toString("base64"),
+		);
+		expect(sanitized).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "file",
+							file: {
+								type: "file",
+								filename: "user-note.txt",
+								mediaType: "text/plain",
+								size: fileBytes.byteLength,
+								sha256: fileSha,
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+				],
+			},
+			{
+				type: "function_call_result",
+				name: "mod__media",
+				callId: "call-1",
+				status: "completed",
+				output: [
+					{
+						type: "input_image",
+						image: `data:image/png;base64,${imageBytes.toString("base64")}`,
+						providerData: {
+							justclaw: {
+								metadata: {
+									type: "image",
+									mediaType: "image/png",
+									size: imageBytes.byteLength,
+									sha256: imageSha,
+									link: "/tmp/image.png",
+									attachable: true,
+								},
+							},
+						},
+					},
+					{
+						type: "input_text",
+						text: JSON.stringify({
+							type: "file",
+							file: {
+								type: "file",
+								filename: "note.txt",
+								mediaType: "text/plain",
+								size: fileBytes.byteLength,
+								sha256: fileSha,
+								link: "/tmp/note.txt",
+								attachable: false,
+								omitted: "data",
+							},
+						}),
+					},
+				],
+			},
+		]);
 	});
 
 	test("skips LLM for sessions.switch.v1 and completes the event", async () => {

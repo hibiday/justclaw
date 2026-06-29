@@ -75,6 +75,22 @@ This applies to:
 
 For ordinary event semantics, modules should use another payload field such as `kind` rather than overloading `type`. `kind` is a convention, not a reserved protocol field.
 
+### Tool Result Types
+
+For `tool/{name}` responses, the top-level `result.type` field is reserved by the core:
+
+| `result.type` | Handling |
+|---|---|
+| omitted | The whole `result` is converted with `JSON.stringify(result)` and passed to the LLM as text. This is the backwards-compatible default. |
+| `json` | `result.data` is converted with `JSON.stringify(result.data)` when present; otherwise the whole `result` is stringified. |
+| `image` | `result.image.data` is treated as base64 image bytes, downscaled by the same image ingestion rule used for `image.send.v1`, and passed to the LLM as an image tool result. |
+| `file` | `result.file.data` is treated as base64 file bytes and passed to the LLM as a file tool result. |
+| anything else | The whole `result` is converted with `JSON.stringify(result)`. |
+
+Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
+
+Inline image data is stored in session history. Inline file data is not: before session history is stored, the core replaces every `input_file` byte payload with file metadata plus `omitted: "data"`, regardless of whether the file came from `file.send.v1`, `attach_file`, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
+
 ## Methods
 
 | Method | Direction | Kind | Description |
