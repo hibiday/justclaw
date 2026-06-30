@@ -38,10 +38,36 @@ import { runReadFileBase64 } from "./workspace";
 
 setTracingDisabled(true);
 
+type OpenAIAPIMode = "chat_completions" | "responses";
+type MediaEventParams = {
+	type: "image.send.v1" | "file.send.v1";
+	data: string;
+	mediaType: string;
+	filename?: string;
+	link?: string;
+	size?: number;
+	sha256?: string;
+};
+type ToolResultDelivery = {
+	apiMode: OpenAIAPIMode;
+	enqueueMedia: (params: MediaEventParams) => void;
+};
+
+function resolveOpenAIAPIMode(): OpenAIAPIMode {
+	const api = process.env.JUSTCLAW_OPENAI_API ?? "chat_completions";
+	if (api === "chat_completions" || api === "responses") {
+		return api;
+	}
+	throw new Error(
+		'JUSTCLAW_OPENAI_API must be "chat_completions" or "responses"',
+	);
+}
+
 export function resolveModelConfig(): string {
 	const apiKey = process.env.JUSTCLAW_OPENAI_API_KEY;
 	const model = process.env.JUSTCLAW_OPENAI_MODEL;
 	const baseURL = process.env.JUSTCLAW_OPENAI_BASE_URL;
+	const api = resolveOpenAIAPIMode();
 	if (!apiKey) {
 		throw new Error("JUSTCLAW_OPENAI_API_KEY is required");
 	}
@@ -55,7 +81,7 @@ export function resolveModelConfig(): string {
 			...(baseURL !== undefined && baseURL !== "" ? { baseURL } : {}),
 		}),
 	);
-	setOpenAIAPI("chat_completions");
+	setOpenAIAPI(api);
 	return model;
 }
 
@@ -411,7 +437,77 @@ async function prepareFileToolResult(
 	};
 }
 
-async function prepareToolResultForLlm(result: unknown): Promise<unknown> {
+function mediaEventFromToolResult(
+	result: Record<string, unknown>,
+): MediaEventParams | null {
+	if (result.type === "image" && isRecord(result.image)) {
+		const image = result.image;
+		if (typeof image.data !== "string") return null;
+		return {
+			type: "image.send.v1",
+			data: image.data,
+			mediaType:
+				typeof image.mediaType === "string" ? image.mediaType : "image/jpeg",
+			...(typeof image.link === "string" ? { link: image.link } : {}),
+			...(typeof image.size === "number" ? { size: image.size } : {}),
+			...(typeof image.sha256 === "string" ? { sha256: image.sha256 } : {}),
+		};
+	}
+	if (result.type === "file" && isRecord(result.file)) {
+		const file = result.file;
+		if (typeof file.data !== "string") return null;
+		return {
+			type: "file.send.v1",
+			data: file.data,
+			mediaType:
+				typeof file.mediaType === "string"
+					? file.mediaType
+					: "application/octet-stream",
+			...(typeof file.filename === "string" ? { filename: file.filename } : {}),
+			...(typeof file.link === "string" ? { link: file.link } : {}),
+			...(typeof file.size === "number" ? { size: file.size } : {}),
+			...(typeof file.sha256 === "string" ? { sha256: file.sha256 } : {}),
+		};
+	}
+	return null;
+}
+
+function delayedMediaToolOutput(result: Record<string, unknown>): string {
+	const media =
+		result.type === "image" && isRecord(result.image)
+			? result.image
+			: result.type === "file" && isRecord(result.file)
+				? result.file
+				: {};
+	const { data: _data, ...metadata } = media;
+	return JSON.stringify({
+		type: result.type,
+		delayed: true,
+		message:
+			"Media was queued as a multimodal event and will be available in the next LLM cycle.",
+		[result.type === "file" ? "file" : "image"]: metadata,
+	});
+}
+
+function maybeDelayMediaToolResult(
+	result: Record<string, unknown>,
+	delivery?: ToolResultDelivery,
+): unknown {
+	if (delivery?.apiMode !== "chat_completions") {
+		return result;
+	}
+	const event = mediaEventFromToolResult(result);
+	if (!event) {
+		return result;
+	}
+	delivery.enqueueMedia(event);
+	return delayedMediaToolOutput(result);
+}
+
+async function prepareToolResultForLlm(
+	result: unknown,
+	delivery?: ToolResultDelivery,
+): Promise<unknown> {
 	if (!isRecord(result)) {
 		return JSON.stringify(result);
 	}
@@ -422,10 +518,16 @@ async function prepareToolResultForLlm(result: unknown): Promise<unknown> {
 		);
 	}
 	if (type === "image") {
-		return (await prepareImageToolResult(result)) ?? JSON.stringify(result);
+		const prepared = await prepareImageToolResult(result);
+		return prepared
+			? maybeDelayMediaToolResult(prepared, delivery)
+			: JSON.stringify(result);
 	}
 	if (type === "file") {
-		return (await prepareFileToolResult(result)) ?? JSON.stringify(result);
+		const prepared = await prepareFileToolResult(result);
+		return prepared
+			? maybeDelayMediaToolResult(prepared, delivery)
+			: JSON.stringify(result);
 	}
 	return JSON.stringify(result);
 }
@@ -652,7 +754,10 @@ function wrapWithNotification(
 	};
 }
 
-function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
+function buildModuleTools(
+	daemons: StartedDaemon[],
+	delivery: ToolResultDelivery,
+): Tool[] {
 	return daemons.flatMap((daemon) =>
 		daemon.tools.map((toolDef) =>
 			tool({
@@ -666,7 +771,7 @@ function buildModuleTools(daemons: StartedDaemon[]): Tool[] {
 						`tool/${toolDef.name}`,
 						input ?? {},
 					);
-					return prepareToolResultForLlm(result);
+					return prepareToolResultForLlm(result, delivery);
 				},
 			}),
 		),
@@ -1044,6 +1149,14 @@ export async function runLlmLoop(
 			},
 		});
 
+		const openAIAPIMode = resolveOpenAIAPIMode();
+		const toolResultDelivery: ToolResultDelivery = {
+			apiMode: openAIAPIMode,
+			enqueueMedia: (params) => {
+				eventQueue.enqueue(event.source, params);
+			},
+		};
+
 		const coreTools: Tool[] = [
 			buildRouteMessageTool(
 				daemonsRef,
@@ -1072,7 +1185,8 @@ export async function runLlmLoop(
 			tool({
 				name: "attach_image",
 				description:
-					"Read a local image file and attach it to the LLM input in this turn. " +
+					"Read a local image file and attach it to the LLM input. " +
+					"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -1125,23 +1239,27 @@ export async function runLlmLoop(
 						image.mediaType,
 						resolved,
 					);
-					return {
-						type: "image",
-						image: {
-							data: Buffer.from(image.data).toString("base64"),
-							mediaType: image.mediaType,
-							size: metadata.size,
-							sha256: metadata.sha256,
-							link: resolved,
+					return prepareToolResultForLlm(
+						{
+							type: "image",
+							image: {
+								data: Buffer.from(image.data).toString("base64"),
+								mediaType: image.mediaType,
+								size: metadata.size,
+								sha256: metadata.sha256,
+								link: resolved,
+							},
+							providerData: attachProviderMetadata(undefined, metadata),
 						},
-						providerData: attachProviderMetadata(undefined, metadata),
-					};
+						toolResultDelivery,
+					);
 				},
 			}),
 			tool({
 				name: "attach_file",
 				description:
-					"Read a local file and attach it to the LLM input in this turn. " +
+					"Read a local file and attach it to the LLM input. " +
+					"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
 					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
 				parameters: {
 					type: "object",
@@ -1195,18 +1313,21 @@ export async function runLlmLoop(
 						resolved,
 						filename,
 					);
-					return {
-						type: "file",
-						file: {
-							data: read.content,
-							mediaType,
-							filename,
-							size: metadata.size,
-							sha256: metadata.sha256,
-							link: resolved,
+					return prepareToolResultForLlm(
+						{
+							type: "file",
+							file: {
+								data: read.content,
+								mediaType,
+								filename,
+								size: metadata.size,
+								sha256: metadata.sha256,
+								link: resolved,
+							},
+							providerData: attachProviderMetadata(undefined, metadata),
 						},
-						providerData: attachProviderMetadata(undefined, metadata),
-					};
+						toolResultDelivery,
+					);
 				},
 			}),
 		];
@@ -1215,8 +1336,9 @@ export async function runLlmLoop(
 			...(options?.workspaceTools ?? []).map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
-			...buildModuleTools(daemonsRef.current).map((toolItem) =>
-				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			...buildModuleTools(daemonsRef.current, toolResultDelivery).map(
+				(toolItem) =>
+					wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
 			...coreTools.map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
