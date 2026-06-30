@@ -44,9 +44,11 @@ import { fireTimer } from "./timer-runner";
 
 const tempDirs: string[] = [];
 const originalJustclawHome = process.env.JUSTCLAW_HOME;
+const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
 
 beforeEach(() => {
 	delete process.env.JUSTCLAW_HOME;
+	delete process.env.JUSTCLAW_OPENAI_API;
 });
 
 afterEach(async () => {
@@ -54,6 +56,11 @@ afterEach(async () => {
 		delete process.env.JUSTCLAW_HOME;
 	} else {
 		process.env.JUSTCLAW_HOME = originalJustclawHome;
+	}
+	if (originalOpenAIAPI === undefined) {
+		delete process.env.JUSTCLAW_OPENAI_API;
+	} else {
+		process.env.JUSTCLAW_OPENAI_API = originalOpenAIAPI;
 	}
 
 	while (tempDirs.length > 0) {
@@ -4114,6 +4121,7 @@ describe("turn_end", () => {
 
 describe("module tool media results", () => {
 	test("converts reserved json, image, and file results for the LLM", async () => {
+		process.env.JUSTCLAW_OPENAI_API = "responses";
 		const homeDir = await createTempDir("justclaw-llm-module-media-");
 		const imagePath = path.join(homeDir, "image.png");
 		const filePath = path.join(homeDir, "note.txt");

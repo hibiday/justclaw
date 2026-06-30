@@ -25,8 +25,14 @@ const hasSandbox =
 	(process.platform === "darwin" && Boolean(Bun.which("sandbox-exec")));
 
 const tempDirs: string[] = [];
+const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
 
 afterEach(async () => {
+	if (originalOpenAIAPI === undefined) {
+		delete process.env.JUSTCLAW_OPENAI_API;
+	} else {
+		process.env.JUSTCLAW_OPENAI_API = originalOpenAIAPI;
+	}
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
 		if (dir) {
@@ -466,6 +472,7 @@ describe("runLlmLoop", () => {
 	test.skipIf(!hasSandbox)(
 		"attach_image returns an image tool result in the current turn",
 		async () => {
+			process.env.JUSTCLAW_OPENAI_API = "responses";
 			const tinyPngBase64 =
 				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 			const home = await createTempDir("justclaw-attach-image-");
@@ -536,6 +543,7 @@ describe("runLlmLoop", () => {
 	test.skipIf(!hasSandbox)(
 		"attach_file returns a file tool result in the current turn",
 		async () => {
+			process.env.JUSTCLAW_OPENAI_API = "responses";
 			const home = await createTempDir("justclaw-attach-file-");
 			const dbPath = path.join(home, "events.db");
 			const filePath = path.join(home, "note.txt");
@@ -601,6 +609,70 @@ describe("runLlmLoop", () => {
 			} finally {
 				db.close();
 			}
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"attach_image queues media for the next cycle in chat completions mode",
+		async () => {
+			process.env.JUSTCLAW_OPENAI_API = "chat_completions";
+			const tinyPngBase64 =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+			const home = await createTempDir("justclaw-attach-image-delayed-");
+			const dbPath = path.join(home, "events.db");
+			const imagePath = path.join(home, "pixel.png");
+			await Bun.write(imagePath, Buffer.from(tinyPngBase64, "base64"));
+			const queue = new EventQueue(dbPath);
+			queue.enqueue("srcmod", { type: "event.v1", kind: "attach" });
+
+			let toolResult: unknown;
+			let secondInput: unknown;
+			let runCount = 0;
+			const rc = new RunContext();
+			const mockRunner = {
+				run: async (agent: Agent, input: unknown) => {
+					runCount += 1;
+					if (runCount === 1) {
+						toolResult = await findFunctionTool(agent, "attach_image").invoke(
+							rc,
+							JSON.stringify({ path: imagePath }),
+						);
+					} else {
+						secondInput = input;
+					}
+					return { finalOutput: null, history: [] };
+				},
+			} as unknown as Runner;
+
+			const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+				runner: mockRunner,
+				workspaceDir: home,
+			});
+			await waitUntil(() => runCount >= 2);
+			queue.close();
+			await loopTask;
+
+			expect(typeof toolResult).toBe("string");
+			const delayed = JSON.parse(toolResult as string) as {
+				type: string;
+				delayed: boolean;
+				image: { data?: string; mediaType?: string };
+			};
+			expect(delayed.type).toBe("image");
+			expect(delayed.delayed).toBe(true);
+			expect(delayed.image.data).toBeUndefined();
+			expect(delayed.image.mediaType).toBe("image/png");
+
+			expect(Array.isArray(secondInput)).toBe(true);
+			const inputArr = secondInput as AgentInputItem[];
+			const imageEvent = inputArr[0] as {
+				role: string;
+				content: Array<{ type: string; image?: string }>;
+			};
+			expect(imageEvent.content[1]).toEqual({
+				type: "input_image",
+				image: `data:image/png;base64,${tinyPngBase64}`,
+			});
 		},
 	);
 

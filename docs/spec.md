@@ -83,8 +83,8 @@ For `tool/{name}` responses, the top-level `result.type` field is reserved by th
 |---|---|
 | omitted | The whole `result` is converted with `JSON.stringify(result)` and passed to the LLM as text. This is the backwards-compatible default. |
 | `json` | `result.data` is converted with `JSON.stringify(result.data)` when present; otherwise the whole `result` is stringified. |
-| `image` | `result.image.data` is treated as base64 image bytes, downscaled by the same image ingestion rule used for `image.send.v1`, and passed to the LLM as an image tool result. |
-| `file` | `result.file.data` is treated as base64 file bytes and passed to the LLM as a file tool result. |
+| `image` | `result.image.data` is treated as base64 image bytes and downscaled by the same image ingestion rule used for `image.send.v1`. In Responses mode it is passed to the LLM as an image tool result; in Chat Completions mode it is queued as `image.send.v1` for the next LLM cycle and the current tool result is text metadata. |
+| `file` | `result.file.data` is treated as base64 file bytes. In Responses mode it is passed to the LLM as a file tool result; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle and the current tool result is text metadata. |
 | anything else | The whole `result` is converted with `JSON.stringify(result)`. |
 
 Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
@@ -764,7 +764,7 @@ attach_image({ path: string })
 |---|---|
 | `path` | Path to an image file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension, downscales large images before re-encoding them, and returns the image as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension and downscales large images before re-encoding them. In Responses mode the image is returned as the tool result so it is available to the LLM in the same turn; in Chat Completions mode it is queued as `image.send.v1` for the next LLM cycle. On failure it returns `error: ...`.
 
 ### Built-in Tool: `attach_file`
 
@@ -776,7 +776,7 @@ attach_file({ path: string })
 |---|---|
 | `path` | Path to a file accessible within the workspace sandbox |
 
-The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension, sets `filename` to the basename, and returns the file as the tool result so it is available to the LLM in the same turn. On failure it returns `error: ...`.
+The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension and sets `filename` to the basename. In Responses mode the file is returned as the tool result so it is available to the LLM in the same turn; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle. On failure it returns `error: ...`.
 
 ### Built-in Tool: `shell`
 
