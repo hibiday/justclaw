@@ -994,6 +994,9 @@ export async function runLlmLoop(
 	});
 
 	while (true) {
+		// Do not start a new (un-abortable) run once shutdown has begun.
+		if (options?.abortSignal?.aborted) break;
+
 		// Interrupt slot takes priority over the persistent queue. Interrupt events
 		// are synthetic (not stored in the DB), so complete() is skipped for them.
 		const interrupt = eventQueue.consumeInterrupt();
@@ -1472,6 +1475,9 @@ export async function runLlmLoop(
 		// either a sessions.skip.v1 request or a process shutdown aborts the run.
 		currentRunController = runController;
 		eventQueue.setRunController(runController);
+		// The abortSignal may have fired while this iteration was blocked in
+		// `await eventQueue.next()`, before currentRunController pointed at it.
+		if (options?.abortSignal?.aborted) runController.abort();
 		try {
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
