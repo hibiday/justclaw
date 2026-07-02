@@ -985,6 +985,14 @@ export async function runLlmLoop(
 		history: [] as AgentInputItem[],
 	};
 
+	// A single persistent listener aborts whichever run controller is current,
+	// instead of registering a new {once:true} listener per iteration (which
+	// would leak on the long-lived shared abortSignal).
+	let currentRunController: AbortController | null = null;
+	options?.abortSignal?.addEventListener("abort", () => {
+		currentRunController?.abort();
+	});
+
 	while (true) {
 		// Interrupt slot takes priority over the persistent queue. Interrupt events
 		// are synthetic (not stored in the DB), so complete() is skipped for them.
@@ -1462,11 +1470,7 @@ export async function runLlmLoop(
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that
 		// either a sessions.skip.v1 request or a process shutdown aborts the run.
-		options?.abortSignal?.addEventListener(
-			"abort",
-			() => runController.abort(),
-			{ once: true },
-		);
+		currentRunController = runController;
 		eventQueue.setRunController(runController);
 		try {
 			const runInput: string | AgentInputItem[] =
