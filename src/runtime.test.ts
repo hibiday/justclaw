@@ -1939,11 +1939,7 @@ sleep 10
 			}
 		}
 		await waitUntil(async () => {
-			return (
-				(await readFile(startCountPath, "utf8")) === "2" &&
-				runtime.daemons[0]?.restartAttempts === 1 &&
-				runtime.daemons[0]?.state === "failed"
-			);
+			return (await readFile(startCountPath, "utf8")) === "2";
 		});
 		await stopDaemons(runtime.daemons);
 		runtime.eventQueue.close();
@@ -2190,7 +2186,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons[0]?.state).toBe("stopped");
 	});
 
-	test("leaves a daemon failed when the restart also fails", async () => {
+	test("removes a daemon from the registry when the restart also fails", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const startCountPath = path.join(homeDir, "restart-fails-starts.txt");
 		await writeDaemonModule(
@@ -2224,11 +2220,10 @@ for await (const chunk of Bun.stdin.stream()) {
 		await waitUntil(async () => {
 			return (
 				(await readFile(startCountPath, "utf8")) === "2" &&
-				runtime.daemons[0]?.restartAttempts === 1 &&
-				runtime.daemons[0]?.state === "failed"
+				runtime.daemons.length === 0
 			);
 		});
-		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+		expect(runtime.daemons).toHaveLength(0);
 
 		await stopDaemons(runtime.daemons);
 		runtime.eventQueue.close();

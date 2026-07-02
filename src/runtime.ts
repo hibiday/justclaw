@@ -622,6 +622,7 @@ async function restartFailedDaemon(
 		console.error(
 			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
 		);
+		daemons.splice(daemonIndex, 1);
 		return;
 	}
 
