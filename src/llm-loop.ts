@@ -18,7 +18,7 @@ import {
 	loadSkillsIndex,
 	readInitContent,
 } from "./agent-context";
-import { notifyEventDropped } from "./event-dropped";
+import { notifyDropped, notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
 	type EventQueue,
@@ -1526,5 +1526,18 @@ export async function runLlmLoop(
 		} finally {
 			eventQueue.setRunController(null);
 		}
+	}
+
+	// A pending interrupt at shutdown is otherwise discarded silently (close()
+	// only resolves the next() waiter); report it as dropped like any other
+	// unhandled event.
+	const pendingInterrupt = eventQueue.consumeInterrupt();
+	if (pendingInterrupt) {
+		notifyDropped(
+			daemonsRef.current,
+			pendingInterrupt.source,
+			pendingInterrupt.params,
+			new Date().toISOString(),
+		);
 	}
 }
