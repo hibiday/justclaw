@@ -109,64 +109,31 @@ function createTimerModulePeer(
 	});
 }
 
-export async function fireTimer(
+/**
+ * Runs the initialize handshake, waits for the module to exit, and cleans up
+ * its peer/state. Kicked off detached from the spawn critical section (see
+ * `fireTimer`) so a slow-initializing or long-lived module never blocks the
+ * next tick's kill-previous/spawn.
+ */
+async function runTimerLifecycle(
 	manifest: TimerModuleManifest,
-	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
+	proc: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
-	options: {
-		sandboxFactory?: (
-			manifest: TimerModuleManifest,
-		) => Promise<SandboxLaunchSpec>;
-		initializeTimeoutMs?: number;
-	},
+	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
+	initializeTimeoutMs: number,
 ): Promise<void> {
-	if (state.process !== null) {
-		await killProcess(state.process);
-	}
-
-	let sandboxSpec: SandboxLaunchSpec;
-	try {
-		sandboxSpec = await (options.sandboxFactory ?? createSandboxLaunchSpec)(
-			manifest,
-		);
-	} catch (error) {
-		console.error(
-			`[${manifest.name}] failed to create sandbox: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return;
-	}
-
-	let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
-	try {
-		proc = Bun.spawn({
-			cmd: sandboxSpec.cmd,
-			cwd: sandboxSpec.cwd,
-			env: sandboxSpec.env,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-	} catch (error) {
-		console.error(
-			`[${manifest.name}] failed to spawn: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return;
-	}
-
-	state.process = proc;
 	const peer = createTimerModulePeer(manifest, proc, queue, sessionStore);
 	const stdoutTask = consumeLines(proc.stdout, (line) => peer.handleLine(line));
 	void consumeLines(proc.stderr, (line) => {
 		console.error(`[${manifest.name}] ${line}`);
 	});
 
-	const initTimeoutMs = options.initializeTimeoutMs ?? INITIALIZE_TIMEOUT_MS;
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 	const initTimeout = new Promise<never>((_, reject) => {
 		timeoutHandle = setTimeout(() => {
 			reject(new Error(`${manifest.name}: initialize timed out`));
-		}, initTimeoutMs);
+		}, initializeTimeoutMs);
 	});
 
 	try {
@@ -192,6 +159,94 @@ export async function fireTimer(
 			state.process = null;
 		}
 	}
+}
+
+export async function fireTimer(
+	manifest: TimerModuleManifest,
+	state: {
+		process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null;
+		// Serializes kill-previous -> spawn -> record across overlapping ticks.
+		// Without this, two ticks firing close together (e.g. a slow
+		// sandboxFactory) can both observe `state.process === null` and spawn
+		// concurrently. Chaining onto this promise makes that section atomic
+		// per state, while the rest of the lifecycle (initialize handshake,
+		// awaiting exit, cleanup) stays detached below so it never delays the
+		// next tick's kill-previous/spawn.
+		lock?: Promise<Bun.Subprocess<"pipe", "pipe", "pipe"> | null>;
+	},
+	queue: EventQueue,
+	sessionStore: SessionStore,
+	options: {
+		sandboxFactory?: (
+			manifest: TimerModuleManifest,
+		) => Promise<SandboxLaunchSpec>;
+		initializeTimeoutMs?: number;
+	},
+): Promise<void> {
+	const lock = (state.lock ?? Promise.resolve(null)).then(async () => {
+		// A rejection here would poison state.lock forever: every later tick's
+		// `.then` chains onto a rejected promise and never runs, silently
+		// killing the schedule. killProcess() isn't expected to throw, but
+		// catch defensively so a surprise failure just skips this tick.
+		try {
+			if (state.process !== null) {
+				await killProcess(state.process);
+			}
+		} catch (error) {
+			console.error(
+				`[${manifest.name}] failed to kill previous process: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return null;
+		}
+
+		let sandboxSpec: SandboxLaunchSpec;
+		try {
+			sandboxSpec = await (options.sandboxFactory ?? createSandboxLaunchSpec)(
+				manifest,
+			);
+		} catch (error) {
+			console.error(
+				`[${manifest.name}] failed to create sandbox: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return null;
+		}
+
+		let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+		try {
+			proc = Bun.spawn({
+				cmd: sandboxSpec.cmd,
+				cwd: sandboxSpec.cwd,
+				env: sandboxSpec.env,
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+		} catch (error) {
+			console.error(
+				`[${manifest.name}] failed to spawn: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return null;
+		}
+
+		state.process = proc;
+		return proc;
+	});
+	state.lock = lock;
+
+	const proc = await lock;
+	if (proc === null) {
+		return;
+	}
+
+	const initTimeoutMs = options.initializeTimeoutMs ?? INITIALIZE_TIMEOUT_MS;
+	void runTimerLifecycle(
+		manifest,
+		proc,
+		queue,
+		sessionStore,
+		state,
+		initTimeoutMs,
+	);
 }
 
 export type TimerScheduler = { stop(): Promise<void> };

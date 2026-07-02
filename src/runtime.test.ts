@@ -4429,6 +4429,51 @@ describe("fireTimer", () => {
 		}
 	});
 
+	test("serializes overlapping fires instead of spawning concurrently", async () => {
+		const homeDir = await createTempDir("justclaw-timer-overlap-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createTimerScript(),
+		);
+		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
+			process: null,
+		};
+
+		// sandboxFactory is awaited inside fireTimer's kill-previous/spawn
+		// critical section. If two overlapping fires can both enter that
+		// section at once (the bug), their sandboxFactory calls overlap too;
+		// the lock must keep this at 1.
+		let concurrentFactoryCalls = 0;
+		let maxConcurrentFactoryCalls = 0;
+		const sandboxFactory = async (m: TimerModuleManifest) => {
+			concurrentFactoryCalls++;
+			maxConcurrentFactoryCalls = Math.max(
+				maxConcurrentFactoryCalls,
+				concurrentFactoryCalls,
+			);
+			await delay(30);
+			concurrentFactoryCalls--;
+			return createUnsandboxedSpec(m.moduleDir, m.execPath);
+		};
+
+		try {
+			const p1 = fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory,
+			});
+			const p2 = fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory,
+			});
+			await Promise.all([p1, p2]);
+
+			expect(maxConcurrentFactoryCalls).toBe(1);
+		} finally {
+			queue.close();
+		}
+	});
+
 	test("logs and returns when initialize times out", async () => {
 		const homeDir = await createTempDir("justclaw-timer-timeout-");
 		const ctx = createSessionContext(homeDir);
@@ -4450,6 +4495,12 @@ describe("fireTimer", () => {
 				initializeTimeoutMs: 50,
 			});
 
+			// The initialize handshake, its timeout, and cleanup run detached from
+			// fireTimer's return (so a slow module can't block the next tick), so
+			// poll for the cleanup to land instead of asserting immediately.
+			for (let i = 0; state.process !== null && i < 50; i++) {
+				await delay(10);
+			}
 			expect(state.process).toBeNull();
 			expect(queue.stale()).toHaveLength(0);
 		} finally {
