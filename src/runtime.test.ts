@@ -649,15 +649,38 @@ describe("JsonRpcPeer", () => {
 		expect(sentLines).toHaveLength(0);
 	});
 
-	test("rejects responses for unknown request ids", () => {
-		const peer = new JsonRpcPeer({
-			name: "test",
-			sendLine: () => {},
-		});
+	test("logs and ignores responses for unknown request ids without tearing down the peer", async () => {
+		const log: string[] = [];
+		const originalConsoleError = console.error;
+		console.error = (...args: unknown[]) => {
+			log.push(args.join(" "));
+		};
 
-		expect(() =>
-			peer.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 99, result: "ok" })),
-		).toThrow("unknown request id 99");
+		try {
+			const peer = new JsonRpcPeer({
+				name: "test",
+				sendLine: () => {},
+			});
+
+			const pending = peer.request("initialize");
+
+			expect(() =>
+				peer.handleLine(
+					JSON.stringify({ jsonrpc: "2.0", id: 99, result: "ok" }),
+				),
+			).not.toThrow();
+			expect(log.some((line) => line.includes("unknown request id 99"))).toBe(
+				true,
+			);
+
+			// The peer stays alive and unrelated in-flight requests are unaffected.
+			peer.handleLine(
+				JSON.stringify({ jsonrpc: "2.0", id: 1, result: "ready" }),
+			);
+			await expect(pending).resolves.toBe("ready");
+		} finally {
+			console.error = originalConsoleError;
+		}
 	});
 
 	test("logs and ignores responses with null id", () => {
@@ -1916,11 +1939,7 @@ sleep 10
 			}
 		}
 		await waitUntil(async () => {
-			return (
-				(await readFile(startCountPath, "utf8")) === "2" &&
-				runtime.daemons[0]?.restartAttempts === 1 &&
-				runtime.daemons[0]?.state === "failed"
-			);
+			return (await readFile(startCountPath, "utf8")) === "2";
 		});
 		await stopDaemons(runtime.daemons);
 		runtime.eventQueue.close();
@@ -2167,7 +2186,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons[0]?.state).toBe("stopped");
 	});
 
-	test("leaves a daemon failed when the restart also fails", async () => {
+	test("removes a daemon from the registry when the restart also fails", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const startCountPath = path.join(homeDir, "restart-fails-starts.txt");
 		await writeDaemonModule(
@@ -2201,11 +2220,10 @@ for await (const chunk of Bun.stdin.stream()) {
 		await waitUntil(async () => {
 			return (
 				(await readFile(startCountPath, "utf8")) === "2" &&
-				runtime.daemons[0]?.restartAttempts === 1 &&
-				runtime.daemons[0]?.state === "failed"
+				runtime.daemons.length === 0
 			);
 		});
-		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+		expect(runtime.daemons).toHaveLength(0);
 
 		await stopDaemons(runtime.daemons);
 		runtime.eventQueue.close();
@@ -4411,6 +4429,51 @@ describe("fireTimer", () => {
 		}
 	});
 
+	test("serializes overlapping fires instead of spawning concurrently", async () => {
+		const homeDir = await createTempDir("justclaw-timer-overlap-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createTimerScript(),
+		);
+		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
+			process: null,
+		};
+
+		// sandboxFactory is awaited inside fireTimer's kill-previous/spawn
+		// critical section. If two overlapping fires can both enter that
+		// section at once (the bug), their sandboxFactory calls overlap too;
+		// the lock must keep this at 1.
+		let concurrentFactoryCalls = 0;
+		let maxConcurrentFactoryCalls = 0;
+		const sandboxFactory = async (m: TimerModuleManifest) => {
+			concurrentFactoryCalls++;
+			maxConcurrentFactoryCalls = Math.max(
+				maxConcurrentFactoryCalls,
+				concurrentFactoryCalls,
+			);
+			await delay(30);
+			concurrentFactoryCalls--;
+			return createUnsandboxedSpec(m.moduleDir, m.execPath);
+		};
+
+		try {
+			const p1 = fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory,
+			});
+			const p2 = fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory,
+			});
+			await Promise.all([p1, p2]);
+
+			expect(maxConcurrentFactoryCalls).toBe(1);
+		} finally {
+			queue.close();
+		}
+	});
+
 	test("logs and returns when initialize times out", async () => {
 		const homeDir = await createTempDir("justclaw-timer-timeout-");
 		const ctx = createSessionContext(homeDir);
@@ -4432,6 +4495,12 @@ describe("fireTimer", () => {
 				initializeTimeoutMs: 50,
 			});
 
+			// The initialize handshake, its timeout, and cleanup run detached from
+			// fireTimer's return (so a slow module can't block the next tick), so
+			// poll for the cleanup to land instead of asserting immediately.
+			for (let i = 0; state.process !== null && i < 50; i++) {
+				await delay(10);
+			}
 			expect(state.process).toBeNull();
 			expect(queue.stale()).toHaveLength(0);
 		} finally {

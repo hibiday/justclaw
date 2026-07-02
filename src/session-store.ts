@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { AgentInputItem } from "@openai/agents";
 import { Glob } from "bun";
@@ -118,7 +119,15 @@ export class SessionStore {
 	}
 
 	async save(id: string, history: AgentInputItem[]): Promise<void> {
-		await Bun.write(this.#filePath(id), JSON.stringify(history, null, 2));
+		const filePath = this.#filePath(id);
+		const tmpPath = `${filePath}.${Bun.randomUUIDv7()}.tmp`;
+		try {
+			await Bun.write(tmpPath, JSON.stringify(history, null, 2));
+			await rename(tmpPath, filePath);
+		} catch (error) {
+			await unlink(tmpPath).catch(() => {});
+			throw error;
+		}
 	}
 
 	async delete(id: string): Promise<void> {

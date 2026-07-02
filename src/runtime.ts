@@ -74,20 +74,32 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	}
 }
 
-function waitForAbort(signal: AbortSignal | undefined): Promise<never> {
+// Returns a promise that rejects when `signal` aborts, plus a `cleanup` to
+// remove the listener. Callers must call `cleanup` on every return path (the
+// listener is otherwise never removed on the common success path, leaking
+// one per call on the shared, long-lived signal across module reloads).
+function waitForAbort(signal: AbortSignal | undefined): {
+	promise: Promise<never>;
+	cleanup: () => void;
+} {
 	if (!signal) {
-		return new Promise(() => {});
+		return { promise: new Promise(() => {}), cleanup: () => {} };
 	}
 
 	if (signal.aborted) {
-		return Promise.reject(createAbortError());
+		return { promise: Promise.reject(createAbortError()), cleanup: () => {} };
 	}
 
-	return new Promise((_, reject) => {
-		signal.addEventListener("abort", () => reject(createAbortError()), {
-			once: true,
-		});
+	let reject!: (error: Error) => void;
+	const promise = new Promise<never>((_, r) => {
+		reject = r;
 	});
+	const handler = () => reject(createAbortError());
+	signal.addEventListener("abort", handler, { once: true });
+	return {
+		promise,
+		cleanup: () => signal.removeEventListener("abort", handler),
+	};
 }
 
 function createTimeout(
@@ -431,12 +443,10 @@ export async function startDaemon(
 	void pipeStderr(daemon);
 	options.onSpawned?.(daemon);
 
+	const abortWait = waitForAbort(options.abortSignal);
 	try {
 		const initializeResult = await withTimeout(
-			Promise.race([
-				peer.request("initialize"),
-				waitForAbort(options.abortSignal),
-			]),
+			Promise.race([peer.request("initialize"), abortWait.promise]),
 			options.initializeTimeoutMs ?? INITIALIZE_TIMEOUT_MS,
 			() => new Error(`${manifest.name}: initialize timed out`),
 		);
@@ -457,6 +467,8 @@ export async function startDaemon(
 			error instanceof Error ? error : new Error(String(error)),
 		);
 		throw error;
+	} finally {
+		abortWait.cleanup();
 	}
 }
 
@@ -622,6 +634,7 @@ async function restartFailedDaemon(
 		console.error(
 			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
 		);
+		daemons.splice(daemonIndex, 1);
 		return;
 	}
 

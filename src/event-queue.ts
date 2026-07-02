@@ -48,6 +48,10 @@ export class EventQueue {
 	#runController: AbortController | null = null;
 	#interrupt: InterruptSlot | null = null;
 
+	get closed(): boolean {
+		return this.#closed;
+	}
+
 	constructor(dbPath: string) {
 		// SQLite opens the file path as-is; it does not create missing parents.
 		mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
@@ -133,10 +137,12 @@ export class EventQueue {
 	}
 
 	complete(id: string): void {
+		if (this.#closed) return;
 		this.#db.run("DELETE FROM events WHERE id = ?", [id]);
 	}
 
 	getMeta(key: string): string | null {
+		if (this.#closed) return null;
 		const row = this.#db
 			.query("SELECT value FROM meta WHERE key = ?")
 			.get(key) as { value: string } | null;
@@ -144,6 +150,7 @@ export class EventQueue {
 	}
 
 	setMeta(key: string, value: string): void {
+		if (this.#closed) return;
 		this.#db.run(
 			"INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 			[key, value],
@@ -151,6 +158,7 @@ export class EventQueue {
 	}
 
 	deleteMeta(key: string): void {
+		if (this.#closed) return;
 		this.#db.run("DELETE FROM meta WHERE key = ?", [key]);
 	}
 
@@ -176,6 +184,14 @@ export class EventQueue {
 	): InterruptSlot | null {
 		const previous = this.#interrupt;
 		this.#interrupt = { source, params };
+		// If the loop is parked in next() on an empty queue, wake it so the
+		// interrupt slot is consumed promptly instead of waiting for the next
+		// queued event (which may never arrive).
+		const waiter = this.#waiter;
+		if (waiter) {
+			this.#waiter = null;
+			waiter(undefined);
+		}
 		return previous;
 	}
 

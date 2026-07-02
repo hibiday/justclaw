@@ -18,7 +18,7 @@ import {
 	loadSkillsIndex,
 	readInitContent,
 } from "./agent-context";
-import { notifyEventDropped } from "./event-dropped";
+import { notifyDropped, notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
 	type EventQueue,
@@ -985,7 +985,18 @@ export async function runLlmLoop(
 		history: [] as AgentInputItem[],
 	};
 
+	// A single persistent listener aborts whichever run controller is current,
+	// instead of registering a new {once:true} listener per iteration (which
+	// would leak on the long-lived shared abortSignal).
+	let currentRunController: AbortController | null = null;
+	options?.abortSignal?.addEventListener("abort", () => {
+		currentRunController?.abort();
+	});
+
 	while (true) {
+		// Do not start a new (un-abortable) run once shutdown has begun.
+		if (options?.abortSignal?.aborted) break;
+
 		// Interrupt slot takes priority over the persistent queue. Interrupt events
 		// are synthetic (not stored in the DB), so complete() is skipped for them.
 		const interrupt = eventQueue.consumeInterrupt();
@@ -998,7 +1009,11 @@ export async function runLlmLoop(
 				}
 			: await eventQueue.next();
 		if (!event) {
-			break;
+			// next() also resolves to undefined when a parked wait was woken by
+			// setInterrupt() rather than shutdown; loop back so the interrupt
+			// slot is consumed first instead of exiting.
+			if (eventQueue.closed) break;
+			continue;
 		}
 
 		if (
@@ -1462,12 +1477,11 @@ export async function runLlmLoop(
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that
 		// either a sessions.skip.v1 request or a process shutdown aborts the run.
-		options?.abortSignal?.addEventListener(
-			"abort",
-			() => runController.abort(),
-			{ once: true },
-		);
+		currentRunController = runController;
 		eventQueue.setRunController(runController);
+		// The abortSignal may have fired while this iteration was blocked in
+		// `await eventQueue.next()`, before currentRunController pointed at it.
+		if (options?.abortSignal?.aborted) runController.abort();
 		try {
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
@@ -1480,6 +1494,17 @@ export async function runLlmLoop(
 				maxTurns,
 			});
 			const text = result.finalOutput;
+			session.history = sanitizeHistoryForStorage(result.history);
+			if (sessionStore && session.currentSessionId !== null) {
+				if (await shouldPersistCurrentSession(session, eventQueue)) {
+					await sessionStore.save(session.currentSessionId, session.history);
+				} else {
+					resetSessionState(session);
+				}
+			}
+			// Deliver only after the session history is persisted, so a save
+			// failure (caught below) means nothing was delivered and the
+			// event.dropped.v1 path is not reporting an already-sent reply.
 			if (text?.trim()) {
 				const targetDaemon = daemonsRef.current.find(
 					(d) => d.manifest.name === currentTarget,
@@ -1489,14 +1514,6 @@ export async function runLlmLoop(
 						type: "message.send.v1",
 						text,
 					});
-				}
-			}
-			session.history = sanitizeHistoryForStorage(result.history);
-			if (sessionStore && session.currentSessionId !== null) {
-				if (await shouldPersistCurrentSession(session, eventQueue)) {
-					await sessionStore.save(session.currentSessionId, session.history);
-				} else {
-					resetSessionState(session);
 				}
 			}
 			if (!isInterrupt) eventQueue.complete(event.id);
@@ -1509,5 +1526,18 @@ export async function runLlmLoop(
 		} finally {
 			eventQueue.setRunController(null);
 		}
+	}
+
+	// A pending interrupt at shutdown is otherwise discarded silently (close()
+	// only resolves the next() waiter); report it as dropped like any other
+	// unhandled event.
+	const pendingInterrupt = eventQueue.consumeInterrupt();
+	if (pendingInterrupt) {
+		notifyDropped(
+			daemonsRef.current,
+			pendingInterrupt.source,
+			pendingInterrupt.params,
+			new Date().toISOString(),
+		);
 	}
 }
