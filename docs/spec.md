@@ -449,14 +449,26 @@ Each timer module directory contains a `module.json` manifest. Required fields: 
 
 When the core starts a module, it executes the manifest's `exec` path inside the platform sandbox. Linux uses `bwrap`; macOS uses `sandbox-exec`.
 
-If the entrypoint begins with a shebang, the core inspects it before spawning:
+The core does not parse module entrypoint shebangs. An interpreter named in a shebang (e.g. `#!/usr/bin/env bun`) must resolve to a path that is already mounted in the sandbox, or the module fails to start. Mounted read-only paths are:
 
-- `#!/absolute/path/to/interpreter` uses that interpreter path
-- `#!/usr/bin/env {command}` resolves `{command}` using the inherited environment
+- The standard OS read-only allowlist (`/usr`, `/bin`, `/etc`, `/nix`, and similar system paths).
+- The core's own runtime directory (`dirname(process.execPath)`), auto-mounted read-only into every module sandbox. This covers the common case of a module written in the same runtime as the core (e.g. Bun installed under `~/.bun/bin`) without reading any module-controlled input.
+- Paths listed in `JUSTCLAW_SANDBOX_RO_PATHS` (see below).
 
-If the resolved interpreter is outside the sandbox's standard read-only allowlist, the core exposes the interpreter's parent directory as an additional read-only path, without exposing `/`.
+**Rationale:** An earlier design parsed each module's shebang and exposed the resolved interpreter's parent directory. Because the shebang line is module-controlled input (and the LLM can write it via the rw-mounted modules root), that let a module expose the parent directory of any path it named, including host directories with no relation to the module's own runtime.
 
-**Rationale:** This preserves common user-local runtimes such as Bun installed outside `/usr` while keeping the sandbox policy minimal and read-only.
+### Operator-configured sandbox paths
+
+Two environment variables let the operator add mount paths beyond the standard allowlist. Both are colon-separated lists of absolute paths, validated against the host filesystem: relative paths, paths containing `..`, and paths that resolve differently once normalized (e.g. `//`, `/.`) are rejected; entries that don't exist on the host are skipped. Rejected or missing entries are logged and otherwise ignored (fail closed).
+
+| Variable | Mount | Scope |
+|---|---|---|
+| `JUSTCLAW_SANDBOX_RO_PATHS` | Read-only | Module sandbox and workspace sandbox |
+| `JUSTCLAW_SANDBOX_RW_PATHS` | Read-write | Module sandbox and workspace sandbox |
+
+These are operator input, not module input, so there is no per-module injection concern; validation exists to fail closed on misconfiguration rather than to defend against an adversarial value.
+
+`JUSTCLAW_SANDBOX_RW_PATHS` grants are global: every module sandbox and the workspace sandbox get the same read-write access. For the workspace sandbox, that means the paths are reachable by the LLM (which drives the workspace shell).
 
 ## Operator instructions
 
