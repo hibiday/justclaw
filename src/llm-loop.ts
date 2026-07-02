@@ -1009,7 +1009,11 @@ export async function runLlmLoop(
 				}
 			: await eventQueue.next();
 		if (!event) {
-			break;
+			// next() also resolves to undefined when a parked wait was woken by
+			// setInterrupt() rather than shutdown; loop back so the interrupt
+			// slot is consumed first instead of exiting.
+			if (eventQueue.closed) break;
+			continue;
 		}
 
 		if (

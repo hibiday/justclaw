@@ -48,6 +48,10 @@ export class EventQueue {
 	#runController: AbortController | null = null;
 	#interrupt: InterruptSlot | null = null;
 
+	get closed(): boolean {
+		return this.#closed;
+	}
+
 	constructor(dbPath: string) {
 		// SQLite opens the file path as-is; it does not create missing parents.
 		mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
@@ -180,6 +184,14 @@ export class EventQueue {
 	): InterruptSlot | null {
 		const previous = this.#interrupt;
 		this.#interrupt = { source, params };
+		// If the loop is parked in next() on an empty queue, wake it so the
+		// interrupt slot is consumed promptly instead of waiting for the next
+		// queued event (which may never arrive).
+		const waiter = this.#waiter;
+		if (waiter) {
+			this.#waiter = null;
+			waiter(undefined);
+		}
 		return previous;
 	}
 
