@@ -1490,6 +1490,17 @@ export async function runLlmLoop(
 				maxTurns,
 			});
 			const text = result.finalOutput;
+			session.history = sanitizeHistoryForStorage(result.history);
+			if (sessionStore && session.currentSessionId !== null) {
+				if (await shouldPersistCurrentSession(session, eventQueue)) {
+					await sessionStore.save(session.currentSessionId, session.history);
+				} else {
+					resetSessionState(session);
+				}
+			}
+			// Deliver only after the session history is persisted, so a save
+			// failure (caught below) means nothing was delivered and the
+			// event.dropped.v1 path is not reporting an already-sent reply.
 			if (text?.trim()) {
 				const targetDaemon = daemonsRef.current.find(
 					(d) => d.manifest.name === currentTarget,
@@ -1499,14 +1510,6 @@ export async function runLlmLoop(
 						type: "message.send.v1",
 						text,
 					});
-				}
-			}
-			session.history = sanitizeHistoryForStorage(result.history);
-			if (sessionStore && session.currentSessionId !== null) {
-				if (await shouldPersistCurrentSession(session, eventQueue)) {
-					await sessionStore.save(session.currentSessionId, session.history);
-				} else {
-					resetSessionState(session);
 				}
 			}
 			if (!isInterrupt) eventQueue.complete(event.id);
