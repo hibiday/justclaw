@@ -259,9 +259,13 @@ export class JsonRpcPeer {
 
 		const pending = this.#pending.get(message.id);
 		if (!pending) {
-			throw new Error(
-				`${this.#name}: received response for unknown request id ${message.id}`,
+			// An uncorrelated response (e.g. a stale reply after the request
+			// already timed out) must not tear down the transport: never throw
+			// from handleLine for a malformed-but-not-fatal peer message.
+			console.error(
+				`[${this.#name}] ignoring JSON-RPC response for unknown request id ${message.id}`,
 			);
+			return;
 		}
 
 		this.#pending.delete(message.id);

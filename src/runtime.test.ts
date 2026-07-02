@@ -649,15 +649,38 @@ describe("JsonRpcPeer", () => {
 		expect(sentLines).toHaveLength(0);
 	});
 
-	test("rejects responses for unknown request ids", () => {
-		const peer = new JsonRpcPeer({
-			name: "test",
-			sendLine: () => {},
-		});
+	test("logs and ignores responses for unknown request ids without tearing down the peer", async () => {
+		const log: string[] = [];
+		const originalConsoleError = console.error;
+		console.error = (...args: unknown[]) => {
+			log.push(args.join(" "));
+		};
 
-		expect(() =>
-			peer.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 99, result: "ok" })),
-		).toThrow("unknown request id 99");
+		try {
+			const peer = new JsonRpcPeer({
+				name: "test",
+				sendLine: () => {},
+			});
+
+			const pending = peer.request("initialize");
+
+			expect(() =>
+				peer.handleLine(
+					JSON.stringify({ jsonrpc: "2.0", id: 99, result: "ok" }),
+				),
+			).not.toThrow();
+			expect(log.some((line) => line.includes("unknown request id 99"))).toBe(
+				true,
+			);
+
+			// The peer stays alive and unrelated in-flight requests are unaffected.
+			peer.handleLine(
+				JSON.stringify({ jsonrpc: "2.0", id: 1, result: "ready" }),
+			);
+			await expect(pending).resolves.toBe("ready");
+		} finally {
+			console.error = originalConsoleError;
+		}
 	});
 
 	test("logs and ignores responses with null id", () => {
