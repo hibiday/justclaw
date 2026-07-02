@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, open, realpath } from "node:fs/promises";
+import { access, realpath } from "node:fs/promises";
 import path from "node:path";
 import type {
 	DaemonModuleManifest,
@@ -24,21 +24,16 @@ type SandboxOptions = {
 	) => Promise<string | null>;
 	pathExists?: (path: string) => Promise<boolean>;
 	realPath?: (path: string) => Promise<string>;
-	readTextFile?: (path: string) => Promise<string>;
 };
 
 type LinuxBubblewrapOptions = {
 	env?: NodeJS.ProcessEnv;
 	pathExists?: (path: string) => Promise<boolean>;
 	realPath?: (path: string) => Promise<string>;
-	lookupExecutable?: (
-		command: string,
-		env: NodeJS.ProcessEnv,
-	) => Promise<string | null>;
-	readTextFile?: (path: string) => Promise<string>;
 };
 
 export type LinuxWorkspaceBwrapOptions = {
+	env?: NodeJS.ProcessEnv;
 	pathExists?: (path: string) => Promise<boolean>;
 	realPath?: (path: string) => Promise<string>;
 	/** When false, skip --ro-bind for history (directory missing on host). */
@@ -66,16 +61,6 @@ export type WorkspaceSandboxBaseOptions = {
 	modulesRoot?: string;
 	/** Skills directory; rw-mounted in the workspace sandbox when set. */
 	skillsDir?: string;
-};
-
-type ResolvedShebangInterpreter = {
-	lookupPath: string;
-	realPath: string;
-};
-
-type ParsedShebangInterpreter = {
-	command: string;
-	env: NodeJS.ProcessEnv;
 };
 
 const DARWIN_TMP_PATHS = ["/tmp", "/private/tmp"] as const;
@@ -144,17 +129,6 @@ async function defaultLookupExecutable(
 	return null;
 }
 
-async function defaultReadTextFile(path: string): Promise<string> {
-	const file = await open(path, "r");
-	try {
-		const buffer = Buffer.alloc(4096);
-		const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-		return buffer.subarray(0, bytesRead).toString("utf8");
-	} finally {
-		await file.close();
-	}
-}
-
 async function defaultRealPath(path: string): Promise<string> {
 	return realpath(path);
 }
@@ -209,30 +183,33 @@ function getDarwinTempPaths(env: NodeJS.ProcessEnv): string[] {
 export function createDarwinSandboxProfile(
 	moduleDir: string,
 	env: NodeJS.ProcessEnv = process.env,
+	/** Operator-configured or core-runtime read-only paths (JUSTCLAW_SANDBOX_RO_PATHS, core runtime dir). */
 	extraReadonlyPaths: string[] = [],
+	/** Operator-configured read-write paths (JUSTCLAW_SANDBOX_RW_PATHS). */
+	extraReadWritePaths: string[] = [],
 ): string {
 	// sandbox-exec's (subpath moduleDir) does not grant read access to parent
 	// directories themselves, but Bun reads ancestor directories on startup.
 	// Use (literal …) for each ancestor up to the filesystem root (excluding /).
-	const moduleDirAncestorLiterals: string[] = [];
-	let ancestor = path.dirname(moduleDir);
-	while (ancestor !== path.dirname(ancestor)) {
-		moduleDirAncestorLiterals.push(
-			`  (literal ${quoteSandboxString(ancestor)})`,
-		);
-		ancestor = path.dirname(ancestor);
-	}
+	const moduleDirAncestorLiterals = collectDarwinAncestorLiterals(moduleDir);
+	const extraReadWriteAncestorLiterals = extraReadWritePaths.flatMap((p) =>
+		collectDarwinAncestorLiterals(p),
+	);
 
 	const allowedReadonlySubpaths = [
 		moduleDir,
 		...DARWIN_READONLY_PATHS,
 		...getDarwinTempPaths(env),
 		...extraReadonlyPaths,
+		...extraReadWritePaths,
 	]
 		.map((readonlyPath) => `  (subpath ${quoteSandboxString(readonlyPath)})`)
 		.join("\n");
 	const allowedTempSubpaths = getDarwinTempPaths(env)
 		.map((tempPath) => `  (subpath ${quoteSandboxString(tempPath)})`)
+		.join("\n");
+	const allowedReadWriteSubpaths = extraReadWritePaths
+		.map((p) => `  (subpath ${quoteSandboxString(p)})`)
 		.join("\n");
 
 	return [
@@ -244,10 +221,12 @@ export function createDarwinSandboxProfile(
 		"(allow file-read* file-map-executable",
 		allowedReadonlySubpaths,
 		...moduleDirAncestorLiterals,
+		...extraReadWriteAncestorLiterals,
 		")",
 		"(allow file-write*",
 		`  (subpath ${quoteSandboxString(moduleDir)})`,
 		allowedTempSubpaths,
+		allowedReadWriteSubpaths,
 		")",
 		"(allow network*)",
 	].join("\n");
@@ -276,6 +255,10 @@ export function createDarwinWorkspaceSandboxProfile(
 	characterDir?: string,
 	modulesRoot?: string,
 	skillsDir?: string,
+	/** Operator-configured read-only paths (JUSTCLAW_SANDBOX_RO_PATHS). */
+	extraReadonlyPaths: string[] = [],
+	/** Operator-configured read-write paths (JUSTCLAW_SANDBOX_RW_PATHS). */
+	extraReadWritePaths: string[] = [],
 ): string {
 	const workspaceAncestors = collectDarwinAncestorLiterals(workspaceDir);
 	const historyAncestors = includeHistoryDir
@@ -290,6 +273,9 @@ export function createDarwinWorkspaceSandboxProfile(
 	const skillsAncestors = skillsDir
 		? collectDarwinAncestorLiterals(skillsDir)
 		: [];
+	const extraReadWriteAncestors = extraReadWritePaths.flatMap((p) =>
+		collectDarwinAncestorLiterals(p),
+	);
 
 	const readonlySubpathEntries = [
 		workspaceDir,
@@ -299,11 +285,16 @@ export function createDarwinWorkspaceSandboxProfile(
 		...(skillsDir ? [skillsDir] : []),
 		...DARWIN_READONLY_PATHS,
 		...getDarwinTempPaths(env),
+		...extraReadonlyPaths,
+		...extraReadWritePaths,
 	]
 		.map((p) => `  (subpath ${quoteSandboxString(p)})`)
 		.join("\n");
 	const allowedTempSubpaths = getDarwinTempPaths(env)
 		.map((tempPath) => `  (subpath ${quoteSandboxString(tempPath)})`)
+		.join("\n");
+	const allowedReadWriteSubpaths = extraReadWritePaths
+		.map((p) => `  (subpath ${quoteSandboxString(p)})`)
 		.join("\n");
 
 	return [
@@ -319,6 +310,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...characterAncestors,
 		...modulesAncestors,
 		...skillsAncestors,
+		...extraReadWriteAncestors,
 		")",
 		"(allow file-write*",
 		`  (subpath ${quoteSandboxString(workspaceDir)})`,
@@ -328,6 +320,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...(modulesRoot ? [`  (subpath ${quoteSandboxString(modulesRoot)})`] : []),
 		...(skillsDir ? [`  (subpath ${quoteSandboxString(skillsDir)})`] : []),
 		allowedTempSubpaths,
+		allowedReadWriteSubpaths,
 		")",
 		"(allow network*)",
 	].join("\n");
@@ -346,143 +339,63 @@ function isPathCovered(
 	return false;
 }
 
-function parseShebangInterpreter(
-	shebang: string,
+/**
+ * Parses a colon-separated env var (JUSTCLAW_SANDBOX_RO_PATHS / _RW_PATHS) into
+ * a list of absolute, normalized, existing paths. These come from the operator
+ * (not module input), but are still validated to fail closed on misconfiguration:
+ * relative paths, "..", "//", "/." and "/" itself are rejected, and paths that
+ * don't exist on the host are skipped rather than passed to bwrap/sandbox-exec.
+ */
+async function resolveOperatorSandboxPaths(
+	rawValue: string | undefined,
+	envVarName: string,
+	pathExists: (path: string) => Promise<boolean>,
+): Promise<string[]> {
+	const candidates = (rawValue ?? "")
+		.split(":")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+
+	const resolved: string[] = [];
+	for (const candidate of candidates) {
+		if (
+			!path.isAbsolute(candidate) ||
+			path.resolve(candidate) !== candidate ||
+			candidate === "/"
+		) {
+			console.error(
+				`${envVarName}: ignoring malformed path "${candidate}" (must be an absolute, normalized path other than "/")`,
+			);
+			continue;
+		}
+		if (!(await pathExists(candidate))) {
+			console.error(
+				`${envVarName}: ignoring path "${candidate}" (does not exist on host)`,
+			);
+			continue;
+		}
+		resolved.push(candidate);
+	}
+	return resolved;
+}
+
+async function resolveOperatorSandboxMounts(
 	env: NodeJS.ProcessEnv,
-): ParsedShebangInterpreter | null {
-	const tokens = shebang
-		.trim()
-		.split(/\s+/)
-		.filter((token) => token.length > 0);
-	if (tokens.length === 0) {
-		return null;
-	}
-
-	const [interpreter, ...args] = tokens;
-	if (!interpreter) {
-		return null;
-	}
-
-	if (!interpreter.endsWith("/env")) {
-		return { command: interpreter, env };
-	}
-
-	if (args.length === 0) {
-		return null;
-	}
-
-	let commandIndex = 0;
-	if (args[0] === "-S") {
-		commandIndex = 1;
-	}
-
-	const shebangEnv = { ...env };
-	while (commandIndex < args.length) {
-		const token = args[commandIndex] ?? "";
-		if (isEnvAssignmentToken(token)) {
-			const [name, value] = splitEnvAssignmentToken(token);
-			shebangEnv[name] = value;
-			commandIndex += 1;
-			continue;
-		}
-		if (envOptionConsumesNextToken(token)) {
-			commandIndex += 2;
-			continue;
-		}
-		if (token.startsWith("-")) {
-			commandIndex += 1;
-			continue;
-		}
-		break;
-	}
-
-	const command = args[commandIndex];
-	return command ? { command, env: shebangEnv } : null;
-}
-
-function envOptionConsumesNextToken(token: string): boolean {
-	return (
-		token === "-u" ||
-		token === "--unset" ||
-		token === "-C" ||
-		token === "--chdir"
-	);
-}
-
-function isEnvAssignmentToken(token: string): boolean {
-	return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token);
-}
-
-function splitEnvAssignmentToken(token: string): [string, string] {
-	const assignmentIndex = token.indexOf("=");
-	return [token.slice(0, assignmentIndex), token.slice(assignmentIndex + 1)];
-}
-
-async function resolveShebangInterpreterPath(
-	manifest: DaemonModuleManifest | TimerModuleManifest,
-	env: NodeJS.ProcessEnv,
-	lookupExecutable: (
-		command: string,
-		env: NodeJS.ProcessEnv,
-	) => Promise<string | null>,
-	realPath: (path: string) => Promise<string>,
-	readTextFile: (path: string) => Promise<string>,
-): Promise<ResolvedShebangInterpreter | null> {
-	let manifestText: string;
-	try {
-		manifestText = await readTextFile(manifest.execPath);
-	} catch {
-		return null;
-	}
-
-	const firstLine = manifestText.split(/\r?\n/, 1)[0];
-	if (!firstLine?.startsWith("#!")) {
-		return null;
-	}
-
-	const interpreter = parseShebangInterpreter(firstLine.slice(2), env);
-	if (!interpreter) {
-		return null;
-	}
-
-	const interpreterPath = interpreter.command.startsWith("/")
-		? interpreter.command
-		: await lookupExecutable(interpreter.command, interpreter.env);
-	if (!interpreterPath) {
-		return null;
-	}
-
-	try {
-		return {
-			lookupPath: interpreterPath,
-			realPath: await realPath(interpreterPath),
-		};
-	} catch {
-		return {
-			lookupPath: interpreterPath,
-			realPath: interpreterPath,
-		};
-	}
-}
-
-function getUniqueShebangInterpreterPaths(
-	interpreter: ResolvedShebangInterpreter,
-): string[] {
-	return [...new Set([interpreter.lookupPath, interpreter.realPath])];
-}
-
-function getInterpreterReadonlyMountPath(
-	interpreterPath: string,
-	moduleDir?: string,
-): string {
-	const interpreterDir = path.dirname(interpreterPath);
-	if (
-		interpreterDir === "/" ||
-		(moduleDir !== undefined && isPathCovered(moduleDir, [interpreterDir]))
-	) {
-		return interpreterPath;
-	}
-	return interpreterDir;
+	pathExists: (path: string) => Promise<boolean>,
+): Promise<{ readonlyPaths: string[]; readWritePaths: string[] }> {
+	const [readonlyPaths, readWritePaths] = await Promise.all([
+		resolveOperatorSandboxPaths(
+			env.JUSTCLAW_SANDBOX_RO_PATHS,
+			"JUSTCLAW_SANDBOX_RO_PATHS",
+			pathExists,
+		),
+		resolveOperatorSandboxPaths(
+			env.JUSTCLAW_SANDBOX_RW_PATHS,
+			"JUSTCLAW_SANDBOX_RW_PATHS",
+			pathExists,
+		),
+	]);
+	return { readonlyPaths, readWritePaths };
 }
 
 function appendReadonlyMount(cmd: string[], mountPath: string): void {
@@ -522,8 +435,6 @@ export async function createLinuxBubblewrapCommand(
 	const env = options.env ?? process.env;
 	const pathExists = options.pathExists ?? defaultPathExists;
 	const realPath = options.realPath ?? defaultRealPath;
-	const lookupExecutable = options.lookupExecutable ?? defaultLookupExecutable;
-	const readTextFile = options.readTextFile ?? defaultReadTextFile;
 	const cmd = [
 		bwrapPath,
 		"--die-with-parent",
@@ -559,30 +470,29 @@ export async function createLinuxBubblewrapCommand(
 		mountedRoots.add(writablePath);
 	}
 
-	const interpreter = await resolveShebangInterpreterPath(
-		manifest,
-		env,
-		lookupExecutable,
-		realPath,
-		readTextFile,
-	);
-	for (const interpreterPath of interpreter
-		? getUniqueShebangInterpreterPaths(interpreter)
-		: []) {
-		const mountPath = getInterpreterReadonlyMountPath(
-			interpreterPath,
-			manifest.moduleDir,
-		);
-		if (
-			(await pathExists(mountPath)) &&
-			!isPathCovered(interpreterPath, mountedRoots)
-		) {
-			if (mountPath === interpreterPath) {
-				appendReadonlyFileMount(cmd, mountPath);
-			} else {
-				appendReadonlyMount(cmd, mountPath);
-			}
-			mountedRoots.add(mountPath);
+	// Covers the common case of a module written in the same runtime as the
+	// core (e.g. `#!/usr/bin/env bun` resolving to ~/.bun/bin/bun) without
+	// parsing module-controlled shebangs.
+	const coreRuntimeDir = path.dirname(process.execPath);
+	if (
+		!isPathCovered(coreRuntimeDir, mountedRoots) &&
+		(await pathExists(coreRuntimeDir))
+	) {
+		appendReadonlyMount(cmd, coreRuntimeDir);
+		mountedRoots.add(coreRuntimeDir);
+	}
+
+	const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
+	for (const readonlyPath of operatorMounts.readonlyPaths) {
+		if (!isPathCovered(readonlyPath, mountedRoots)) {
+			appendReadonlyMount(cmd, readonlyPath);
+			mountedRoots.add(readonlyPath);
+		}
+	}
+	for (const readWritePath of operatorMounts.readWritePaths) {
+		if (!isPathCovered(readWritePath, mountedRoots)) {
+			appendWritableMount(cmd, readWritePath);
+			mountedRoots.add(readWritePath);
 		}
 	}
 
@@ -606,6 +516,7 @@ export async function createLinuxWorkspaceBwrapCommand(
 	historyDir: string,
 	options: LinuxWorkspaceBwrapOptions = {},
 ): Promise<string[]> {
+	const env = options.env ?? process.env;
 	const pathExists = options.pathExists ?? defaultPathExists;
 	const realPath = options.realPath ?? defaultRealPath;
 	const bindHistoryDir = options.bindHistoryDir ?? true;
@@ -689,6 +600,20 @@ export async function createLinuxWorkspaceBwrapCommand(
 	appendWritableMount(cmd, tmpPath);
 	mountedRoots.add(tmpPath);
 
+	const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
+	for (const readonlyPath of operatorMounts.readonlyPaths) {
+		if (!isPathCovered(readonlyPath, mountedRoots)) {
+			appendReadonlyMount(cmd, readonlyPath);
+			mountedRoots.add(readonlyPath);
+		}
+	}
+	for (const readWritePath of operatorMounts.readWritePaths) {
+		if (!isPathCovered(readWritePath, mountedRoots)) {
+			appendWritableMount(cmd, readWritePath);
+			mountedRoots.add(readWritePath);
+		}
+	}
+
 	cmd.push("--proc", "/proc", "--dev", "/dev", "--chdir", workspaceDir, "--");
 
 	return cmd;
@@ -720,6 +645,7 @@ export async function createWorkspaceSandboxBaseCommand(
 		if (!sandboxExecPath) {
 			throw new Error("sandbox-exec backend is unavailable");
 		}
+		const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
 		const profile = createDarwinWorkspaceSandboxProfile(
 			workspaceDir,
 			historyDir,
@@ -728,6 +654,8 @@ export async function createWorkspaceSandboxBaseCommand(
 			characterDir,
 			modulesRoot,
 			skillsDir,
+			operatorMounts.readonlyPaths,
+			operatorMounts.readWritePaths,
 		);
 		return {
 			backend: "sandbox-exec",
@@ -747,6 +675,7 @@ export async function createWorkspaceSandboxBaseCommand(
 			workspaceDir,
 			historyDir,
 			{
+				env,
 				pathExists,
 				realPath,
 				bindHistoryDir: historyExists,
@@ -765,6 +694,15 @@ export async function createWorkspaceSandboxBaseCommand(
 	throw new Error(`Unsupported sandbox platform: ${platform}`);
 }
 
+function ensurePathContainsDir(env: NodeJS.ProcessEnv, dir: string): void {
+	const pathEntries = (env.PATH ?? "")
+		.split(":")
+		.filter((entry) => entry.length > 0);
+	if (!pathEntries.includes(dir)) {
+		env.PATH = [dir, ...pathEntries].join(":");
+	}
+}
+
 export async function createSandboxLaunchSpec(
 	manifest: DaemonModuleManifest | TimerModuleManifest,
 	options: SandboxOptions = {},
@@ -776,48 +714,53 @@ export async function createSandboxLaunchSpec(
 			: { ...(options.env ?? process.env) };
 	const lookupExecutable = options.lookupExecutable ?? defaultLookupExecutable;
 	const pathExists = options.pathExists ?? defaultPathExists;
-	const readTextFile = options.readTextFile ?? defaultReadTextFile;
-	const realPath = options.realPath ?? defaultRealPath;
 	const backend = resolveSandboxBackend(platform);
+
+	// An interpreter named by a module's shebang (e.g. `#!/usr/bin/env bun`)
+	// must resolve via PATH at exec time, since the core no longer parses
+	// module shebangs to derive mounts (see resolveOperatorSandboxMounts).
+	const coreRuntimeDir = path.dirname(process.execPath);
+	ensurePathContainsDir(env, coreRuntimeDir);
 
 	if (backend === "sandbox-exec") {
 		const sandboxExecPath = await lookupExecutable("sandbox-exec", env);
 		if (!sandboxExecPath) {
 			throw new Error("sandbox-exec backend is unavailable");
 		}
-		const extraReadonlyPaths: string[] = [];
-		const interpreter = await resolveShebangInterpreterPath(
-			manifest,
-			env,
-			lookupExecutable,
-			realPath,
-			readTextFile,
-		);
-		for (const interpreterPath of interpreter
-			? getUniqueShebangInterpreterPaths(interpreter)
-			: []) {
-			const mountPath = getInterpreterReadonlyMountPath(
-				interpreterPath,
-				manifest.moduleDir,
-			);
+		const standardCovered = [
+			manifest.moduleDir,
+			...DARWIN_READONLY_PATHS,
+			...getDarwinTempPaths(env),
+		];
+		const extraReadonlyPaths = (await pathExists(coreRuntimeDir))
+			? [coreRuntimeDir].filter((p) => !isPathCovered(p, standardCovered))
+			: [];
+		const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
+		for (const readonlyPath of operatorMounts.readonlyPaths) {
 			if (
-				!isPathCovered(interpreterPath, [
-					manifest.moduleDir,
-					...DARWIN_READONLY_PATHS,
-					...getDarwinTempPaths(env),
+				!isPathCovered(readonlyPath, [
+					...standardCovered,
 					...extraReadonlyPaths,
 				])
 			) {
-				extraReadonlyPaths.push(mountPath);
+				extraReadonlyPaths.push(readonlyPath);
 			}
 		}
+		const extraReadWritePaths = operatorMounts.readWritePaths.filter(
+			(p) => !isPathCovered(p, standardCovered),
+		);
 
 		return {
 			backend,
 			cmd: [
 				sandboxExecPath,
 				"-p",
-				createDarwinSandboxProfile(manifest.moduleDir, env, extraReadonlyPaths),
+				createDarwinSandboxProfile(
+					manifest.moduleDir,
+					env,
+					extraReadonlyPaths,
+					extraReadWritePaths,
+				),
 				"--",
 				manifest.execPath,
 			],
@@ -836,9 +779,7 @@ export async function createSandboxLaunchSpec(
 		cmd: await createLinuxBubblewrapCommand(bwrapPath, manifest, {
 			env,
 			pathExists,
-			realPath,
-			lookupExecutable,
-			readTextFile,
+			realPath: options.realPath ?? defaultRealPath,
 		}),
 		cwd: manifest.moduleDir,
 		env,

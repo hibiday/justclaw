@@ -35,6 +35,7 @@ import {
 import {
 	createDarwinSandboxProfile,
 	createLinuxBubblewrapCommand,
+	createLinuxWorkspaceBwrapCommand,
 	createSandboxLaunchSpec,
 	resolveSandboxBackend,
 	type SandboxLaunchSpec,
@@ -858,7 +859,7 @@ describe("sandbox", () => {
 		expect(profile).toContain('(subpath "/private/var/folders/example/T")');
 	});
 
-	test("allows a darwin shebang interpreter installed under HOME for reads only", async () => {
+	test("darwin module sandbox exposes JUSTCLAW_SANDBOX_RO_PATHS as read-only", async () => {
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
@@ -867,27 +868,20 @@ describe("sandbox", () => {
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
-			env: { ...process.env, PATH: "/Users/test/.bun/bin:/usr/bin" },
-			lookupExecutable: async (command) => {
-				if (command === "sandbox-exec") {
-					return "/usr/bin/sandbox-exec";
-				}
-				if (command === "bun") {
-					return "/Users/test/.bun/bin/bun";
-				}
-				return null;
-			},
-			readTextFile: async () => "#!/usr/bin/env bun\nconsole.log('hi')\n",
+			env: { ...process.env, JUSTCLAW_SANDBOX_RO_PATHS: "/srv/extra-ro" },
+			lookupExecutable: async (command) =>
+				command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
+			pathExists: async (candidatePath) => candidatePath === "/srv/extra-ro",
 		});
 
 		const profile = spec.cmd[2] ?? "";
-		expect(profile).toContain('(subpath "/Users/test/.bun/bin")');
+		expect(profile).toContain('(subpath "/srv/extra-ro")');
 		expect(profile.slice(profile.indexOf("(allow file-write*"))).not.toContain(
-			'(subpath "/Users/test/.bun/bin")',
+			'(subpath "/srv/extra-ro")',
 		);
 	});
 
-	test("allows both lookup and real target paths for a symlinked darwin shebang interpreter", async () => {
+	test("darwin module sandbox exposes JUSTCLAW_SANDBOX_RW_PATHS as read-write", async () => {
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
@@ -896,29 +890,25 @@ describe("sandbox", () => {
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
-			env: { ...process.env, PATH: "/Users/test/.bun/bin:/usr/bin" },
-			lookupExecutable: async (command) => {
-				if (command === "sandbox-exec") {
-					return "/usr/bin/sandbox-exec";
-				}
-				if (command === "bun") {
-					return "/Users/test/.bun/bin/bun";
-				}
-				return null;
-			},
-			realPath: async (candidatePath) =>
-				candidatePath === "/Users/test/.bun/bin/bun"
-					? "/Users/test/.bun/install/bin/bun"
-					: candidatePath,
-			readTextFile: async () => "#!/usr/bin/env bun\nconsole.log('hi')\n",
+			env: { ...process.env, JUSTCLAW_SANDBOX_RW_PATHS: "/srv/extra-rw" },
+			lookupExecutable: async (command) =>
+				command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
+			pathExists: async (candidatePath) => candidatePath === "/srv/extra-rw",
 		});
 
 		const profile = spec.cmd[2] ?? "";
-		expect(profile).toContain('(subpath "/Users/test/.bun/bin")');
-		expect(profile).toContain('(subpath "/Users/test/.bun/install/bin")');
+		expect(profile).toContain('(subpath "/srv/extra-rw")');
+		expect(profile.slice(profile.indexOf("(allow file-write*"))).toContain(
+			'(subpath "/srv/extra-rw")',
+		);
 	});
 
-	test("allows a root-level darwin shebang interpreter without exposing root", async () => {
+	test("a malicious darwin module shebang produces no extra interpreter mount", async () => {
+		// Regression test: the core no longer reads module entrypoints to derive
+		// mounts, so a shebang naming an arbitrary path (e.g. an ssh key, or "//"
+		// which previously bypassed the "/" root guard) cannot expose anything.
+		// There is no readTextFile option any more -- nothing in module.json or
+		// the entrypoint file is consulted when building the profile.
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
@@ -929,34 +919,13 @@ describe("sandbox", () => {
 			platform: "darwin",
 			lookupExecutable: async (command) =>
 				command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
-			readTextFile: async () => "#!/bun\nconsole.log('hi')\n",
+			pathExists: async () => true,
 		});
 
 		const profile = spec.cmd[2] ?? "";
-		expect(profile).toContain('(subpath "/bun")');
+		expect(profile).not.toContain('(subpath "/home/x/.ssh")');
+		expect(profile).not.toContain('(subpath "/home/x/.ssh/id_rsa")');
 		expect(profile).not.toContain('(subpath "/")');
-	});
-
-	test("allows a darwin shebang interpreter as a file when its parent contains the module directory", async () => {
-		const moduleDir = "/Users/alice/justclaw/modules/example";
-		const interpreterPath = "/Users/alice/justclaw/bun";
-		const manifest = parseDaemonManifest(moduleDir, "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const spec = await createSandboxLaunchSpec(manifest, {
-			platform: "darwin",
-			lookupExecutable: async (command) =>
-				command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
-			readTextFile: async () => `#!${interpreterPath}\nconsole.log('hi')\n`,
-		});
-
-		const profile = spec.cmd[2] ?? "";
-		expect(profile).toContain(`(subpath "${moduleDir}")`);
-		expect(profile).toContain(`(subpath "${interpreterPath}")`);
-		expect(profile).not.toContain('(subpath "/Users/alice/justclaw")');
 	});
 
 	test("builds a linux bwrap command from the readonly allowlist", async () => {
@@ -1018,246 +987,225 @@ describe("sandbox", () => {
 		expect(cmd).toContain("--bind");
 	});
 
-	test("adds a mount for a shebang interpreter resolved via env", async () => {
+	test("mounts the core runtime directory in the module sandbox", async () => {
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
 			mode: "daemon",
 		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/home/test/.bun/bin",
-			lookupExecutable: async (command) =>
-				command === "bun" ? "/home/test/.bun/bin/bun" : null,
-			readTextFile: async () => "#!/usr/bin/env bun\nconsole.log('hi')\n",
-		});
-
-		expect(cmd).toContain("--dir");
-		expect(cmd).toContain("/home");
-		expect(cmd).toContain("/home/test");
-		expect(cmd).toContain("/home/test/.bun");
-		expect(cmd).toContain("/home/test/.bun/bin");
-		expect(cmd).toContain("--ro-bind");
-		expect(cmd).toContain("/home/test/.bun/bin");
-	});
-
-	test("mounts both lookup and real target paths for a symlinked linux shebang interpreter", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/home/test/.bun/bin" ||
-				candidatePath === "/opt/bun/bin",
-			lookupExecutable: async (command) =>
-				command === "bun" ? "/home/test/.bun/bin/bun" : null,
-			realPath: async (candidatePath) =>
-				candidatePath === "/home/test/.bun/bin/bun"
-					? "/opt/bun/bin/bun"
-					: candidatePath,
-			readTextFile: async () => "#!/usr/bin/env bun\nconsole.log('hi')\n",
-		});
-
-		expect(cmd).toContain("/opt");
-		expect(cmd).toContain("/opt/bun");
-		expect(cmd).toContain("/opt/bun/bin");
-		expect(cmd).toContain("/home/test/.bun/bin");
-	});
-
-	test("skips env assignments when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/home/test/.bun/bin",
-			lookupExecutable: async (command) =>
-				command === "bun" ? "/home/test/.bun/bin/bun" : null,
-			readTextFile: async () =>
-				"#!/usr/bin/env -S BUN_INSTALL=$HOME/.bun bun\nconsole.log('hi')\n",
-		});
-
-		expect(cmd).toContain("--dir");
-		expect(cmd).toContain("/home");
-		expect(cmd).toContain("/home/test");
-		expect(cmd).toContain("/home/test/.bun");
-		expect(cmd).toContain("/home/test/.bun/bin");
-		expect(cmd).toContain("--ro-bind");
-		expect(cmd).toContain("/home/test/.bun/bin");
-	});
-
-	test("applies PATH assignments when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			env: { ...process.env, PATH: "/usr/bin" },
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/opt/bun/bin",
-			lookupExecutable: async (command, env) =>
-				command === "bun" && env.PATH === "/opt/bun/bin"
-					? "/opt/bun/bin/bun"
-					: null,
-			readTextFile: async () =>
-				"#!/usr/bin/env -S PATH=/opt/bun/bin bun\nconsole.log('hi')\n",
-		});
-
-		expect(cmd).toContain("/opt/bun/bin");
-	});
-
-	test("skips env options that consume the next token when resolving an env -S shebang interpreter", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			env: { ...process.env, PATH: "/home/test/.bun/bin:/usr/bin" },
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/home/test/.bun/bin",
-			lookupExecutable: async (command) =>
-				command === "bun" ? "/home/test/.bun/bin/bun" : null,
-			readTextFile: async () =>
-				"#!/usr/bin/env -S -u NODE_OPTIONS bun\nconsole.log('hi')\n",
-		});
-
-		expect(cmd).toContain("/home/test/.bun/bin");
-	});
-
-	test("adds a mount for an absolute shebang interpreter outside the allowlist", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
+		const coreRuntimeDir = path.dirname(process.execPath);
 
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
 				candidatePath === "/tmp/example" ||
 				candidatePath === "/tmp" ||
-				candidatePath === "/custom/runtime/bin",
-			readTextFile: async () => "#!/custom/runtime/bin/bun\n",
-		});
-
-		expect(cmd).toContain("/custom");
-		expect(cmd).toContain("/custom/runtime");
-		expect(cmd).toContain("/custom/runtime/bin");
-		expect(cmd).toContain("--ro-bind");
-	});
-
-	test("mounts a root-level linux shebang interpreter as a file", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" ||
-				candidatePath === "/tmp" ||
-				candidatePath === "/bun",
-			readTextFile: async () => "#!/bun\n",
+				candidatePath === coreRuntimeDir,
 		});
 
 		expect(
 			cmd.some(
 				(token, index) =>
 					token === "--ro-bind" &&
-					cmd[index + 1] === "/bun" &&
-					cmd[index + 2] === "/bun",
+					cmd[index + 1] === coreRuntimeDir &&
+					cmd[index + 2] === coreRuntimeDir,
+			),
+		).toBe(true);
+	});
+
+	test("does not mount the core runtime directory in the workspace sandbox", async () => {
+		const coreRuntimeDir = path.dirname(process.execPath);
+
+		const cmd = await createLinuxWorkspaceBwrapCommand(
+			"/usr/bin/bwrap",
+			"/ws",
+			"/hist",
+			{
+				pathExists: async (candidatePath) =>
+					candidatePath === "/ws" ||
+					candidatePath === "/tmp" ||
+					candidatePath === coreRuntimeDir,
+				bindHistoryDir: false,
+			},
+		);
+
+		expect(cmd).not.toContain(coreRuntimeDir);
+	});
+
+	test("mounts JUSTCLAW_SANDBOX_RO_PATHS entries read-only on linux", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
+			env: { ...process.env, JUSTCLAW_SANDBOX_RO_PATHS: "/srv/extra-ro" },
+			pathExists: async (candidatePath) =>
+				candidatePath === "/tmp/example" ||
+				candidatePath === "/tmp" ||
+				candidatePath === "/srv/extra-ro",
+		});
+
+		expect(
+			cmd.some(
+				(token, index) =>
+					token === "--ro-bind" &&
+					cmd[index + 1] === "/srv/extra-ro" &&
+					cmd[index + 2] === "/srv/extra-ro",
+			),
+		).toBe(true);
+	});
+
+	test("mounts JUSTCLAW_SANDBOX_RW_PATHS entries read-write on linux", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
+			env: { ...process.env, JUSTCLAW_SANDBOX_RW_PATHS: "/srv/extra-rw" },
+			pathExists: async (candidatePath) =>
+				candidatePath === "/tmp/example" ||
+				candidatePath === "/tmp" ||
+				candidatePath === "/srv/extra-rw",
+		});
+
+		expect(
+			cmd.some(
+				(token, index) =>
+					token === "--bind" &&
+					cmd[index + 1] === "/srv/extra-rw" &&
+					cmd[index + 2] === "/srv/extra-rw",
+			),
+		).toBe(true);
+	});
+
+	test("applies JUSTCLAW_SANDBOX_RO_PATHS / RW_PATHS to the workspace sandbox", async () => {
+		const cmd = await createLinuxWorkspaceBwrapCommand(
+			"/usr/bin/bwrap",
+			"/ws",
+			"/hist",
+			{
+				env: {
+					...process.env,
+					JUSTCLAW_SANDBOX_RO_PATHS: "/srv/extra-ro",
+					JUSTCLAW_SANDBOX_RW_PATHS: "/srv/extra-rw",
+				},
+				pathExists: async (candidatePath) =>
+					candidatePath === "/ws" ||
+					candidatePath === "/tmp" ||
+					candidatePath === "/srv/extra-ro" ||
+					candidatePath === "/srv/extra-rw",
+				bindHistoryDir: false,
+			},
+		);
+
+		expect(
+			cmd.some(
+				(token, index) =>
+					token === "--ro-bind" &&
+					cmd[index + 1] === "/srv/extra-ro" &&
+					cmd[index + 2] === "/srv/extra-ro",
 			),
 		).toBe(true);
 		expect(
 			cmd.some(
 				(token, index) =>
-					token === "--ro-bind" &&
-					cmd[index + 1] === "/" &&
-					cmd[index + 2] === "/",
-			),
-		).toBe(false);
-	});
-
-	test("mounts a linux shebang interpreter as a file when its parent contains the module directory", async () => {
-		const moduleDir = "/home/alice/justclaw/modules/example";
-		const interpreterPath = "/home/alice/justclaw/bun";
-		const manifest = parseDaemonManifest(moduleDir, "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			pathExists: async (candidatePath) =>
-				candidatePath === moduleDir ||
-				candidatePath === "/tmp" ||
-				candidatePath === interpreterPath,
-			readTextFile: async () => `#!${interpreterPath}\n`,
-		});
-
-		expect(
-			cmd.some(
-				(token, index) =>
-					token === "--ro-bind" &&
-					cmd[index + 1] === interpreterPath &&
-					cmd[index + 2] === interpreterPath,
+					token === "--bind" &&
+					cmd[index + 1] === "/srv/extra-rw" &&
+					cmd[index + 2] === "/srv/extra-rw",
 			),
 		).toBe(true);
-		expect(
-			cmd.some(
-				(token, index) =>
-					token === "--ro-bind" &&
-					cmd[index + 1] === "/home/alice/justclaw" &&
-					cmd[index + 2] === "/home/alice/justclaw",
-			),
-		).toBe(false);
 	});
 
-	test("does not add an extra interpreter mount when the shebang is already covered", async () => {
+	test("rejects malformed JUSTCLAW_SANDBOX_RO_PATHS entries and skips them", async () => {
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
 			mode: "daemon",
 		});
+		const originalConsoleError = console.error;
+		const errors: unknown[][] = [];
+		console.error = (...args: unknown[]) => {
+			errors.push(args);
+		};
+
+		try {
+			const cmd = await createLinuxBubblewrapCommand(
+				"/usr/bin/bwrap",
+				manifest,
+				{
+					env: {
+						...process.env,
+						JUSTCLAW_SANDBOX_RO_PATHS: [
+							"relative/path",
+							"/a/../b",
+							"//double",
+							"/.",
+							"/",
+							"/does/not/exist",
+							"/opt/good",
+						].join(":"),
+					},
+					pathExists: async (candidatePath) =>
+						candidatePath === "/tmp/example" ||
+						candidatePath === "/tmp" ||
+						candidatePath === "/opt/good",
+				},
+			);
+
+			expect(
+				cmd.some(
+					(token, index) =>
+						token === "--ro-bind" &&
+						cmd[index + 1] === "/opt/good" &&
+						cmd[index + 2] === "/opt/good",
+				),
+			).toBe(true);
+			expect(cmd).not.toContain("relative/path");
+			expect(cmd).not.toContain("/a/../b");
+			expect(cmd).not.toContain("//double");
+			expect(cmd).not.toContain("/does/not/exist");
+			expect(
+				cmd.some(
+					(token, index) => token === "--ro-bind" && cmd[index + 1] === "/",
+				),
+			).toBe(false);
+			expect(errors.length).toBeGreaterThan(0);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
+
+	test("a malicious linux module shebang produces no extra interpreter mount", async () => {
+		// Regression test: the core no longer reads module entrypoints to derive
+		// mounts. Even if the host happens to have these malicious-looking paths
+		// (a shebang of "//bun" previously bypassed the "/" guard; an absolute
+		// path could name any file readable by the sandboxed process), nothing
+		// queries them because there is no readTextFile option any more.
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
 		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
 			pathExists: async (candidatePath) =>
 				candidatePath === "/tmp/example" ||
 				candidatePath === "/tmp" ||
-				candidatePath === "/usr",
-			readTextFile: async () => "#!/usr/bin/env bun\n",
-			lookupExecutable: async (command) =>
-				command === "bun" ? "/usr/bin/bun" : null,
+				candidatePath === "/" ||
+				candidatePath === "/home/x/.ssh" ||
+				candidatePath === "/home/x/.ssh/id_rsa",
 		});
 
+		expect(cmd).not.toContain("/home/x/.ssh");
+		expect(cmd).not.toContain("/home/x/.ssh/id_rsa");
 		expect(
-			cmd.filter(
-				(token, index) => token === "--ro-bind" && cmd[index + 1] === "/usr",
+			cmd.some(
+				(token, index) => token === "--ro-bind" && cmd[index + 1] === "/",
 			),
-		).toHaveLength(1);
+		).toBe(false);
 	});
 
 	test("omits missing optional linux readonly mounts", async () => {
@@ -1308,22 +1256,6 @@ describe("sandbox", () => {
 				(token, index) => token === "--ro-bind" && cmd[index + 1] === "/run",
 			),
 		).toHaveLength(0);
-	});
-
-	test("ignores a shebang interpreter path when its directory does not exist", async () => {
-		const manifest = parseDaemonManifest("/tmp/example", "example", {
-			name: "example",
-			exec: "./run",
-			mode: "daemon",
-		});
-
-		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-			pathExists: async (candidatePath) =>
-				candidatePath === "/tmp/example" || candidatePath === "/tmp",
-			readTextFile: async () => "#!/missing/bin/bun\n",
-		});
-
-		expect(cmd).not.toContain("/missing/bin");
 	});
 
 	test("fails when a required writable linux sandbox path is unavailable", async () => {
